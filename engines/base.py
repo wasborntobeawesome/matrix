@@ -17,25 +17,59 @@ VOICES_DIR = Path(__file__).resolve().parent.parent / "voices"
 GPU_LOCK = threading.Lock()
 
 
+class VoiceNotFound(ValueError):
+    """The requested voice doesn't exist (any more), e.g. it was deleted mid-request."""
+
+
 @dataclass
 class Voice:
     id: str
     name: str
     ref_wav: Path | None = None   # reference clip for voice-cloning models
     ref_text: str | None = None   # exact transcript of ref_wav
-    lang: str | None = None       # language the voice speaks; None = any language the engine supports
+    lang: str | None = None       # language the voice speaks natively; None = any language the engine supports
+    # Can speak the engine's other languages too, with this voice's accent. Defaults to True
+    # for reference clips, since cloning models carry a clip's voice into any language.
+    cross_lingual: bool | None = None
+    version: int = 0              # reference clip mtime when listed; changes when it is re-recorded
+
+    def __post_init__(self):
+        if self.cross_lingual is None:
+            self.cross_lingual = self.ref_wav is not None
+
+    @property
+    def clone(self) -> bool:
+        return self.ref_wav is not None
+
+    @property
+    def cache_key(self) -> str:
+        """Key for cached voice prompts. Needs no file access, so a clip deleted mid-request
+        doesn't break chunks whose prompt is already cached."""
+        return f"{self.id}:{self.version}"
 
 
-def reference_voices(require_text: bool = False) -> list[Voice]:
-    """Voices in voices/: <id>.wav (+ optional <id>.txt transcript, <id>.name label)."""
+def reference_voices(require_text: bool = False, langs: tuple[str, ...] = ("uz",)) -> list[Voice]:
+    """Reference clips for voice cloning: <id>.wav (+ optional <id>.txt transcript, <id>.name label).
+
+    Clips directly in voices/ are Uzbek (id "madina"); clips in voices/<lang>/ speak that
+    language (id "ru/anna"). Only clips in `langs` are returned.
+    """
     out = []
-    for wav in sorted(VOICES_DIR.glob("*.wav")):
-        txt, label = wav.with_suffix(".txt"), wav.with_suffix(".name")
-        text = txt.read_text(encoding="utf-8").strip() if txt.exists() else None
-        if require_text and not text:
+    folders = [(VOICES_DIR, "uz", "")] + [(VOICES_DIR / lang, lang, f"{lang}/") for lang in langs]
+    for folder, lang, prefix in folders:
+        if lang not in langs:
             continue
-        name = label.read_text(encoding="utf-8").strip() if label.exists() else wav.stem.title()
-        out.append(Voice(wav.stem, name, wav, text))
+        for wav in sorted(folder.glob("*.wav")):
+            txt, label = wav.with_suffix(".txt"), wav.with_suffix(".name")
+            try:  # a voice deleted while we list it is simply skipped
+                version = wav.stat().st_mtime_ns
+                text = txt.read_text(encoding="utf-8").strip() if txt.exists() else None
+                name = label.read_text(encoding="utf-8").strip() if label.exists() else ""
+            except FileNotFoundError:
+                continue
+            if require_text and not text:
+                continue
+            out.append(Voice(prefix + wav.stem, name or wav.stem.title(), wav, text, lang, version=version))
     return out
 
 
@@ -114,7 +148,8 @@ class Engine:
             "url": self.url, "supports_rate": self.supports_rate,
             "supports_pitch": self.supports_pitch, "loaded": self.loaded,
             "available": reason is None, "unavailable_reason": reason,
-            "voices": [{"id": v.id, "name": v.name, "lang": v.lang} for v in self.voices()],
+            "voices": [{"id": v.id, "name": v.name, "lang": v.lang, "clone": v.clone, "cross_lingual": v.cross_lingual}
+                       for v in self.voices()],
             "styles": self.styles() if reason is None else [],
         }
 
@@ -141,7 +176,7 @@ class Engine:
         """Blocking synthesis of arbitrary-length text. Returns (audio bytes, media type)."""
         voice = next((v for v in self.voices() if v.id == voice_id), None)
         if voice is None:
-            raise ValueError(f"Unknown voice '{voice_id}' for {self.name}")
+            raise VoiceNotFound(f"Unknown voice '{voice_id}' for {self.name}")
         speed = 1 + rate / 100 if self.supports_rate else 1.0
         with GPU_LOCK:
             if not self.loaded:

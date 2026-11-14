@@ -7,3 +7,8 @@ __pycache__/
 static/compare/audio/
 static/compare/index.html
 static/compare/results.json
+# Recordings of real people added through the UI (keep them off GitHub)
+voices/uz/
+voices/ru/
+voices/en/
+voices/ar/
