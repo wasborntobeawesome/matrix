@@ -79,10 +79,10 @@ class ChatterboxEngine(Engine):
 
     def generate(self, text, voice, speed):
         torch = self._torch
-        if self.current_voice != voice.id:
+        if self.current_voice != voice.cache_key:
             ref = self.default_ref if voice.id == "diktor" else str(voice.ref_wav)
             self.model.prepare_conditionals(ref, exaggeration=0.5)
-            self.current_voice = voice.id
+            self.current_voice = voice.cache_key
         random.seed(42)
         np.random.seed(42)
         torch.manual_seed(42)

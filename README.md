@@ -9,14 +9,25 @@ Pick the language at the top of the page. The model list only shows models that 
 | Language | Microsoft (online) voices | Local models |
 |---|---|---|
 | Oʻzbekcha | Madina, Sardor | all models below |
-| Русский | Svetlana, Dmitriy | OmniVoice |
-| English | Ava, Andrew, Emma, Brian, Aria, Guy (US); Sonia, Ryan (UK) | OmniVoice |
-| العربية | Zariyah, Hamed (Saudi); Fatima, Hamdan (UAE); Salma, Shakir (Egypt) | OmniVoice |
+| Русский | Svetlana, Dmitriy | OmniVoice, Chatterbox Multilingual |
+| English | Ava, Andrew, Emma, Brian, Aria, Guy (US); Sonia, Ryan (UK) | OmniVoice, Chatterbox Multilingual |
+| العربية | Zariyah, Hamed (Saudi); Fatima, Hamdan (UAE); Salma, Shakir (Egypt) | OmniVoice, Chatterbox Multilingual |
 
 - Russian Cyrillic is sent as-is. Only Uzbek text gets the Cyrillic → Latin conversion.
-- Microsoft voices read digits themselves in ru/en/ar, including Russian case endings (`более 50 000` → *пятидесяти тысяч*). For OmniVoice, numbers are spelled out with `num2words`.
-- OmniVoice clones the voice in `voices/`. The starter clips are Uzbek, so it speaks other languages with an Uzbek accent. For a native accent, add a reference clip recorded in that language (see *Your own voices*).
+- Microsoft voices read digits themselves in ru/en/ar, including Russian case endings (`более 50 000` → *пятидесяти тысяч*). For the local models, numbers are spelled out with `num2words`.
 - Arabic text is shown right to left. Eastern Arabic digits (`٢٥٪`) are supported.
+
+### Native-speaker voices (free, local)
+
+The local models copy the voice **and accent** of a reference clip. For a native-sounding voice in Russian, English or Arabic, record a native speaker of that language:
+
+1. Open **＋ Ovoz qoʻshish** at the bottom of the page, with the target language selected.
+2. Have the speaker read the suggested ad-style script (5–15 s, quiet room, lively tone), or upload a WAV, MP3 or M4A clip and type its exact words.
+3. Tick the consent box and save. The clip is stored in `voices/<lang>/` and selected for OmniVoice and Chatterbox Multilingual.
+
+Voices can only be added or deleted from the app's own page at http://localhost:8000, not from `index.html` opened from disk. This stops other websites open in your browser from changing your voices.
+
+Without a native clip for a language, the UI warns that the voice will have an accent, and labels clips from other languages "· … aksenti". Recordings of real people stay on your machine: `voices/<lang>/` is in `.gitignore`. Only record people who agreed to have their voice cloned and used in ads.
 
 ## Models
 
@@ -28,6 +39,7 @@ Pick the language at the top of the page. The model list only shows models that 
 | [Qwen3-TTS Uzbek](https://huggingface.co/mrmuminov/Qwen3-TTS-12Hz-0.6B-Uzbek) (gated, auto-approved) | Local GPU | Apache-2.0 | ✅ | clones `voices/*` |
 | [Sayro TTS](https://huggingface.co/uzlm/sayro-tts-1.7B) (gated, manual approval) | Local GPU | Sayro Terms of Use | ❓ **terms unverified** | built-in speaker, 4 styles |
 | [Chatterbox Uzbek](https://huggingface.co/Abduqayum/uzbek-tts-natural-speech-chatterbox) | Local GPU | MIT | ✅ | built-in narrator + clones |
+| [Chatterbox Multilingual](https://huggingface.co/ResembleAI/chatterbox) (v3) — ru, en, ar | Local GPU | MIT | ✅ | built-in US speaker + clones, 3 energy levels |
 | [Anadil Uzbek](https://huggingface.co/Anadilorg/Anadil_Uzbek_TTS) (VoxCPM2) | Local GPU | MIT + Apache-2.0 | ✅ | clones `voices/*` |
 | [F5-TTS Uzbek](https://huggingface.co/mrmuminov/f5-tts-uzbek) | Local GPU | CC BY-NC 4.0 | ❌ **NC** | clones `voices/*` |
 | [Meta MMS-TTS](https://huggingface.co/facebook/mms-tts-uzb-script_cyrillic) | Local GPU/CPU | CC BY-NC 4.0 | ❌ **NC** | male + fine-tuned female |
@@ -107,6 +119,8 @@ The starter clips `madina` and `sardor` are generated with the Microsoft voices 
 | GET | `/api/languages` | – | supported content languages (`uz`, `ru`, `en`, `ar`) |
 | POST | `/api/tts` | `{text, model, voice, rate, pitch, language}` | `audio/mpeg` (online) or `audio/wav` (local) |
 | POST | `/api/normalize` | `{text, model, language}` | the exact text the model will read |
+| POST | `/api/voices` | `{name, language, transcript, consent, audio}` (`audio` = base64 WAV, 3–30 s) | `{id}` of the new reference voice, e.g. `ru/anna` |
+| DELETE | `/api/voices/{lang}/{id}` | – | deletes a voice added through the UI |
 
 `language` defaults to `uz`.
 

@@ -10,11 +10,12 @@ import re
 from uzbek import expand_numbers as uz_expand_numbers
 from uzbek import normalize as uz_normalize
 
+# name: in the language itself (language picker); label: in Uzbek (hints, "· Rus aksenti").
 LANGUAGES = {
-    "uz": {"name": "Oʻzbekcha", "dir": "ltr"},
-    "ru": {"name": "Русский", "dir": "ltr"},
-    "en": {"name": "English", "dir": "ltr"},
-    "ar": {"name": "العربية", "dir": "rtl"},
+    "uz": {"name": "Oʻzbekcha", "label": "Oʻzbek", "dir": "ltr"},
+    "ru": {"name": "Русский", "label": "Rus", "dir": "ltr"},
+    "en": {"name": "English", "label": "Ingliz", "dir": "ltr"},
+    "ar": {"name": "العربية", "label": "Arab", "dir": "rtl"},
 }
 
 _PERCENT_WORD = {"ru": "процентов", "en": "percent", "ar": "بالمئة"}
