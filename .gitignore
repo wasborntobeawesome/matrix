@@ -1,0 +1,9 @@
+*.pyc
+.models/
+.pytest_cache/
+.venv*/
+.venv/
+__pycache__/
+static/compare/audio/
+static/compare/index.html
+static/compare/results.json

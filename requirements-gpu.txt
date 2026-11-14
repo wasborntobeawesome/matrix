@@ -1,0 +1,18 @@
+# Local GPU models (NVIDIA, CUDA 12.8 — required for RTX 50-series).
+# Install PyTorch first:
+#   pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+# then:  pip install -r requirements.txt -r requirements-gpu.txt
+#        python scripts/setup_models.py
+transformers>=5.3
+soundfile
+omnivoice        # OmniVoice (Apache-2.0)
+f5-tts           # F5-TTS Uzbek (CC BY-NC 4.0)
+voxcpm           # Anadil Uzbek / VoxCPM2 (MIT + Apache-2.0)
+# Chatterbox Uzbek (MIT) runs on the code vendored in its training toolkit (cloned by setup_models.py)
+resemble-perth
+s3tokenizer
+conformer==0.3.2
+diffusers==0.29.0
+omegaconf
+pytsmod          # time-stretching (Qwen3-TTS Uzbek speaks too fast)
+pyloudnorm

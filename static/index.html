@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="uz">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ovoz — matnni nutqqa aylantirish</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="wrap">
+    <header class="row">
+      <div>
+        <h1>Ovoz</h1>
+        <p class="sub">Oʻzbek, rus, ingliz va arab tilidagi matnni ovozga aylantiring — reklama va ijtimoiy tarmoq videolari uchun.</p>
+      </div>
+      <a class="compare-link" href="compare/">Modellarni solishtirish →</a>
+    </header>
+
+    <section class="card">
+      <span class="label">Til</span>
+      <div id="langs" class="seg langs" role="radiogroup" aria-label="Til">
+        <button type="button" role="radio" data-lang="uz" lang="uz">Oʻzbekcha</button>
+        <button type="button" role="radio" data-lang="ru" lang="ru">Русский</button>
+        <button type="button" role="radio" data-lang="en" lang="en">English</button>
+        <button type="button" role="radio" data-lang="ar" lang="ar" dir="rtl">العربية</button>
+      </div>
+      <label for="text" class="label text-label">Matn</label>
+      <textarea id="text" rows="7" maxlength="5000" dir="auto"
+        placeholder="Matnni shu yerga yozing yoki joylashtiring…"></textarea>
+      <div class="row meta">
+        <div class="samples">
+          <span>Namunalar:</span>
+          <span id="samples" class="samples"></span>
+        </div>
+        <span id="count" class="count">0 / 5000</span>
+      </div>
+      <p id="notice" class="notice" hidden>
+        Kirill yozuvi aniqlandi — matn avtomatik ravishda lotinchaga oʻgiriladi.
+      </p>
+      <p class="preview-row"><button type="button" id="showLatin" class="link">Model oʻqiydigan matnni koʻrish</button></p>
+      <pre id="latin" class="latin" dir="auto" hidden></pre>
+    </section>
+
+    <section class="card">
+      <div class="row label-row">
+        <span class="label">Model</span>
+        <label class="toggle"><input type="checkbox" id="commercialOnly"> Faqat tijoriy foydalanish mumkin boʻlganlar</label>
+      </div>
+      <div id="models" class="models" role="radiogroup" aria-label="Model"></div>
+      <p id="langHint" class="hint lang-hint" hidden></p>
+      <p id="modelDesc" class="model-desc"></p>
+    </section>
+
+    <section class="card controls">
+      <div class="field">
+        <span class="label">Ovoz</span>
+        <div id="voices" class="seg" role="radiogroup"></div>
+      </div>
+      <div class="field" id="styleField" hidden>
+        <span class="label">Hissiyot</span>
+        <div id="styles" class="chips" role="radiogroup"></div>
+      </div>
+      <div class="field" id="rateField">
+        <label for="rate" class="label">Tezlik <output id="rateOut">0%</output></label>
+        <input id="rate" type="range" min="-50" max="100" step="5" value="0">
+      </div>
+      <div class="field" id="pitchField">
+        <label for="pitch" class="label">Ohang <output id="pitchOut">0 Hz</output></label>
+        <input id="pitch" type="range" min="-50" max="50" step="5" value="0">
+      </div>
+    </section>
+
+    <section class="actions">
+      <button id="speak" class="primary" type="button">▶ Ovozlashtirish</button>
+      <a id="download" class="secondary" hidden>⬇ Yuklab olish</a>
+    </section>
+
+    <p id="error" class="error" role="alert" hidden></p>
+    <p id="result" class="result" hidden></p>
+    <audio id="player" controls hidden></audio>
+
+    <footer>Ctrl + Enter — tezkor ovozlashtirish</footer>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

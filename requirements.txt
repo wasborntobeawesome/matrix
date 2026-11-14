@@ -1,0 +1,4 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+edge-tts>=7.0
+num2words>=0.5.13   # spells out numbers in Russian, English and Arabic for local models

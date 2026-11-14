@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="uz">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Modellarni solishtirish — Ovoz</title>
+  <link rel="stylesheet" href="../style.css">
+  <style>
+    .wrap { max-width: 1100px; }
+    table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    th { color: var(--muted); font-weight: 600; font-size: .8rem; }
+    td a { color: var(--text); font-weight: 600; }
+    td.err { color: var(--error); font-size: .8rem; }
+    .table-wrap { overflow-x: auto; }
+    section { margin-top: 28px; }
+    h2 { font-size: 1.1rem; margin: 0 0 4px; }
+    .sentence { margin: 0 0 12px; color: var(--muted); font-style: italic; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }
+    .clip { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; }
+    .clip.is-nc { border-color: var(--nc); }
+    .clip-head { display: flex; justify-content: space-between; gap: 6px; align-items: center; }
+    .voice { font-size: .8rem; color: var(--muted); margin: 2px 0 6px; }
+    .clip audio { height: 36px; }
+    .cer { border-bottom: 1px dotted var(--muted); cursor: help; }
+    .back { color: var(--accent); text-decoration: none; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <a class="back" href="../">← Ovoz</a>
+    <h1>Modellarni solishtirish</h1>
+    <p class="sub">Bir xil gaplar har bir model bilan ovozlashtirildi (RTX 5070 Ti). Yaratilgan: {{DATE}}.
+      <b>NC</b> — notijorat litsenziya: tijoriy maqsadda foydalanib boʻlmaydi. <b>ASR xato</b> — ovoz oʻzbekcha nutqni aniqlash modeli bilan qayta matnga aylantirilib, asl matn bilan solishtirildi (belgi xatosi, past = yaxshi). Bu tushunarlilikni oʻlchaydi, tabiiylikni emas — eshitib koʻring.</p>
+    <div class="card table-wrap">
+      <table>
+        <thead><tr><th>Model</th><th>Turi / litsenziya</th><th title="Ovozni oʻzbekcha ASR (Whisper) bilan qayta matnga aylantirib, asl matn bilan solishtirilgan belgi xatosi. Past = aniqroq talaffuz.">ASR xato ↓</th><th>Yuklanish</th><th>Tezlik</th><th>GPU xotira</th><th></th></tr></thead>
+        <tbody>{{ROWS}}</tbody>
+      </table>
+    </div>
+    {{SECTIONS}}
+  </main>
+</body>
+</html>
