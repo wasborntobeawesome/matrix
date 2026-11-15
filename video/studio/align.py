@@ -194,6 +194,40 @@ def align_words(script: list[str], asr: list[dict], lang: str, duration: float) 
     return out, (matched / nw if nw else 0.0)
 
 
+def remap_words(spoken: list[dict], caption: list[str], lang: str) -> list[dict]:
+    """Word times of the SPOKEN text (`say_tts` / pronounced form) -> the caption words (`say`).
+
+    Words that are the same on both sides keep their own times; a differing run ("Ovoz" captioned,
+    "Овоз" spoken; "AI" vs "эй-ай") takes the time span of the spoken run, shared by character weight; caption
+    words with no spoken counterpart get a zero-length slot at the boundary, so captions stay in order."""
+    if not caption:
+        return []
+    if not spoken:
+        return [{"w": w, "start": 0.0, "end": 0.0} for w in caption]
+    a = [norm(w["w"], lang) for w in spoken]
+    b = [norm(w, lang) for w in caption]
+    out: list[dict] = []
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            for k in range(j2 - j1):
+                w = spoken[i1 + k]
+                out.append({"w": caption[j1 + k], "start": w["start"], "end": w["end"]})
+        elif op in ("replace", "insert"):
+            if i2 > i1:
+                t0, t1 = spoken[i1]["start"], spoken[i2 - 1]["end"]
+            else:      # caption words that are not spoken: a zero-length slot after the previous word
+                t0 = t1 = out[-1]["end"] if out else spoken[0]["start"]
+            ws = [max(1, len(b[j])) for j in range(j1, j2)]
+            t = t0
+            for j, wt in zip(range(j1, j2), ws):
+                dt = (t1 - t0) * wt / sum(ws)
+                out.append({"w": caption[j], "start": round(t, 3), "end": round(t + dt, 3)})
+                t += dt
+        # "delete": spoken words with no caption word; their time just passes
+    return out
+
+
 def _sha(f: Path) -> str:
     h = hashlib.sha1()
     with open(f, "rb") as fh:

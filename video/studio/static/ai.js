@@ -138,13 +138,15 @@
   // generate-a-clip form; `orientation` from the project format, `assign` = {project, scene, dim, blur},
   // `provider` = the default generator, `images` = [{value, label, ref}] that can be animated (image-to-video)
   A.brollForm = ({ prompt = "", orientation = "portrait", fixedOrientation = false, assign = null, onQueued, provider = null,
-    images = null, image = null, onProvider = null } = {}) => {
+    images = null, image = null, onProvider = null, seed: seed0 = null, onSeed = null } = {}) => {
     const st = A.status;
     const provs = (st && st.providers) || [];
     const pr = el("textarea", { rows: 3, placeholder: t("ai.promptPh") });
     pr.value = prompt;
     const neg = el("textarea", { rows: 2 });
-    const seed = el("input", { type: "number", class: "narrow", value: Math.floor(Math.random() * 100000), min: 0, step: 1 });
+    // a scene's form starts from the scene's own seed (the one "Make video" uses) and remembers changes
+    const seed = el("input", { type: "number", class: "narrow", value: seed0 != null ? seed0 : Math.floor(Math.random() * 100000), min: 0, step: 1,
+      onchange: () => onSeed && onSeed(parseInt(seed.value, 10) || 0) });
     let preset = "draft", orient = orientation, prov = provider || (st && st.default_provider) || "fastwan-5b";
     let img = image || "";
     const est = el("div", { class: "muted small" });
@@ -201,7 +203,7 @@
         el("div", { class: "field" }, el("span", { class: "lbl" }, t("ai.orientation")), orientBox),
         el("div", { class: "field narrow" }, el("label", {}, t("ai.seed")),
           el("div", { class: "row gap" }, seed, el("button", { type: "button", class: "icon-btn", title: t("ai.randomSeed"),
-            "aria-label": t("ai.randomSeed"), onclick: () => { seed.value = Math.floor(Math.random() * 100000); } }, "⟳")))),
+            "aria-label": t("ai.randomSeed"), onclick: () => { seed.value = Math.floor(Math.random() * 100000); onSeed && onSeed(parseInt(seed.value, 10)); } }, "⟳")))),
       est,
       assign ? el("p", { class: "muted small" }, t("ai.willAssign")) : null,
       el("div", { class: "row gap" }, go, A.badge()));

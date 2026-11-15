@@ -315,14 +315,22 @@
     // Words that are the brand name or contain digits get the gradient fill.
     function words(text, cls = "") {
       const box = h("div", cls);
-      const parts = String(text || "").split(/(\s+)/).filter(p => p.length);
+      // break only at ordinary spaces: words tied by a no-break space (Russian "в голос") share one
+      // nowrap group, so a one-letter preposition never ends a line; each word still animates on its own
+      const parts = String(text || "").split(/([ \t\r\n]+)/).filter(p => p.length);
       const list = [];
-      for (const p of parts) {
-        if (/^\s+$/.test(p)) { box.appendChild(document.createTextNode(" ")); continue; }
+      const word = (p, into) => {
         const w = h("span", "word", p);
         if ((B.name && norm(p) === norm(B.name)) || /\d/.test(p)) w.classList.add("grad");
         if (isArabic(p)) { w.lang = "ar"; w.dir = "rtl"; }
-        box.appendChild(w); list.push(w);
+        into.appendChild(w); list.push(w);
+      };
+      for (const p of parts) {
+        if (/^[ \t\r\n]+$/.test(p)) { box.appendChild(document.createTextNode(" ")); continue; }
+        const sub = p.split(/ +/).filter(Boolean);
+        if (sub.length < 2) { word(p, box); continue; }
+        const grp = box.appendChild(h("span", "nbw"));
+        sub.forEach((s, k) => { if (k) grp.appendChild(document.createTextNode(" ")); word(s, grp); });
       }
       if (isArabic(String(text || ""))) box.dir = "rtl";
       return { box, list };
@@ -741,6 +749,8 @@
 
         let G = null;  // geometry, computed on first update (needs fonts for text height)
         const RV = reserveFor(sc);
+        // callout: "above" / "below" the focus area (or the device, without a focus); "auto" keeps it off the focus
+        const CPOS = ["above", "below"].includes(sc.callout_position) ? sc.callout_position : "auto";
         // 1:1: phones (tall shots) sit next to the text, browsers / wide shots below it
         const sqSide = SQ && hasText && (kind === "phone" || (kind === "none" && m.aspect > 1.15));
         if (sqSide) txt.classList.add("side");
@@ -748,6 +758,9 @@
           let box;
           const th = hasText ? txt.offsetHeight : 0;
           let side = false;
+          // without a focus the callout gets its own strip under (or above) the device instead of covering the
+          // bottom of the screen, where apps usually show the result (the QA's "Bir bosishda audio" hid the player)
+          const cReserve = callout && !f ? callout.offsetHeight + 26 : 0;
           if (LAND) {
             // device box ends at y 900: the caption pill (top ≈ 923) stays clear even with the slow camera drift
             if (hasText) {
@@ -781,6 +794,10 @@
             // caption sits below the phone instead of covering the bottom of its screen
             const top = 330 + (hasText ? th + 40 : 20);
             box = { x: 70, y: top, w: 940, h: 1325 - top };
+          }
+          if (cReserve) {
+            box = { ...box, h: box.h - cReserve };
+            if (CPOS === "above") box.y += cReserve;
           }
           const g = deviceGeom(kind, m.aspect, box, kind === "phone" ? (LAND ? 520 : SQ ? 420 : 600) : Infinity);
           if (hasText) {
@@ -874,13 +891,30 @@
           }
           if (callout && G.R) {
             // ring rectangle in stage coordinates: zoom inside the screen, then the device drift
-            const sx0 = G.g.x + G.g.sx + zk * G.R.x + zx, sy0 = G.g.y + G.g.sy + zk * G.R.y + zy;
-            const rx = s * sx0 + tx, ry = s * sy0 + ty, rw = s * zk * G.R.w, rh = s * zk * G.R.h;
+            const ringAt = (zk2, zx2, zy2, s2) => {
+              const tx2 = c.x - s2 * c.x, ty2 = c.y - s2 * c.y;
+              const sx0 = G.g.x + G.g.sx + zk2 * G.R.x + zx2, sy0 = G.g.y + G.g.sy + zk2 * G.R.y + zy2;
+              return { x: s2 * sx0 + tx2, y: s2 * sy0 + ty2, w: s2 * zk2 * G.R.w, h: s2 * zk2 * G.R.h };
+            };
+            const { x: rx, y: ry, w: rw, h: rh } = ringAt(zk, zx, zy, s);
             // never above the device area (= below the headline), never into the captions
             const lim = LAND ? { x0: G.box.x, x1: G.box.x + G.box.w, y0: 120, y1: 900 }
                       : SQ ? { x0: 40, x1: W - 40, y0: sqSide ? 100 : (hasText ? G.box.y - 8 : 100), y1: RV ? RV.y - 14 : 890 }
                       : { x0: 50, x1: W - 50, y0: hasText ? G.box.y - 8 : 330, y1: RV ? RV.y - 14 : 1330 };
-            let below = ry + rh + 34 + G.ch <= lim.y1;
+            if (G.below == null) {
+              // decided once from the settled zoom (a pure function of the geometry, so every render worker agrees):
+              // the side that fits without covering the focus area; "above" / "below" force a side
+              const fin = ringAt(G.kz * 1.02, G.Z.x, G.Z.y, 1 + 0.035 * clamp((zs + zd - sc.start) / D));
+              const cover = b2 => {
+                const y0 = clamp(b2 ? fin.y + fin.h + 34 : fin.y - 34 - G.ch, lim.y0, lim.y1 - G.ch);
+                return Math.max(0, Math.min(y0 + G.ch, fin.y + fin.h) - Math.max(y0, fin.y));   // overlap height
+              };
+              G.below = CPOS === "below" ? true : CPOS === "above" ? false
+                : fin.y + fin.h + 34 + G.ch <= lim.y1 ? true
+                : fin.y - 34 - G.ch >= lim.y0 ? false
+                : cover(true) <= cover(false);
+            }
+            const below = G.below;
             let cy = below ? ry + rh + 34 : ry - 34 - G.ch;
             cy = clamp(cy, lim.y0, lim.y1 - G.ch);
             const cx = clamp(rx + rw / 2 - G.cw / 2, lim.x0, lim.x1 - G.cw);
@@ -891,10 +925,12 @@
             calloutArrow.className = below ? "arrow up" : "arrow down";
             calloutArrow.style.left = px(clamp(rx + rw / 2 - cx, 30, G.cw - 30) - 13);
           } else if (callout) {
-            // no focus: callout sits under the device
+            // no focus: the callout sits in its own strip under the device (or above it), never on the screen
             const cp = prog(t, sc.start + 1.0, 0.55, E.outBack);
             const cxn = (LAND || sqSide) ? G.g.x + G.g.w / 2 - G.cw / 2 : W / 2 - G.cw / 2;
-            place(callout, clamp(cxn, 40, W - 40 - G.cw), Math.min(G.g.y + G.g.h * s - G.ch * 1.6, LAND ? 860 : SQ ? 830 : (RV ? RV.y - 14 - G.ch : 1240)));
+            const grow = (s - 1) * G.g.h / 2;                // the camera drift grows the device about its centre
+            const cyn = CPOS === "above" ? G.g.y - grow - 14 - G.ch : G.g.y + G.g.h + grow + 14;
+            place(callout, clamp(cxn, 40, W - 40 - G.cw), cyn);
             callout.style.opacity = clamp((t - sc.start - 1.0) / 0.15).toFixed(3);
             callout.style.transform = `scale(${lerp(0.6, 1, cp).toFixed(4)})`;
             calloutArrow.style.display = "none";
@@ -1116,6 +1152,9 @@
       if (sc.speech_end == null) sc.speech_end = sc.end;
       const layout = builders[sc.layout] ? sc.layout : "hero";
       const el = h("div", `scene ${layout}`);
+      // footage behind this scene (AI clip or its editor placeholder): templates restyle .on-media text
+      // (light templates switch to light text on a dark scrim, see style.css)
+      if (sc.background && sc.background.type === "broll" && (sc.background.clip || sc.background.placeholder)) el.classList.add("on-media");
       el.dataset.id = sc.id || idx;
       scenesEl.appendChild(el);
       let update, fit = null;
@@ -1223,10 +1262,17 @@
       let acc = 0;
       if (isArabic(c.text)) txt.dir = "rtl";
       const timed = c.words && c.words.length === ws.length;   // aligned (faster-whisper) word times
+      // words tied by a no-break space (Russian "в голос") go into one nowrap group, so the pill
+      // never ends a line on a one-letter preposition (word count / times are unchanged: /\s+/ splits at U+00A0)
+      const seps = c.text.trim().match(/\s+/g) || [];
+      let grp = null;
       const wl = ws.map((w, k) => {
-        const s = h("span", "w", w + (k < ws.length - 1 ? " " : ""));
+        const tied = k < ws.length - 1 && / /.test(seps[k] || "");
+        const s = h("span", "w", w + (k < ws.length - 1 ? (tied ? " " : " ") : ""));
         if (isArabic(w)) { s.lang = "ar"; s.dir = "rtl"; }
-        txt.appendChild(s);
+        if (tied && !grp) grp = txt.appendChild(h("span", "nbw"));
+        (grp || txt).appendChild(s);
+        if (!tied) grp = null;
         if (timed) return { s, t0: c.words[k][0], t1: k + 1 < ws.length ? c.words[k + 1][0] : c.words[k][1] };
         const t0 = c.start + (acc / total) * (c.end - c.start);
         acc += w.length;
@@ -1294,14 +1340,21 @@
     // Consecutive scenes with the same clip share one <video> (no restart at the cut). The clip is
     // slowed down (>= 0.6x) to cover the segment; if that is not enough it ping-pongs with eased
     // turnarounds, so there is never a jump. Dim + blur per scene, brand glow (blobs) on top.
+    // Editor preview only: a scene that asks for an AI clip that does not exist yet gets a still
+    // placeholder (`background.placeholder`, image TL.broll_placeholder) so the template's contrast over
+    // footage can be judged before the slow generation. Renders never get placeholders.
+    // Light templates dim with a dark colour (a light wash made light text unreadable, QA #4).
     const bgSegs = [];
     const FADE = 0.35;
+    const PH = "\u0000placeholder";
     TL.scenes.forEach((sc, i) => {
       const bg = sc.background;
-      if (!bg || bg.type !== "broll" || !bg.clip) return;
+      if (!bg || bg.type !== "broll") return;
+      const clip = bg.clip || (bg.placeholder && TL.broll_placeholder ? PH : null);
+      if (!clip) return;
       const prev = bgSegs[bgSegs.length - 1];
-      if (prev && prev.clip === bg.clip && prev.endIdx === i - 1) { prev.end = sc.end; prev.endIdx = i; prev.parts.push(sc); }
-      else bgSegs.push({ clip: bg.clip, meta: bg, start: sc.start, end: sc.end, endIdx: i, parts: [sc] });
+      if (prev && prev.clip === clip && prev.endIdx === i - 1) { prev.end = sc.end; prev.endIdx = i; prev.parts.push(sc); }
+      else bgSegs.push({ clip, meta: bg, start: sc.start, end: sc.end, endIdx: i, parts: [sc] });
     });
     if (bgSegs.length) {
       const holder = h("div");
@@ -1319,10 +1372,18 @@
         S.D = D;
         if (need <= D / 0.6) { S.rate = Math.min(1, D / need); S.loop = false; } else { S.rate = 0.8; S.loop = true; }
         S.el = holder.appendChild(h("div", "bgv"));
-        S.v = S.el.appendChild(h("video", "bgv-video"));
-        S.v.muted = true; S.v.playsInline = true; S.v.preload = "auto";
-        S.v.src = base + encodeURIComponent(S.clip) + "/clip.webm";
+        if (S.clip === PH) {
+          S.v = null;
+          S.m = S.el.appendChild(h("img", "bgv-video bgv-ph"));
+          S.m.src = TL.broll_placeholder;
+          S.m.alt = "";
+        } else {
+          S.m = S.v = S.el.appendChild(h("video", "bgv-video"));
+          S.v.muted = true; S.v.playsInline = true; S.v.preload = "auto";
+          S.v.src = base + encodeURIComponent(S.clip) + "/clip.webm";
+        }
         S.dim = S.el.appendChild(h("div", "bgv-dim"));
+        if (S.clip === PH && embed) S.el.appendChild(h("div", "bgv-tag", TL.broll_placeholder_label || "AI clip placeholder"));
         S.lastDim = null; S.lastBlur = null;
       }
     }
@@ -1351,7 +1412,11 @@
       }
       return { dim: clamp(d, 0, 0.92), blur: Math.max(0, b) };
     }
-    const BGRGB = hex(B.background).join(",");
+    // light templates: footage is dimmed towards a near-black tint of the brand colour (never towards the
+    // light page colour, which washed the clip out under light text) and at least to MEDIA_DIM_LIGHT, so
+    // the light-on-dark .on-media text keeps >= 4.5:1 over bright bokeh (templates/validate.py checks it)
+    const MEDIA_DIM_LIGHT = 0.62;
+    const BGRGB = hex(B.light ? mixHex(B.primary, "#05070B", 0.86) : B.background).join(",");
     function syncBg(t) {
       const waits = [];
       let maxO = 0;
@@ -1359,10 +1424,11 @@
         const o = bgOpacity(S, t);
         const vis = o > 0.001;
         S.el.style.display = vis ? "" : "none";
-        if (!vis) { if (!S.v.paused) S.v.pause(); continue; }
+        if (!vis) { if (S.v && !S.v.paused) S.v.pause(); continue; }
         maxO = Math.max(maxO, o);
         S.el.style.opacity = o.toFixed(4);
-        const { dim, blur } = bgParams(S, t);
+        let { dim, blur } = bgParams(S, t);
+        if (B.light) dim = Math.max(dim, MEDIA_DIM_LIGHT);
         const dk = dim.toFixed(3);
         if (dk !== S.lastDim) {
           S.lastDim = dk;
@@ -1373,9 +1439,10 @@
         }
         const kb = prog(t, S.t0, Math.max(1, S.t1 - S.t0), E.linear);
         const sc = 1.03 + 0.05 * kb + (blur > 0 ? Math.min(0.08, blur * 0.006) : 0);
-        S.v.style.transform = `scale(${sc.toFixed(4)})`;
+        S.m.style.transform = `scale(${sc.toFixed(4)})`;
         const bk = blur.toFixed(2);
-        if (bk !== S.lastBlur) { S.lastBlur = bk; S.v.style.filter = blur > 0.05 ? `blur(${bk}px)` : "none"; }
+        if (bk !== S.lastBlur) { S.lastBlur = bk; S.m.style.filter = blur > 0.05 ? `blur(${bk}px)` : "none"; }
+        if (!S.v) continue;                     // placeholder still: nothing to seek
         const target = clipTime(S, t);
         const v = S.v;
         if (renderMode || !playing) {
@@ -1397,8 +1464,12 @@
           if (Math.abs(v.currentTime - target) > 0.05 && !v.seeking) v.currentTime = target;
         }
       }
-      // keep the brand glow on top, a little softer over footage
-      blobs[1].style.opacity = blobs[2].style.opacity = (1 - 0.35 * maxO).toFixed(3);
+      // keep the brand glow on top, a little softer over footage (light templates: the white/pastel glow
+      // would wash the footage out again, so it fades away)
+      blobs[1].style.opacity = blobs[2].style.opacity = (1 - (B.light ? 0.95 : 0.35) * maxO).toFixed(3);
+      if (B.light) blobs[0].style.opacity = (parseFloat(blobs[0].style.opacity || "1") * (1 - 0.6 * maxO)).toFixed(3);
+      // the stage-level header / progress bar follow the footage: light text while it is mostly visible
+      stage.classList.toggle("media-bg", maxO > 0.5);
       if (!waits.length) return null;
       return Promise.all(waits).then(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
     }
@@ -1581,7 +1652,7 @@
     function ready() {
       const imgs = [...stage.querySelectorAll("img")].map(img =>
         img.complete ? Promise.resolve() : new Promise(r => { img.addEventListener("load", r, { once: true }); img.addEventListener("error", r, { once: true }); }));
-      const allv = [...videos.map(v => v.el), ...bgSegs.map(S => S.v), ...pvids.map(P => P.el)];
+      const allv = [...videos.map(v => v.el), ...bgSegs.map(S => S.v).filter(Boolean), ...pvids.map(P => P.el)];
       const vids = allv.map(el => el.readyState >= 2 ? Promise.resolve() : new Promise(r => {
         el.addEventListener("loadeddata", r, { once: true }); el.addEventListener("error", r, { once: true });
       }));

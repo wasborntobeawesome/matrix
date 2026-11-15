@@ -20,3 +20,9 @@
 /* restyle built-in layouts with plain CSS */
 #stage.tpl-starter .chip, #stage.tpl-starter .item { background: var(--surface); }
 #stage.tpl-starter .pill { background: var(--accent); color: #1A1410; }
+
+/* over footage (an AI b-roll clip behind the scene): the renderer adds .on-media to the scene, dims the clip
+   and lightens --muted; keep coloured text light enough and give it a dark halo (validate.py measures it) */
+#stage.tpl-starter .scene.on-media .st-kicker { color: color-mix(in srgb, var(--accent) 55%, #fff);
+  text-shadow: 0 2px 20px rgba(0,0,0,.55), 0 0 3px rgba(0,0,0,.4); }
+#stage.tpl-starter .scene.on-media .st-sub { text-shadow: 0 2px 20px rgba(0,0,0,.55), 0 0 3px rgba(0,0,0,.4); }

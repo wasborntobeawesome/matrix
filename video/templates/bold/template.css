@@ -127,6 +127,12 @@
 #stage.tpl-bold .seg { height: 10px; background: rgba(255,255,255,.16); }
 #stage.tpl-bold .seg .fill { background: var(--accent); }
 
+/* ---------- over footage (an AI b-roll clip behind the scene: .scene.on-media) ----------
+   a dark halo keeps the accent-coloured words and the stat fill >= 3:1 over bright bokeh (validate.py) */
+#stage.tpl-bold .scene.on-media .headline, #stage.tpl-bold .scene.on-media .scr-text .headline,
+#stage.tpl-bold .scene.on-media .bd-num, #stage.tpl-bold .scene.on-media .bd-sub {
+  text-shadow: 0 3px 26px rgba(0,0,0,.6), 0 0 4px rgba(0,0,0,.45); }
+
 /* ---------- right-to-left ---------- */
 #stage.rtl.tpl-bold .headline { line-height: 1.2; }
 #stage.rtl.tpl-bold .bd-w { transform-origin: 70% 70%; }

@@ -228,6 +228,13 @@ header above and the captions below.
 In 9:16 the bottom ~360 px and the top ~220 px are covered by TikTok / Reels / Shorts UI; the right edge
 has the like/share rail, so don't put small text in the right 100 px of the content area either.
 
+**Screen-scene callout** (`.callout`, built-in `screen` layout): the renderer positions it, a template only
+styles it. Without a focus it gets its own strip under the device (the device box is shortened by the callout's
+height + 26 px), or above the device with `callout_position: "above"`. It never sits on the screen. With a
+focus, `auto` puts it below the focus area if it fits, else above, else on the side where it covers less of
+it; `above` / `below` force a side. A template that restyles `.callout` should keep its height reasonable,
+because a taller callout makes the device smaller.
+
 ## Captions and progress
 
 The captions (`#captions .cap`) and progress (`#progress`) are drawn by the renderer for every template,
@@ -243,6 +250,31 @@ never collides with it. In 9:16 `screen`/`screens` scenes the caption moves down
 - When the project turns captions off, `#captions` is hidden; design layouts so they still look balanced.
 - Progress: `segments` (one per scene), `bar` (one continuous bar), `dots`, `none`. RTL fills from the right.
 
+## Text over footage (AI b-roll backgrounds)
+
+A scene can have an AI video clip behind it (`background: {type: "broll", dim, blur}`). Your text must stay
+readable over it — the Ovoz QA run found the original Clean look washing the clip out with its light page
+colour, so the teal kicker and the grey sub disappeared (QA #4). The rules:
+
+- The renderer adds **`.on-media`** to such a scene element (`#scenes > .scene.on-media`) and, while footage
+  covers most of the frame, **`media-bg`** to `#stage` (for the header / progress bar outside the scenes).
+- It dims the clip per scene with `dim` (default 0.55), darker at the top and bottom. Dark templates dim towards
+  their background colour. **Light templates (`tone: "light"`) dim towards a near-black tint of the brand colour
+  with a floor of 0.62** and fade their pastel glow away — never a light wash.
+- Built-in rules (`html/style.css`), for every template: a soft dark radial scrim behind the scene content, a dark
+  halo (`text-shadow`) on `.headline`, `.sub`, `.kicker`, `.cta-url`, a near-white `--muted`, and a dark pill
+  behind the base `.kicker` in dark templates. Light templates also get `--text: #fff`, dark translucent
+  `--surface` cards and a white header / progress bar.
+- In your template.css, give coloured text and your own classes the same care under `.scene.on-media`: lighter
+  tints of `--primary` / `--accent` (e.g. `color-mix(in srgb, var(--primary) 40%, #fff)`) and a halo. Remove
+  shadows from gradient-clipped text (`background-clip: text`), or they paint over the fill. See the
+  `.on-media` blocks in `clean/template.css`, `bold/template.css` and `_starter/template.css`.
+- Targets (WCAG AA): **4.5:1** for body text, **3:1** for large text (>= 66 stage px, or >= 50 px semi-bold),
+  measured by `validate.py` (below) against a busy, bright sample frame.
+- The studio's live preview shows a **placeholder still** (`html/broll-placeholder.jpg`, tagged "AI clip
+  placeholder") for a scene that asks for an AI clip that is not generated yet, so the template picker shows
+  the contrast before the slow AI stage. Renders never use it (a missing clip renders the brand gradient).
+
 ## Right to left (Arabic), Cyrillic, Uzbek
 
 - Arabic: `#stage.rtl`, `dir="rtl"`. Flexbox / grid rows flip automatically, so build layouts with flex/grid
@@ -256,6 +288,10 @@ never collides with it. In 9:16 `screen`/`screens` scenes the caption moves down
   Noto — check them with `validate.py` (it renders en, ar, ru and uz).
 - Russian and Uzbek words are long ("Синхронизация", "jamgʻarmangiz"): size headlines from measurements,
   not character counts, and allow two lines.
+- Russian text arrives with a no-break space (U+00A0) after the one-letter prepositions / conjunctions
+  в к с и а о у я ("текст в голос"), so they never end a line. `ctx.words()` keeps such a pair in one
+  `.nbw` nowrap group (each word still animates on its own); if you split text yourself, split on ordinary
+  spaces (`/[ \t\r\n]+/`), not `/\s+/` — in JavaScript `\s` also matches U+00A0.
 
 ## Fonts and licences
 
@@ -303,6 +339,14 @@ scene reports:
   overlaps the caption or the brand header,
 - declared fonts that did not load,
 - non-determinism: the same moments rendered twice (fresh page, different seek order) must match.
+- contrast over footage: every layout and format again over a b-roll background (dim 0.5) — by default the
+  sample frame `video/html/broll-placeholder.jpg` (busy, bright bokeh: a worst case), or your own
+  `--frame some-frame.png` / `--frame clip.mp4` (a frame at 1.5 s). For each text element it compares the text
+  colour with the pixels behind it (a second screenshot with the text hidden; your halos and scrims count) and
+  takes the 10th percentile, so a bright spot behind a few letters fails too. Below 4.5:1 (3:1 for large text)
+  it prints `CONTRAST … 2.1:1 over footage (needs 4.5:1)`. Text on its own opaque or gradient box (a button) is
+  skipped. `--no-contrast` skips the check; with `--sheet DIR` the frames go to `DIR/contrast/`.
+  `--make-sample` rewrites the sample frame (deterministic numpy, no AI model).
 
 Exit code 0 = clean. The studio's import runs the manifest + syntax checks; run `validate.py` for the
 render checks. While you work, keep the project open in the studio: **↻** in the preview bar (or *Reload*

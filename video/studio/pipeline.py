@@ -19,6 +19,14 @@ Stages, strictly in order, one pipeline at a time:
 Pipelines are stored in library/pipelines.json. A failed or cancelled pipeline can be retried:
 it resumes at the first stage that is not finished. After a server restart, running pipelines
 show as "interrupted".
+
+Voice lines Ovoz refuses (after build.generate's retries) do not fail the pipeline: every other line is
+generated, then the pipeline PAUSES (status "paused", `voice_failures`) so the person can fix those lines
+(edit the text, pick another voice) and Retry, or Continue with them silent (retry with skip_failed).
+
+Timing: `elapsed` is this attempt's time, `total_elapsed` all attempts together; `eta` is the sum of the
+remaining stages' estimates (stage `estimate`: voice lines, AI job estimates of the AI queue, render =
+measured seconds per video second of earlier renders, else 1.2 x the video length, per output).
 """
 from __future__ import annotations
 
@@ -49,9 +57,18 @@ class Cancelled(Exception):
     pass
 
 
+class Paused(Exception):
+    """The pipeline stops and waits for a decision (some voice lines failed)."""
+
+
+VOICE_LINE_S = {"online": 1.5, "local": 3.5}   # seconds per generated line (Edge measured 1.4 s, navoiy ~3 s)
+ALIGN_LINE_S = 0.7                              # faster-whisper small on the CPU, per line
+RENDER_FACTOR = 1.2                             # render seconds per video second per output, until measured
+
+
 def _stage() -> dict:
     return {"state": "pending", "progress": 0.0, "message": "", "started": None, "finished": None,
-            "eta": None, "error": None, "detail": {}}
+            "eta": None, "error": None, "detail": {}, "estimate": None}
 
 
 class Pipelines:
@@ -124,16 +141,40 @@ class Pipelines:
 
     def view(self, it: dict) -> dict:
         v = {k: val for k, val in it.items() if not k.startswith("_")}
-        if it["status"] == "running" and it.get("started"):
-            v["elapsed"] = round(time.time() - it["started"])
+        v["stages"] = {k: dict(st) for k, st in it["stages"].items()}
+        t = time.time()
+        spent = it.get("spent") or 0.0
+        if it["status"] == "running" and (it.get("attempt_started") or it.get("started")):
+            v["elapsed"] = round(t - (it.get("attempt_started") or it["started"]))        # this attempt only
+            v["total_elapsed"] = round(spent + v["elapsed"])
             for st in v["stages"].values():
                 if st["state"] == "running" and st.get("started"):
-                    st["elapsed"] = round(time.time() - st["started"])
+                    st["elapsed"] = round(t - st["started"])
+        elif spent:
+            v["total_elapsed"] = round(spent)
         q = self.queued()
         v["position"] = q.index(it["id"]) + 1 if it["id"] in q else 0
-        etas = [st.get("eta") for st in it["stages"].values() if st["state"] in ("running", "pending")]
-        v["eta"] = sum(e for e in etas if e) if it["status"] == "running" else None
+        v["eta"] = self.eta(v) if it["status"] == "running" else None
         return v
+
+    @staticmethod
+    def eta(v: dict) -> int | None:
+        """Seconds left = the running stage's own ETA (or its estimate minus its elapsed time) + the estimates of
+        the stages still pending."""
+        total, known = 0.0, False
+        for name in STAGES:
+            st = v["stages"][name]
+            if st["state"] == "running":
+                if st.get("eta") is not None:
+                    total += st["eta"]
+                    known = True
+                elif st.get("estimate") is not None:
+                    total += max(5, st["estimate"] - (st.get("elapsed") or 0))
+                    known = True
+            elif st["state"] == "pending" and st.get("estimate") is not None:
+                total += st["estimate"]
+                known = True
+        return round(total) if known else None
 
     def queued(self) -> list[str]:
         return [p["id"] for p in sorted(self.items.values(), key=lambda p: p["created"]) if p["status"] == "queued"]
@@ -179,15 +220,20 @@ class Pipelines:
         self._save(force=True)
         return self.view(it)
 
-    def retry(self, ident: str) -> dict | None:
+    def retry(self, ident: str, skip_failed: bool = False) -> dict | None:
+        """Resume at the first unfinished stage. skip_failed: voice lines that fail again are rendered silent
+        (the "Continue without those lines" choice of a paused pipeline)."""
         it = self.items.get(ident)
-        if not it or it["status"] not in ("error", "cancelled", "interrupted"):
+        if not it or it["status"] not in ("error", "cancelled", "interrupted", "paused"):
             return None
         if self.active(it["project"]):
             return None
         for st in it["stages"].values():
-            if st["state"] in ("error", "cancelled", "running"):
+            if st["state"] in ("error", "cancelled", "running", "paused"):
                 st.update(_stage())
+        if skip_failed:
+            it["skip_failed"] = True
+        it.pop("voice_failures", None)
         it.update(status="queued", error=None, finished=None)
         it.pop("_cancel", None)
         self._save(force=True)
@@ -205,8 +251,11 @@ class Pipelines:
             self._run(self.items[q[0]])
 
     def _run(self, it: dict) -> None:
-        it.update(status="running", started=it.get("started") or now(), error=None)
+        t0 = now()
+        it.update(status="running", started=it.get("started") or t0, attempt_started=t0, error=None,
+                  attempts=(it.get("attempts") or 0) + 1)
         self.current = it["id"]
+        self._estimate(it)
         self._save(force=True)
         try:
             for name in STAGES:
@@ -225,6 +274,9 @@ class Pipelines:
                 except Cancelled:
                     st.update(state="cancelled", message="cancelled")
                     raise
+                except Paused as e:
+                    st.update(state="paused", error=str(e), eta=None)
+                    raise
                 except Exception as e:
                     st.update(state="error", error=str(e) or type(e).__name__)
                     raise
@@ -232,17 +284,100 @@ class Pipelines:
                     st["finished"] = now()
                     self.phase = None
                     self._save(force=True)
+                self._estimate(it)          # e.g. the voice-over fixes the video length for the render estimate
             it.update(status="done", current=None)
         except Cancelled:
             it["status"] = "cancelled"
+        except Paused as e:
+            it.update(status="paused", error=str(e))
         except Exception as e:
             it.update(status="error", error=str(e) or type(e).__name__)
         finally:
             it["finished"] = now()
+            it["spent"] = round((it.get("spent") or 0.0) + (it["finished"] - t0), 1)
             it.pop("_cancel", None)
             self.current = None
             self.phase = None
             self._save(force=True)
+
+    # ------------------------------------------------------------ estimates
+    def _estimate(self, it: dict) -> None:
+        """Fill stage["estimate"] (seconds) for every stage that is not finished. Never fails the pipeline."""
+        try:
+            p = Project.get(it["project"])
+        except StoreError:
+            return
+        for name in STAGES:
+            st = it["stages"][name]
+            if st["state"] in ("done", "skipped", "warning"):
+                continue
+            try:
+                st["estimate"] = round(getattr(self, "_est_" + name)(it, p))
+            except Exception as e:     # an estimate is a nicety
+                print(f"[make] estimate {name} failed: {e}", flush=True)
+                st["estimate"] = None
+
+    def _est_voice(self, it: dict, p: Project) -> float:
+        todo = build.todo_lines(p)
+        sec = 0.0
+        for _lg, lb, s in todo:
+            m = (build.line_voice(lb, s).get("model") or "").lower()
+            sec += VOICE_LINE_S["online" if m in build.ONLINE_MODELS else "local"]
+        lines = sum(1 for lg in build.langs_of(p.brief) for s in normalize_l(p.brief, lg)["scenes"] if build.say_of(s))
+        return 3 + sec + ALIGN_LINE_S * (len(todo) or 0) + (0.05 * lines)
+
+    def _est_unload(self, it: dict, p: Project) -> float:
+        return 6.0
+
+    def _est_ai(self, it: dict, p: Project) -> float:
+        return sum(e for _k, e in self.ai_plan(p, it.get("quality") or "final"))
+
+    def _est_render(self, it: dict, p: Project) -> float:
+        return render_estimate(p)
+
+    def ai_plan(self, p: Project, q: str) -> list[tuple[str, float]]:
+        """[(kind, estimated seconds)] of the AI jobs "Make video" would still run for this project (read-only)."""
+        brief = p.brief
+        out: list[tuple[str, float]] = []
+        mu = brief.get("music") if isinstance(brief.get("music"), dict) else {}
+        spec = mu.get("generate")
+        if spec and not (mu.get("track") and MU.get(mu["track"])):
+            dur = spec.get("duration") or min(240.0, round(build.timeline(p)["duration"] + 3, 1))
+            full = {**spec, "duration": dur, "seed": spec.get("seed", 7)}
+            if not MU.generated_for(full):
+                out.append(("music", self.ai.estimate("music", "final", dur)))
+        pres = brief.get("presenter") if isinstance(brief.get("presenter"), dict) else None
+        bubble, fullp, _ = PR.needed(brief)
+        if (bubble or fullp) and pres is not None and not pres.get("portrait") and pres.get("portrait_prompt"):
+            out.append(("portrait", self.ai.estimate("portrait", "final", 40)))
+        fmt = brief.get("format", "9:16")
+        comfy = False
+        for s in brief["scenes"]:
+            bg = s.get("background") or {}
+            if bg.get("type") != "broll" or (bg.get("clip") and L.broll_get(bg["clip"])) or not bg.get("prompt"):
+                continue
+            provider = bg.get("provider") or brief.get("broll_provider") or P.DEFAULT
+            if not P.exists(provider):
+                provider = P.DEFAULT
+            orient = "landscape" if fmt == "16:9" else "portrait"
+            img = image_ref(p, bg["image"]) if bg.get("image") else None
+            cid = P.clip_key(provider, bg["prompt"], broll_seed(bg), q, orient, img["sha"] if img else None)
+            if L.broll_get(cid):
+                continue
+            comfy = comfy or P.is_comfy(provider)
+            out.append(("broll", self.ai.estimate_broll(provider, q, bool(img))))
+            if bg.get("both") and other_orientation(brief) and not (bg.get("clip_alt") and L.broll_get(bg["clip_alt"])):
+                out.append(("broll", self.ai.estimate_broll(provider, q, False)))
+        if comfy and not self.ai.comfy.reachable(1.0):
+            out.append(("comfy-start", 25.0))         # ComfyUI starts (measured ~21 s) before its first job
+        if bubble or fullp:
+            try:
+                pl = PR.plan(p, normalize_l(brief), build.timeline(p), q)
+                if pl and not pl.get("error") and not pl["ready"]:
+                    out.append(("presenter", self.ai.estimate("presenter", q, pl["missing_seconds"])))
+            except Exception:
+                pass
+        return out
 
     def _check(self, it: dict) -> None:
         if it.get("_cancel"):
@@ -312,8 +447,10 @@ class Pipelines:
             st.update(progress=round(f, 3), message=f"{msg} ({done[0]}/{len(todo)})",
                       eta=round(el / done[0] * (len(todo) - done[0])) if done[0] else None)
             self._save()
+        failed = []
         try:
-            build.generate(p, progress=prog)
+            res = build.generate(p, progress=prog, skip_failed=bool(it.get("skip_failed")))
+            failed = res["failed"]
         except build.V.TTSError as e:
             if not it.get("allow_silent"):
                 raise RuntimeError(f"voice-over failed: {e}") from None
@@ -321,8 +458,20 @@ class Pipelines:
             self._notice(it, f"voice-over skipped (silent scenes): {e}")
         st["detail"]["seconds"] = round(time.time() - t0, 1)
         tim = finish()
-        st["message"] = (f"{len(todo)} line(s) generated in {st['detail']['seconds']} s "
+        st["message"] = (f"{len(todo) - len(failed)} line(s) generated in {st['detail']['seconds']} s "
                          f"({len(langs)} language(s)); timing aligned for {tim['aligned']}/{tim['lines']}")
+        if failed:
+            st["detail"]["failed"] = failed
+            summary = build.failed_summary(failed)
+            if it.get("allow_silent") or it.get("skip_failed"):
+                st["state"] = "warning"
+                n = len(failed)
+                self._notice(it, f"voice-over: {n} line{'s' if n != 1 else ''} failed — continuing with "
+                                 f"{'them' if n != 1 else 'it'} silent")
+                return
+            # every other line is done: stop here and let the person decide (fix / other voice / silent)
+            it["voice_failures"] = failed
+            raise Paused(f"voice-over: {summary} — choose what to do with {'them' if len(failed) != 1 else 'it'} below")
 
     # ------------------------------------------------------------ 2. free the GPU
     def _unload(self, it: dict, st: dict) -> None:
@@ -426,16 +575,37 @@ class Pipelines:
                 img = image_ref(p, bg["image"])
                 if not img:
                     self._notice(it, f"scene '{s['id']}': image '{bg['image']}' to animate is missing — text to video instead")
-            params = {"prompt": bg["prompt"], "negative": None, "seed": 42, "orientation": orient, "provider": provider,
+            seed = broll_seed(bg)
+            params = {"prompt": bg["prompt"], "negative": None, "seed": seed, "orientation": orient, "provider": provider,
                       "assign": {"project": p.id, "scene": s["id"], "dim": bg.get("dim", 0.55), "blur": bg.get("blur", 0)}}
             if img:
                 params["image"] = img
-            cid = P.clip_key(provider, bg["prompt"], 42, q, orient, img["sha"] if img else None)
+            cid = P.clip_key(provider, bg["prompt"], seed, q, orient, img["sha"] if img else None)
             if L.broll_get(cid):
                 self.ai._assign_broll({"params": params}, cid)
                 continue
             pv = P.get(provider)
             ids.append(self.ai.submit("broll", params, project=p.id, label=f"{pv['name']} · {bg['prompt'][:56]}",
+                                      units=pv["presets"][q]["steps"], preset=q)["id"])
+        for s in brief["scenes"]:
+            # b) the other orientation (e.g. 16:9 next to a 9:16 main format) instead of a hard crop
+            bg = s.get("background") or {}
+            oth = other_orientation(brief)
+            if (bg.get("type") != "broll" or not bg.get("both") or not bg.get("prompt") or not oth
+                    or (bg.get("clip_alt") and L.broll_get(bg["clip_alt"]))):
+                continue
+            provider = bg.get("provider") or brief.get("broll_provider") or P.DEFAULT
+            provider = provider if P.exists(provider) else P.DEFAULT
+            seed = broll_seed(bg)
+            params = {"prompt": bg["prompt"], "negative": None, "seed": seed, "orientation": oth, "provider": provider,
+                      "assign": {"project": p.id, "scene": s["id"], "dim": bg.get("dim", 0.55), "blur": bg.get("blur", 0),
+                                 "variant": True}}
+            cid = P.clip_key(provider, bg["prompt"], seed, q, oth, None)
+            if L.broll_get(cid):
+                self.ai._assign_broll({"params": params}, cid)
+                continue
+            pv = P.get(provider)
+            ids.append(self.ai.submit("broll", params, project=p.id, label=f"{pv['name']} · {oth} · {bg['prompt'][:46]}",
                                       units=pv["presets"][q]["steps"], preset=q)["id"])
         if wants_presenter:
             brief = p.brief
@@ -495,9 +665,12 @@ class Pipelines:
     # ------------------------------------------------------------ 4. render
     def _render(self, it: dict, st: dict) -> None:
         pid = it["project"]
-        j = self.jobs.busy(pid, "render") or self.jobs.submit("render", pid, allow_silent=bool(it.get("allow_silent")))
+        skip = bool(it.get("skip_failed"))
+        j = self.jobs.busy(pid, "render") or self.jobs.submit("render", pid, allow_silent=bool(it.get("allow_silent")) or skip,
+                                                              skip_voice=skip)
         it["render_job"] = j["id"]
         t0 = time.time()
+        est = st.get("estimate")
         while True:
             if it.get("_cancel"):
                 self.jobs.cancel(j["id"])
@@ -506,7 +679,8 @@ class Pipelines:
             f = j.get("progress") or 0
             m = re.search(r"~(\d+)s left", j.get("message") or "")
             el = time.time() - t0
-            eta = int(m.group(1)) + 5 if m else (round(el / f * (1 - f)) if f > 0.2 else None)
+            eta = (int(m.group(1)) + 5 if m else round(el / f * (1 - f)) if f > 0.2
+                   else max(5, round(est - el)) if est else None)
             st.update(progress=round(f, 3), eta=eta, message=f"{j.get('stage')}: {j.get('message') or ''}".strip(": "))
             if j["status"] == "done":
                 r = j["result"]
@@ -521,6 +695,52 @@ class Pipelines:
                 raise RuntimeError(f"render {j['status']}: {j.get('error') or ''}")
             self._save()
             time.sleep(1.5)
+
+
+def other_orientation(brief: dict) -> str | None:
+    """'landscape' / 'portrait' when the project also renders formats of the other orientation than its main one."""
+    main_land = (brief.get("format") or "9:16") == "16:9"
+    fmts = brief.get("formats") or [brief.get("format") or "9:16"]
+    if any((f == "16:9") != main_land for f in fmts):
+        return "portrait" if main_land else "landscape"
+    return None
+
+
+def broll_seed(bg: dict) -> int:
+    """The seed a scene's b-roll is generated with: background.seed (the editor's seed field), else 42."""
+    try:
+        return int(bg.get("seed")) if bg.get("seed") is not None else 42
+    except (TypeError, ValueError):
+        return 42
+
+
+def render_estimate(p: Project) -> float:
+    """Seconds the render stage will take: per language x format output, the video length times the measured
+    render seconds per video second (earlier renders of this project, same format, preferably same template),
+    else RENDER_FACTOR; plus a few seconds per output for the timeline, audio mix and browser start."""
+    brief = p.brief
+    tpl = brief.get("template") or "aurora"
+    ratios: dict[tuple, list[float]] = {}
+    try:
+        for f in sorted(p.renders_dir.glob("*.json"))[-40:]:
+            try:
+                m = json.loads(f.read_text(encoding="utf-8"))
+                if m.get("seconds") and m.get("duration"):
+                    r = float(m["seconds"]) / float(m["duration"])
+                    ratios.setdefault((m.get("format"), m.get("template") or "?"), []).append(r)
+                    ratios.setdefault((m.get("format"), None), []).append(r)
+            except (OSError, ValueError, TypeError):
+                continue
+    except OSError:
+        pass
+    total = 0.0
+    for lg in build.langs_of(brief):
+        dur = build.timeline(p, lang=lg)["duration"]
+        for fmt in build.formats_of(brief):
+            rs = ratios.get((fmt, tpl)) or ratios.get((fmt, None))
+            r = sorted(rs)[len(rs) // 2] if rs else RENDER_FACTOR
+            total += dur * r + 4
+    return total + 5
 
 
 def _snap(s: dict) -> dict:

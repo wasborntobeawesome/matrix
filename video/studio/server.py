@@ -40,6 +40,7 @@ from aijobs import AI_PY, DISCLOSURE, LICENCES, AIJobs
 from jobs import Jobs
 from pipeline import Pipelines, image_ref
 from store import MAX_IMAGE, MAX_VIDEO, Project, StoreError, import_project, kind_of
+from store import _lock as STORE_LOCK
 
 STUDIO = Path(__file__).resolve().parent
 VIDEO = STUDIO.parent
@@ -300,6 +301,7 @@ def _detail(p: Project, lang: str = "en") -> dict:
     _, warnings = B.normalize(brief, p.assets())
     return {**d, "assets": p.assets(), "renders": p.renders(), "voiced": voiced, "voiced_by_lang": by_lang,
             "missing": B.missing_translations(brief), "warnings": I.tr_list(warnings, lang),
+            "voice_failures": build.voice_failures(p, brief),
             "jobs": [I.tr_job(j, lang) for j in jobs.for_project(p.id)],
             "ai_jobs": [I.tr_job(j, lang) for j in ai.active(project=p.id)],
             "make": I.tr_job(make.latest(p.id), lang), "presenter_state": _presenter_state(p)}
@@ -321,7 +323,8 @@ async def update_project(pid: str, request: Request):
     lang = I.ui_lang(request)
     if snap:
         snap = I.tr_history([snap], lang)[0]
-    return {"brief": clean, "warnings": I.tr_list(warnings, lang), "updated": p.read()["updated"], "snapshot": snap}
+    return {"brief": clean, "warnings": I.tr_list(warnings, lang), "updated": p.read()["updated"], "snapshot": snap,
+            "voice_failures": build.voice_failures(p, clean)}
 
 
 # ---------------------------------------------------------------- version history
@@ -356,13 +359,52 @@ def project_history_restore(pid: str, sid: str, request: Request):
 
 
 # ---------------------------------------------------------------- follow-up for the source AI
+def _followup_timing(p: Project) -> dict:
+    """Per language (main format): video length, spoken seconds, and per scene {length, speech, voiced}."""
+    out = {}
+    for lg in build.langs_of(p.brief):
+        try:
+            tl = build.timeline(p, lang=lg)
+        except Exception:        # a check is a nicety; never break the follow-up
+            continue
+        sc = {s["id"]: {"length": round(s["end"] - s["start"], 2), "speech": round(s["speech_end"] - s["start"], 2),
+                        "voiced": s["voiced"]} for s in tl["scenes"]}
+        out[lg] = {"duration": tl["duration"], "speech": round(sum(x["speech"] for x in sc.values()), 2), "scenes": sc}
+    return out
+
+
+@app.post("/api/projects/{pid}/followup/dismiss")
+async def project_followup_dismiss(pid: str, request: Request):
+    """Hide one follow-up issue for this project from now on: {"key": "<issue key>"} ({"key": ..., "undo": true}
+    shows it again; {"reset": true} shows every dismissed issue again)."""
+    p = Project.get(pid)
+    prm = _body(await request.body())
+    key = str(prm.get("key") or "")[:200]
+    with STORE_LOCK:
+        d = p.read()
+        keys = [k for k in (d.get("followup_dismissed") or []) if isinstance(k, str)]
+        if prm.get("reset"):
+            keys = []
+        elif not key:
+            raise HTTPException(422, "key is required")
+        elif prm.get("undo"):
+            keys = [k for k in keys if k != key]
+        elif key not in keys:
+            keys = (keys + [key])[-200:]
+        d["followup_dismissed"] = keys
+        p._write(d)
+    return {"dismissed": keys}
+
+
 @app.get("/api/projects/{pid}/followup")
 def project_followup(pid: str, format: str = "json", lang: str = "en"):
     """A ready-to-send message for the source AI listing missing/invalid files, missing translations,
     over-long or empty text, badly sized screenshots and suggestions. ?format=text returns just the message.
     ?lang=uz writes it in Uzbek (default English: the source AI usually works in English)."""
     p = Project.get(pid)
-    r = followup.build(p.brief, p.assets(), lang=lang if lang in followup.LANGS else "en")
+    d = p.read()
+    r = followup.build(d["brief"], p.assets(), lang=lang if lang in followup.LANGS else "en", timing=_followup_timing(p),
+                       dismissed=d.get("followup_dismissed") or [])
     if format == "text":
         return PlainTextResponse(r["message"])
     return JSONResponse(r, headers=NOCACHE)
@@ -443,7 +485,9 @@ def preview_timeline(pid: str, lang: str | None = None, format: str | None = Non
     p = Project.get(pid)
     if template and not TP.exists(template):
         raise HTTPException(404, f"template '{template}' not found")
-    tl = build.timeline(p, lang=lang, fmt=format, align_mode="queue", template=template)
+    # placeholder: scenes that ask for an AI clip that is not generated yet show a stand-in still, so the
+    # template's contrast over footage can be judged before the slow AI stage (renders never get it)
+    tl = build.timeline(p, lang=lang, fmt=format, align_mode="queue", template=template, placeholder=True)
     TP.fill_urls(tl.get("template"), "http")
     if tl.get("broll") or tl.get("presenter"):
         build.ai_urls(p, tl, "http")
@@ -575,7 +619,7 @@ def library_music():
         if tr:
             used.setdefault(tr, []).append({"project": p.id, "title": b.get("title")})
     return JSONResponse([{**m, "url": f"/api/library/music/{m['id']}/track{m['ext']}", "used_in": used.get(m["id"], [])}
-                         for m in MU.list_tracks()], headers=NOCACHE)
+                         for m in map(MU.brightness, MU.list_tracks())], headers=NOCACHE)
 
 
 @app.get("/api/library/music/{tid}/{name}")
@@ -761,7 +805,8 @@ async def ai_broll(request: Request):
     if a and a.get("project") and a.get("scene"):
         Project.get(a["project"])
         params["assign"] = {"project": a["project"], "scene": a["scene"],
-                            **{k: float(a[k]) for k in ("dim", "blur") if isinstance(a.get(k), (int, float))}}
+                            **{k: float(a[k]) for k in ("dim", "blur") if isinstance(a.get(k), (int, float))},
+                            **({"variant": True} if a.get("variant") else {})}
     project = params.get("assign", {}).get("project")
     img_sha = (params.get("image") or {}).get("sha")
     cid = PV.clip_key(provider, params["prompt"], seed, preset, orient, img_sha)
@@ -1273,10 +1318,13 @@ def make_cancel(mid: str):
 
 
 @app.post("/api/make/{mid}/retry", status_code=202)
-def make_retry(mid: str):
-    it = make.retry(mid)
+async def make_retry(mid: str, request: Request):
+    """Resume a failed / cancelled / interrupted / paused pipeline. Body (optional): {"skip_failed": true} =
+    voice lines that still fail are rendered silent (the paused pipeline's "continue without them")."""
+    prm = _body(await request.body())
+    it = make.retry(mid, skip_failed=bool(prm.get("skip_failed")))
     if not it:
-        raise HTTPException(409, "only a failed, cancelled or interrupted pipeline can be retried (and none may be active)")
+        raise HTTPException(409, "only a failed, cancelled, interrupted or paused pipeline can be retried (and none may be active)")
     return it
 
 

@@ -604,9 +604,13 @@ class AIJobs:
         for s in b["scenes"]:
             if s["id"] == a["scene"]:
                 bg = s.get("background") if isinstance(s.get("background"), dict) else {}
-                s["background"] = {**{k: bg[k] for k in ("prompt", "provider", "image") if bg.get(k)},
-                                   "type": "broll", "clip": cid, "dim": a.get("dim", bg.get("dim", 0.55)),
-                                   "blur": a.get("blur", bg.get("blur", 0))}
+                keep = {k: bg[k] for k in ("prompt", "provider", "image", "seed", "clip", "clip_alt", "both")
+                        if bg.get(k) not in (None, "")}
+                # variant = the other orientation of the same b-roll (16:9 next to 9:16), not a replacement
+                s["background"] = {**keep, "type": "broll", ("clip_alt" if a.get("variant") else "clip"): cid,
+                                   "dim": a.get("dim", bg.get("dim", 0.55)), "blur": a.get("blur", bg.get("blur", 0))}
+                if not a.get("variant") and job["params"].get("seed") is not None:
+                    s["background"]["seed"] = job["params"]["seed"]       # the seed the clip was really made with
                 p.save_brief(normalize(b, p.assets())[0])
                 job.setdefault("result_note", f"assigned to scene '{a['scene']}'")
                 return

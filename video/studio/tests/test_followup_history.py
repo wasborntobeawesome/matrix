@@ -131,3 +131,29 @@ def test_tr_unknown_passes_through_and_job_views():
     assert t["message"] == "soʻz vaqtlari" and t["error"].startswith("render uz 9:16 muvaffaqiyatsiz")
     assert t["result"]["warnings"] == ["brif berilmadi — boʻsh loyiha yaratildi"]
     assert j["message"] == "word timing"                           # the stored job is not changed
+
+
+def test_history_names_templates():
+    """QA #8: "template: — → bold" / bare "template" -> both template names (no template = Aurora)."""
+    base = {"title": "x", "scenes": []}
+    assert HI.summarize({**base, "template": "clean"}, base) == "template: Clean → Aurora"
+    assert HI.summarize(base, {**base, "template": "bold"}) == "template: Aurora → Bold"
+    assert HI.summarize({**base, "template": "clean"}, {**base, "template": "bold"}) == "template: Clean → Bold"
+    assert HI.summarize(base, {**base, "template": "gone-tpl"}) == "template: Aurora → Gone-tpl"   # not installed
+    assert I.tr("template: Clean → Aurora", "uz") == "shablon: Clean → Aurora"
+
+
+def test_old_template_summaries_are_relabelled(project, monkeypatch):
+    # versions saved before template names were shown said "edit template" / "template: — → bold"
+    monkeypatch.setattr(HI, "COALESCE", 0.0)
+    b = project.brief
+    b["template"] = "clean"
+    project.save_brief(B.normalize(b)[0])
+    b.pop("template")
+    project.save_brief(B.normalize(b)[0])
+    idx = HI._index(project)
+    idx[-1]["summary"] = "template"
+    idx[-2]["summary"] = "template: — → clean"
+    HI._write_index(project, idx)
+    top = HI.listing(project)[:2]
+    assert top[0]["summary"] == "template: Clean → Aurora" and top[1]["summary"] == "template: Aurora → Clean"

@@ -24,7 +24,7 @@ FORMAT_ALIASES = {"portrait": "9:16", "vertical": "9:16", "landscape": "16:9", "
 # fields that may be a plain string (all languages) or a map {"uz": "...", "ru": "..."}
 TEXT_FIELDS = ("say", "kicker", "headline", "sub", "callout", "button", "url", "stat")
 ON_SCREEN = ("kicker", "headline", "sub", "callout", "button")   # Uzbek apostrophes are fixed on these (+ items, labels)
-MUSIC_DEFAULT = {"volume_db": -20.0, "duck": True, "duck_db": -10.0, "fade_in": 1.0, "fade_out": 2.5, "start": 0.0}
+MUSIC_DEFAULT = {"volume_db": -15.0, "duck": True, "duck_db": -10.0, "fade_in": 1.0, "fade_out": 2.5, "start": 0.0}
 LAYOUTS = ["hero", "chips", "stat", "list", "cta", "screen", "screens", "presenter"]
 BROLL_PROVIDERS = ["wan22-5b", "fastwan-5b", "wan22-a14b"]     # providers.py
 DEFAULT_BROLL = "fastwan-5b"   # providers.DEFAULT (wan22-5b is kept as a legacy choice: its draft clips came out near-black)
@@ -143,7 +143,7 @@ SCHEMA = {
                                             "rate": {"type": "integer", "minimum": -50, "maximum": 100}, "style": _str}}},
         "music": {"type": "object", "description": "Background music from the studio's music library (ducked under the voice)",
                   "properties": {"track": {**_str, "description": "music library id (picked in the studio)"},
-                                 "volume_db": {"type": "number", "minimum": -40, "maximum": 0, "default": -20,
+                                 "volume_db": {"type": "number", "minimum": -40, "maximum": 0, "default": -15,
                                                "description": "music level (dB); the track is loudness-matched first"},
                                  "duck": {"type": "boolean", "default": True},
                                  "duck_db": {"type": "number", "minimum": -30, "maximum": 0, "default": -10,
@@ -181,6 +181,13 @@ SCHEMA = {
             "properties": {"model": _str, "voice": _str, "rate": {"type": "integer", "minimum": -50, "maximum": 100}, "style": _str},
         },
         "captions": {"type": "boolean", "default": True},
+        "target_seconds": {"type": "number", "minimum": 5, "maximum": 180,
+                           "description": "Target video length in seconds (the follow-up checks the length against it; "
+                                          "default 15–45 s)"},
+        "pronounce": {"type": "object", "propertyNames": {"enum": LANGS},
+                      "description": "Pronunciation dictionary per language: {\"ru\": {\"Ovoz\": \"Овоз\"}} — the voice "
+                                     "says the right side, captions and on-screen text keep the left side",
+                      "additionalProperties": {"type": "object", "additionalProperties": _str}},
         "template": {**_str, "default": "aurora", "description": "Look of the video: a template id from video/templates "
                      "(built in: aurora = dark glow, clean = light minimal, bold = high-contrast social). The studio user "
                      "usually picks it; brand colours still apply"},
@@ -197,6 +204,16 @@ SCHEMA = {
                     "id": {**_str, "pattern": "^[a-z0-9][a-z0-9-]*$"},
                     "layout": {"enum": LAYOUTS},
                     "say": _ls(f"Voice-over line, <= ~{SAY_WORDS_SOFT} words"),
+                    "say_tts": _ls("Optional: what the voice says when it must differ from the caption text `say` "
+                                   "(e.g. ru say 'Попробуйте Ovoz', say_tts 'Попробуйте Овоз'). Captions keep `say`"),
+                    "silent": {"type": "array", "items": {"enum": LANGS},
+                               "description": "Languages whose line is rendered without voice (captions stay)"},
+                    "voices": {"type": "object", "propertyNames": {"enum": LANGS},
+                               "description": "Per-line voice for some languages: {\"ru\": {model, voice}} (default: "
+                                              "the project voice of that language)"},
+                    "callout_position": {"enum": ["auto", "above", "below"], "default": "auto",
+                                         "description": "screen: callout above or below the focus area / device "
+                                                        "(auto keeps it off the focus area)"},
                     "pad": {"type": "number", "minimum": 0, "maximum": 5, "description": "Silence after the line (s), default 0.4"},
                     "duration": {"type": "number", "minimum": 1, "maximum": 30, "description": "Minimum scene length (s)"},
                     "background": _background,
@@ -347,6 +364,15 @@ def normalize(raw, assets: dict | None = None) -> tuple[dict, list[str]]:
         voices[lg] = vo
     b["voice"] = voices[lang]
     b["voices"] = voices
+    pron = _pronounce_norm(raw.get("pronounce"), langs, warn)
+    if pron:
+        b["pronounce"] = pron
+    if raw.get("target_seconds") not in (None, ""):
+        ts = _num(raw.get("target_seconds"), 5, 180)
+        if ts is not None:
+            b["target_seconds"] = round(ts, 1)
+        else:
+            warn.append(f"target_seconds '{raw.get('target_seconds')}' ignored (a number of seconds, 5–180)")
     b["captions"] = raw.get("captions") is not False
     if "music" in raw:
         mu = _music_norm(raw.get("music"), warn)
@@ -417,7 +443,7 @@ def normalize(raw, assets: dict | None = None) -> tuple[dict, list[str]]:
     for k, v in raw.items():
         # (fields normalised above that were dropped as invalid must not sneak back in verbatim)
         if k not in b and k not in ("name", "template", "template_options", "transition", "broll_provider", "music",
-                                    "cover", "presenter") and isinstance(k, str) \
+                                    "cover", "presenter", "pronounce", "target_seconds") and isinstance(k, str) \
                 and len(k) < 40 and not k.startswith("_"):
             b[k] = copy.deepcopy(v)
     if len(b["languages"]) > 1:
@@ -453,6 +479,22 @@ def _scene(s: dict, i: int, seen: set, warn: list, assets) -> dict:
         v = _ltext(s.get(k), 140)
         if v:
             o[k] = v
+    # what the TTS says when it differs from the caption text (brand spelling on screen, phonetic form spoken)
+    st = _ltext(s.get("say_tts"), 400)
+    if st:
+        o["say_tts"] = st
+    sil = _langs_list(s.get("silent"))
+    if sil:
+        o["silent"] = sil          # languages whose line is rendered without voice (captions stay)
+    lv = _line_voices(s.get("voices"), sid, warn)
+    if lv:
+        o["voices"] = lv           # per-line voice for some languages (e.g. another voice for one refused line)
+    if s.get("callout_position") is not None:
+        cp = str(s.get("callout_position") or "auto").lower()
+        if cp in CALLOUT_POSITIONS:
+            o["callout_position"] = cp
+        else:
+            warn.append(f"scene '{sid}': callout_position '{cp}' unknown (auto|above|below) — using auto")
     if s.get("stat") is not None and _ltext(s.get("stat"), 12):
         o["stat"] = _ltext(s.get("stat"), 12)
     for k, lo, hi in (("pad", 0, 5), ("duration", 1, 30), ("zoom", 1, 4), ("trim_start", 0, 600)):
@@ -463,7 +505,7 @@ def _scene(s: dict, i: int, seen: set, warn: list, assets) -> dict:
     # per-scene fields (start, end, voiced …) or internal "_" keys
     for k, v in s.items():
         skip = ("items", "focus", "device", "asset", "stat", "voiceover", "vo", "background", "transition",
-                "start", "end", "speech_end", "voiced", "timing")
+                "start", "end", "speech_end", "voiced", "timing", "say_tts", "silent", "voices", "callout_position")
         if k not in o and k not in skip and isinstance(k, str) and len(k) < 40 and not k.startswith("_"):
             o[k] = copy.deepcopy(v)
     if "background" in s:
@@ -532,6 +574,103 @@ def _scene(s: dict, i: int, seen: set, warn: list, assets) -> dict:
     return o
 
 
+CALLOUT_POSITIONS = ("auto", "above", "below")
+
+
+def _langs_list(v) -> list[str]:
+    """`true` = every language; a list / "uz, ru" -> the known languages in it."""
+    if v is True:
+        return list(LANGS)
+    if isinstance(v, str):
+        v = re.split(r"[\s,;]+", v)
+    if not isinstance(v, list):
+        return []
+    out = []
+    for x in v:
+        x = str(x or "").lower()[:2]
+        if x in LANGS and x not in out:
+            out.append(x)
+    return out
+
+
+def _line_voices(v, sid: str, warn: list) -> dict:
+    if not isinstance(v, dict):
+        return {}
+    out = {}
+    for lg, rv in v.items():
+        lg = str(lg).lower()[:2]
+        if lg not in LANGS or not isinstance(rv, dict):
+            continue
+        model, voice = _text(rv.get("model"), 40), _text(rv.get("voice"), 80)
+        if not model or not voice:
+            warn.append(f"scene '{sid}': voices.{lg} needs model and voice — ignored")
+            continue
+        vo = {"model": model, "voice": voice}
+        if rv.get("rate") is not None:
+            vo["rate"] = int(_num(rv.get("rate"), -50, 100, 0))
+        if _text(rv.get("style")):
+            vo["style"] = _text(rv.get("style"), 40)
+        out[lg] = vo
+    return out
+
+
+def _pronounce_norm(v, langs: list, warn: list) -> dict:
+    """{lang: {"Ovoz": "Овоз"}}: words the TTS should say differently from how captions spell them."""
+    if not isinstance(v, dict):
+        return {}
+    out = {}
+    for lg, d in v.items():
+        lg = str(lg).lower()[:2]
+        if lg not in LANGS or not isinstance(d, dict):
+            continue
+        m = {}
+        for a, b in list(d.items())[:60]:
+            a, b = _text(a, 60), _text(b, 120)
+            if a and b and a != b:
+                m[a] = b
+        if m:
+            out[lg] = m
+    return out
+
+
+def pronounce(text: str, table: dict | None) -> str:
+    """Apply a pronunciation table (whole words, case-insensitive; longest entry first)."""
+    if not text or not table:
+        return text
+    for a in sorted(table, key=len, reverse=True):
+        text = re.sub(rf"(?<!\w){re.escape(a)}(?!\w)", lambda m, b=table[a]: b, text, flags=re.I)
+    return text
+
+
+def tts_text(brief: dict, scene: dict) -> str:
+    """What the voice says for a scene of a LOCALIZED brief: `say_tts`, else `say` with the brief's
+    pronunciation table for that language applied. Captions always use `say`."""
+    st = scene.get("say_tts")
+    if isinstance(st, str) and st.strip():
+        return st.strip()
+    say = scene.get("say") or ""
+    if isinstance(say, dict):
+        say = next((x for x in say.values() if x), "")
+    return pronounce(say.strip(), (brief.get("pronounce") or {}).get(brief.get("language")))
+
+
+def line_voice(brief: dict, scene: dict) -> dict:
+    """The voice of one line of a LOCALIZED brief: the scene's own voice for this language, else the brief's."""
+    v = brief.get("voice") or {}
+    ov = (scene.get("voices") or {}).get(brief.get("language"))
+    if not ov:
+        return v
+    out = {"model": ov["model"], "voice": ov["voice"], "rate": ov.get("rate", v.get("rate", 0))}
+    if ov.get("style"):
+        out["style"] = ov["style"]
+    return out
+
+
+def is_silent(brief: dict, scene: dict) -> bool:
+    """The line of this (localized) scene is rendered without voice (the author chose so)."""
+    return brief.get("language") in (scene.get("silent") or [])
+
+
 def _is_lmap(v) -> bool:
     return isinstance(v, dict) and bool(v) and all(isinstance(k, str) and k.lower()[:2] in LANGS and len(k) <= 5 for k in v)
 
@@ -562,6 +701,8 @@ def _music_norm(v, warn: list) -> dict | None:
     for k, lo, hi in (("volume_db", -40, 0), ("duck_db", -30, 0), ("fade_in", 0, 10), ("fade_out", 0, 15), ("start", 0, 3600)):
         o[k] = round(_num(v.get(k), lo, hi, MUSIC_DEFAULT[k]), 2)
     o["duck"] = v.get("duck") is not False
+    if isinstance(v.get("brighten"), bool):
+        o["brighten"] = v["brighten"]      # gentle high shelf in the mix (default: only for a "dark" track)
     if _text(v.get("mood"), 80):
         o["mood"] = _text(v.get("mood"), 80)
     g = v.get("generate")
@@ -613,12 +754,16 @@ def localize(brief: dict, lang: str | None = None) -> dict:
         dm, dv = DEFAULT_VOICE[lang]
         b["voice"] = voices.get(lang) or {"model": dm, "voice": dv, "rate": 0}
     product = b.get("product") or ""
-    fix = (lambda t: display_text(t, "uz", product) if isinstance(t, str) else t) if lang == "uz" else (lambda t: t)
+    # uz: oʻ gʻ ʼ; ru: no-break space after one-letter prepositions (в к с и а о у я)
+    fix = ((lambda t: display_text(t, lang, product) if isinstance(t, str) else t) if lang in ("uz", "ru")
+           else (lambda t: t))
     for sc in b.get("scenes", []):
         for k in TEXT_FIELDS:
             if k in sc:
                 v = pick(sc[k], lang, main)
                 sc[k] = fix(v) if k in ON_SCREEN else (v if v is not None else "")
+        if isinstance(sc.get("say_tts"), dict):
+            sc["say_tts"] = sc["say_tts"].get(lang) or ""      # never another language's spoken form
         items = sc.get("items")
         if isinstance(items, list):
             out = []
@@ -700,6 +845,14 @@ def _background_norm(v, sid: str, warn: list) -> dict | None:
     img = _text(v.get("image"), 120)
     if img:
         o["image"] = img
+    sd = _num(v.get("seed"), 0, 2**31 - 1)
+    if sd is not None:
+        o["seed"] = int(sd)          # the seed "Make video" generates the clip with (default 42)
+    alt = _text(v.get("clip_alt"), 60)
+    if alt:
+        o["clip_alt"] = alt          # the same b-roll in the other orientation (used by the formats it fits)
+    if v.get("both") is True:
+        o["both"] = True             # "Make video" also generates the other orientation when the project has both
     # no clip and no prompt yet (the editor's "AI clip" mode before a clip is picked): kept, renders as brand
     o["dim"] = round(_num(v.get("dim"), 0, 0.9, BG_DIM_DEFAULT), 3)
     o["blur"] = round(_num(v.get("blur"), 0, 24, 0), 2)

@@ -7,8 +7,10 @@ short timed caption chunks. No CLI here; import it.
 from __future__ import annotations
 
 import json
+import random
 import re
 import subprocess
+import time
 import urllib.error
 import urllib.request
 import wave
@@ -21,17 +23,28 @@ DEFAULT_API = "http://localhost:8000"
 
 
 class TTSError(RuntimeError):
-    """Ovoz refused or could not be reached. `unreachable` is True when it is down."""
+    """Ovoz refused or could not be reached. `unreachable` is True when it is down.
 
-    def __init__(self, message: str, unreachable: bool = False, status: int | None = None):
+    `status` = Ovoz's HTTP status, `detail` = its message, `attempts` = how many times the line was tried."""
+
+    def __init__(self, message: str, unreachable: bool = False, status: int | None = None, detail: str = "",
+                 attempts: int = 1):
         super().__init__(message)
         self.unreachable = unreachable
         self.status = status
+        self.detail = detail
+        self.attempts = attempts
 
 
-def tts(text: str, model: str, voice: str, lang: str, rate: int = 0, style: str | None = None,
-        api: str = DEFAULT_API, timeout: float = 600) -> bytes:
-    """Ask Ovoz for one clip. Returns the raw audio bytes (mp3 or wav)."""
+# Ovoz answers 422 when the voice engine returned no audio (Microsoft's online service sends
+# "NoAudioReceived" for some sentences, sometimes only now and then) and 5xx for engine / network errors:
+# worth another try. 400 (bad voice / language), 410 (voice deleted), 503 (model not installed) are not.
+RETRY_STATUS = {422, 500, 502, 504}
+RETRY_DELAYS = (1.5, 4.0)          # seconds before the 2nd and the 3rd attempt, times a 0.7..1.3 jitter
+_sleep = time.sleep                # tests replace it
+
+
+def _tts_once(text, model, voice, lang, rate, style, api, timeout) -> bytes:
     payload = {"text": text, "model": model, "voice": voice, "rate": int(rate or 0), "language": lang}
     if style:
         payload["style"] = style
@@ -46,10 +59,31 @@ def tts(text: str, model: str, voice: str, lang: str, rate: int = 0, style: str 
             body = json.loads(body).get("detail", body)
         except (ValueError, AttributeError):
             pass
-        raise TTSError(f"Ovoz error {e.code}: {body}", status=e.code) from None
+        raise TTSError(f"Ovoz error {e.code}: {body}", status=e.code, detail=str(body)) from None
     except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
         reason = getattr(e, "reason", e)
         raise TTSError(f"Ovoz TTS is not reachable at {api} ({reason})", unreachable=True) from None
+
+
+def tts(text: str, model: str, voice: str, lang: str, rate: int = 0, style: str | None = None,
+        api: str = DEFAULT_API, timeout: float = 600, retries: int | None = None, on_retry=None) -> bytes:
+    """Ask Ovoz for one clip. Returns the raw audio bytes (mp3 or wav).
+
+    A refusal that may be temporary (RETRY_STATUS) is retried up to `retries` times (default
+    len(RETRY_DELAYS)) with backoff and jitter; `on_retry(attempt, error)` is called before each wait."""
+    delays = RETRY_DELAYS if retries is None else tuple(RETRY_DELAYS[min(i, len(RETRY_DELAYS) - 1)]
+                                                        for i in range(max(0, retries)))
+    for attempt in range(len(delays) + 1):
+        try:
+            return _tts_once(text, model, voice, lang, rate, style, api, timeout)
+        except TTSError as e:
+            e.attempts = attempt + 1
+            if e.unreachable or e.status not in RETRY_STATUS or attempt >= len(delays):
+                raise
+            if on_retry:
+                on_retry(attempt + 1, e)
+            _sleep(delays[attempt] * random.uniform(0.7, 1.3))
+    raise AssertionError("unreachable")
 
 
 def models(api: str = DEFAULT_API, timeout: float = 5) -> list:
@@ -103,9 +137,43 @@ def _uz_word(w: str, product: str = "") -> str:
     return re.sub(r"(?<=\w)['’`](?=\w)", "ʼ", w)
 
 
+NBSP = " "
+# Russian typography: a one-letter preposition / conjunction never ends a line ("текст в / голос"), so it is
+# tied to the next word with a no-break space. Python's str.split() and JS /\s+/ both still split at U+00A0,
+# so word lists (alignment, caption word times) are unchanged; only line breaking is.
+RU_SHORT = "вксиаоуяВКСИАОУЯ"
+_RU_SHORT_WORD = re.compile(rf"^[{RU_SHORT}]$")
+_RU_NBSP = re.compile(rf"(?<!\w)([{RU_SHORT}])[ \t]+(?=\S)")
+
+
+def ru_nbsp(text: str) -> str:
+    """"Превратите текст в голос" -> "Превратите текст в голос" (also after the start of a line / punctuation)."""
+    return _RU_NBSP.sub(lambda m: m.group(1) + NBSP, text) if text else text
+
+
+def short_word(w: str) -> bool:
+    """A Russian one-letter preposition / conjunction that keeps to the next word."""
+    return bool(_RU_SHORT_WORD.match(w or ""))
+
+
+def join_words(words: list[str]) -> str:
+    """Join words with spaces, but a no-break space after a Russian one-letter preposition / conjunction."""
+    out = ""
+    for i, w in enumerate(words):
+        if i:
+            out += NBSP if short_word(words[i - 1]) else " "
+        out += w
+    return out
+
+
 def display_text(text: str, lang: str = "uz", product: str = "") -> str:
-    """Typewriter apostrophes -> proper Uzbek letters for on-screen text (oʻ gʻ ʼ). Other languages unchanged."""
-    if lang != "uz" or not text:
+    """On-screen text: typewriter apostrophes -> proper Uzbek letters (oʻ gʻ ʼ); Russian one-letter
+    prepositions / conjunctions get a no-break space after them. Other languages unchanged."""
+    if not text:
+        return text
+    if lang == "ru":
+        return ru_nbsp(text)
+    if lang != "uz":
         return text
     return re.sub(r"\S+", lambda m: _uz_word(m.group(0), product), text)
 
@@ -117,9 +185,17 @@ def _chunk_groups(words: list[str], max_words: int) -> list[list[int]]:
     groups, cur = [], []
     for i, w in enumerate(words):
         cur.append(i)
-        if len(cur) == max_words or _PUNCT_END.search(w) or i == len(words) - 1:
+        if _PUNCT_END.search(w) or i == len(words) - 1:
             groups.append(cur)
             cur = []
+        elif len(cur) >= max_words:
+            if short_word(w) and len(cur) > 1:
+                # "текст в" | "голос": the one-letter preposition moves on with its word
+                groups.append(cur[:-1])
+                cur = [i]
+            else:
+                groups.append(cur)
+                cur = []
     return groups
 
 
@@ -154,7 +230,7 @@ def chunks_from_words(words: list[dict], max_words: int = 3, end: float | None =
             b = nxt if nxt - last < 0.35 else last + 0.15   # bridge short gaps, keep real pauses
         else:
             b = max(words[g[-1]]["end"], end if end is not None else 0)
-        out.append({"text": " ".join(words[i]["w"] for i in g), "start": round(a, 3), "end": round(b, 3),
+        out.append({"text": join_words([words[i]["w"] for i in g]), "start": round(a, 3), "end": round(b, 3),
                     "words": [[round(words[i]["start"], 3), round(words[i]["end"], 3)] for i in g]})
     return out
 
@@ -170,7 +246,7 @@ def caption_chunks(text: str, start: float, length: float, max_words: int = 3, l
     chunks, t = [], start
     for g in _chunk_groups(words, max_words):
         dt = length * sum(weight[j] for j in g) / total
-        chunks.append({"text": " ".join(words[j] for j in g), "start": round(t, 3), "end": round(t + dt, 3)})
+        chunks.append({"text": join_words([words[j] for j in g]), "start": round(t, 3), "end": round(t + dt, 3)})
         t += dt
     return chunks
 

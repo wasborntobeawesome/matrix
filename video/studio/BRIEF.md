@@ -114,6 +114,11 @@ project). If something is wrong, it writes `ERROR.txt` into the folder; fix the 
 - **Uzbek:** write apostrophes however you like (`o'`, `g'`, `'`). On screen the studio shows `oʻ gʻ`
   (U+02BB) and the tutuq belgisi `ʼ` (U+02BC): "Nimbo'ni ko'ring" → "Nimboʼni koʻring". The brief keeps
   what you wrote, and the voice-over reads your text as written.
+- **Vertical videos and browser screenshots:** a landscape 1440×900 screenshot in a browser frame is shown
+  at about 65 % in a 9:16 video, so its text is unreadable unless the camera zooms in. Give such a scene a
+  `focus` narrower than 0.3 of the width (the part the line talks about), or send a phone screenshot.
+- **Callout:** `"callout_position": "auto" | "above" | "below"` (screen scenes). `auto` keeps the label off
+  the focus area; without a focus it sits under the device, never on its screen.
 
 **Music and cover (optional).** The studio user picks the track from the studio's music library, or the
 studio generates one locally (ACE-Step, instrumental). A source AI may suggest a mood, or describe the
@@ -124,8 +129,10 @@ music to generate:
 "music": { "generate": { "prompt": "calm modern tech background, soft synth pads, gentle beat",
                          "genre": "corporate electronic", "mood": "calm, confident", "bpm": 96 } },
                                                                       // "Make video" generates it if there is no track yet
-"music": { "track": "builtin-calm-pad", "volume_db": -20, "duck": true, "duck_db": -10,
+"music": { "track": "builtin-calm-pad", "volume_db": -15, "duck": true, "duck_db": -10,
            "fade_in": 1, "fade_out": 2.5, "start": 0 },                // as the studio stores it
+"music": { "track": "m-…", "brighten": false },                       // generated tracks with < 2 % energy above
+                                                                      // 2 kHz get a gentle high shelf unless false
 "cover": { "scene": "hook", "t": 2.0 }                                 // cover PNG moment (default: end of scene 1)
 ```
 
@@ -206,6 +213,13 @@ generates and approves.
   product information comes from the overlays anyway.
 - `dim` 0–0.9 (default 0.55) darkens the clip; `blur` 0–24 px. The clip is cropped to fill the frame,
   slowed down or ping-ponged to cover the scene, and the brand glow stays on top.
+- `seed` (optional, default 42): the seed "Make video" generates the clip with; the editor's form starts
+  from it and stores changes, so a clip queued from the form and one from "Make video" are the same clip.
+- `"both": true` (projects with both orientations, e.g. 9:16 + 16:9): "Make video" also generates the
+  clip in the other orientation (stored as `clip_alt`), which the formats of that orientation use instead
+  of a hard crop. About one more clip's time.
+- Light templates (Clean) darken the clip and put a scrim behind the text, so text stays readable over
+  footage; until the clip exists, the editor preview shows a placeholder still in its place.
 
 **Presenter** — project level:
 
@@ -358,3 +372,28 @@ If left out, the studio picks `edge` (Microsoft online voices) with a default vo
 (uz: `uz-UZ-MadinaNeural`, ru: `ru-RU-SvetlanaNeural`, en: `en-US-AvaNeural`, ar: `ar-SA-ZariyahNeural`).
 The user can change them in the editor (the voice fields follow the language tab); only models whose
 `languages` include that language are offered.
+
+**Spoken text vs caption text.** Captions and on-screen text always use `say`. When the voice must say a
+word differently (a brand name in another script, an abbreviation), keep the brand spelling in `say` and
+give the spoken form, either per scene and language or once per language for the whole project:
+
+```json
+"pronounce": { "ru": { "Ovoz": "Овоз" } },                       // whole words, case-insensitive
+{ "id": "cta", "layout": "cta", "say": { "ru": "Попробуйте Ovoz сегодня." },
+  "say_tts": { "ru": "Попробуйте Овоз сегодня." } }               // this scene only; wins over `pronounce`
+```
+
+The word timing maps the spoken words back onto the caption words, so the karaoke highlight still lands
+on "Ovoz".
+
+**Lines the voice service refuses.** Microsoft's online voices (`edge`) occasionally return no audio for a
+particular sentence ("NoAudioReceived"); the text is usually fine. The studio retries such a line twice,
+generates every other line, and then lists the failed lines with *edit text*, *try another voice* and
+*render silent*. The brief keeps the choice: a per-line voice
+`"voices": {"ru": {"model": "edge", "voice": "ru-RU-DmitryNeural"}}` on the scene, or `"silent": ["ru"]`
+(no voice in that language, captions stay). A rephrasing usually works too ("Говорит на четырёх
+языках: …" instead of "Говорит на узбекском, русском, английском и арабском.").
+
+**Length.** Aim for 15–45 s in total (or set `"target_seconds": 30`). The follow-up message flags a
+video that runs over the target, a language whose lines run more than 10 % longer than another's, and a
+screen recording that keeps a scene going long after its line ends (dead air).

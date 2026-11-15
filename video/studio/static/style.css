@@ -29,7 +29,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .crumb { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; }
 .crumb .back { color: var(--muted); text-decoration: none; white-space: nowrap; }
 .crumb .back:hover { color: var(--text); }
-.title-input { flex: 1; min-width: 80px; max-width: 520px; background: transparent; border: 1px solid transparent; border-radius: 8px; padding: 6px 8px; font-weight: 650; font-size: 15px; }
+.title-input { flex: 0 1 auto; width: calc(var(--chars, 24) * 0.62em + 18px); min-width: 80px; max-width: 640px; text-overflow: ellipsis; background: transparent; border: 1px solid transparent; border-radius: 8px; padding: 6px 8px; font-weight: 650; font-size: 15px; }
 .title-input:hover, .title-input:focus { border-color: var(--line2); background: var(--panel); }
 .top-right { display: flex; align-items: center; gap: 12px; margin-left: auto; }
 .savestate { color: var(--muted); font-size: 12px; min-width: 50px; text-align: right; }
@@ -438,7 +438,8 @@ code { font-family: var(--mono); font-size: .95em; background: rgba(255,255,255,
 .sm-item.lv-lo b { color: #c9d0e6; }
 .sm-item.lv-mid { background: rgba(245,185,74,.12); } .sm-item.lv-mid b { color: #ffcd76; }
 .sm-item.lv-hi { background: rgba(255,107,122,.14); } .sm-item.lv-hi b { color: #ff9aa5; }
-@media (max-width: 1180px) { .sm-temp, .sm-cpu { display: none !important; } }
+/* up to 1500 px the header leaves the room to the project title (QA #10): temperature and CPU fold away */
+@media (max-width: 1500px) { .sm-temp, .sm-cpu { display: none !important; } }
 @media (max-width: 760px) { .sm-ram, .sm-vram .sm-l { display: none !important; } }
 .mon-page { max-width: 1500px; }
 .mon-now-box { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin: 14px 0 10px; }
@@ -509,3 +510,31 @@ table.lic td { overflow-wrap: anywhere; }
 @media (max-width: 600px) { .wf-map-t select { max-width: 150px; } .top-right .comfy-pill { display: none; } }
 .legacy-tag { display: inline-block; margin-left: 6px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
   padding: 0 5px; border-radius: 5px; border: 1px solid currentColor; opacity: .7; vertical-align: middle; }
+
+/* voice lines Ovoz refused: per-line actions (QA bug #1) */
+.vfails { background: rgba(255,107,122,.06); border: 1px solid rgba(255,107,122,.35); border-radius: 10px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
+.vfails[hidden] { display: none; }
+.vf-title { color: #ffb3bb; }
+.vfail { background: rgba(255,255,255,.03); border: 1px solid var(--line2); border-radius: 8px; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; }
+.vfail .vf-text { margin: 0; font-size: 13px; overflow-wrap: anywhere; }
+.vfail .vf-why { margin: 0; color: #ffd99a; }
+.vfail select { max-width: 100%; min-width: 0; flex: 1 1 180px; }
+.fbadge, .sbadge { font-size: 10px; padding: 1px 6px; border-radius: 5px; white-space: nowrap; }
+.fbadge { color: var(--danger); border: 1px solid rgba(255,107,122,.5); background: rgba(255,107,122,.08); }
+.sbadge { color: var(--muted); border: 1px solid var(--line2); }
+.dark-badge { font-size: 10px; padding: 1px 6px; border-radius: 5px; color: var(--warn); border: 1px solid rgba(245,185,74,.4); white-space: nowrap; }
+.pv-phone.on { color: var(--ok); border-color: rgba(61,220,151,.5); background: rgba(61,220,151,.08); }
+.variant-box { border: 1px dashed var(--line2); border-radius: 8px; padding: 6px 10px; margin: 6px 0; }
+.variant-box p { margin: 0 0 6px; }
+.fu-issues { list-style: none; padding: 0; margin: 6px 0 0; display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow: auto; }
+.fu-issue { display: flex; gap: 8px; align-items: flex-start; justify-content: space-between; border: 1px solid var(--line2); border-radius: 8px; padding: 6px 8px; }
+.fu-issue.sug { opacity: .85; }
+.fu-issue .btn { flex: none; }
+.mk-pause-box { background: rgba(245,185,74,.08); border: 1px solid rgba(245,185,74,.35); border-radius: 8px; padding: 8px 10px; display: flex; flex-direction: column; gap: 8px; margin: 6px 0; }
+.mk-pause-box p { margin: 0; }
+.mk-paused { color: var(--warn); }
+.mk-pause-box > p { color: #ffd99a; }
+.step.s-paused .st-icon { background: rgba(245,185,74,.15); color: var(--warn); border-color: rgba(245,185,74,.45); }
+.say-tts { margin: -4px 0 10px; }
+.say-tts textarea { width: 100%; margin-top: 4px; }

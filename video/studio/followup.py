@@ -9,6 +9,13 @@ usually works in English — or in Uzbek with lang="uz"):
   - voice-over lines over the word limit, and empty text the layout needs
   - screenshots in the wrong orientation for their frame, or too small to look sharp
   - suggestions (a screenshot that would help a text-only scene, a logo, a recording, focus areas)
+  - with `timing` ({lang: {duration, speech, scenes: {id: {length, speech, voiced}}}}, from the timelines):
+    the video length against `target_seconds` (default 15–45 s), a language whose lines run > 10 % longer than
+    another's, screen recordings that leave the scene without voice (dead air), and landscape screenshots in a
+    browser frame of a 9:16-main project (shown small: a focus narrower than 0.3 of the width is needed)
+
+Every issue has a stable `key`; keys the person dismissed (`dismissed`, stored per project) are left out of
+the message and returned as `dismissed` (count), so a deliberate text scene is not suggested again and again.
 """
 from __future__ import annotations
 
@@ -26,6 +33,10 @@ FIELD_NAMES = {"en": {"say": "voice-over (say)", "kicker": "kicker", "headline":
 NEEDS = {"hero": ["headline"], "chips": ["headline", "items"], "stat": ["stat", "headline"], "list": ["headline", "items"],
          "cta": ["headline"], "screen": ["asset"], "screens": ["items"], "presenter": ["headline"]}
 MIN_W = {"phone": 720, "browser": 1280, "none": 720}
+TARGET = (15.0, 45.0)        # seconds, when the brief has no target_seconds
+LANG_SPREAD = 0.10           # a language whose spoken lines are > 10 % longer than another's
+DEAD_AIR = 2.0               # seconds of a recording scene with no voice
+FOCUS_W = 0.3                # landscape screenshot in a 9:16 video: focus at most this wide
 
 # message texts per language; {placeholders} are filled with str.format
 T = {
@@ -82,6 +93,21 @@ T = {
                     "{{\"id\": \"hook\", \"layout\": \"hero\", ...}}",
         "how_maps": ", with every text field as a map {{{maps}}}.",
         "how_len": "- Keep voice-over lines to one natural sentence of at most 18 words; on-screen headlines 1–5 words.",
+        "too_long_video": "The video runs {s:.0f} s in {label} — over the {target} target. Please shorten the longest "
+                          "lines ({lst}) or drop a scene.",
+        "too_short_video": "The video runs only {s:.0f} s in {label} — under the {target} target. One or two more "
+                           "scenes (or a longer line) would help.",
+        "target_range": "{a:.0f}–{b:.0f} s", "target_one": "{t:.0f} s",
+        "lang_longer": "{label} runs {p} % longer than {label2} ({a:.1f} s vs {b:.1f} s of speech). Please shorten "
+                       "its longest lines ({lst}) — or the studio can raise that voice's speed to about +{rate} %.",
+        "dead_air": "Scene “{sid}”: the recording {name} ({rd:.1f} s) keeps the scene {gap:.1f} s longer than the "
+                    "voice ({lg}: {sp:.1f} s spoken) — dead air. Add a few words to the line, start the clip later "
+                    "(trim_start) or send a shorter recording of the one action.",
+        "small_browser": "Scene “{sid}”: {name} is a landscape {w}×{h} screenshot in a browser frame; in the vertical "
+                         "9:16 video it is shown at about {pct} % of its size and its text is unreadable. Please give "
+                         "a focus narrower than {fw} of the width on the part the line talks about{cur}, or send a "
+                         "portrait phone screenshot.",
+        "cur_focus": " (the current focus is {w:.2f} wide)",
     },
     "uz": {
         "scene": "“{sid}” sahnasi", "logo": "brend logotipi",
@@ -136,6 +162,20 @@ T = {
                     "{{\"id\": \"hook\", \"layout\": \"hero\", ...}}",
         "how_maps": ", har bir matn maydoni {{{maps}}} koʻrinishidagi xarita boʻlsin.",
         "how_len": "- Ovoz matni koʻpi bilan 18 soʻzli bitta tabiiy gap boʻlsin; ekrandagi sarlavhalar 1–5 soʻz.",
+        "too_long_video": "Video {label} tilida {s:.0f} soniya — {target} maqsaddan uzun. Iltimos, eng uzun satrlarni "
+                          "({lst}) qisqartiring yoki bitta sahnani olib tashlang.",
+        "too_short_video": "Video {label} tilida atigi {s:.0f} soniya — {target} maqsaddan qisqa. Yana bir-ikki sahna "
+                           "(yoki uzunroq satr) yordam beradi.",
+        "target_range": "{a:.0f}–{b:.0f} s", "target_one": "{t:.0f} s",
+        "lang_longer": "{label} {label2}dan {p} % uzun ({a:.1f} s va {b:.1f} s nutq). Iltimos, uning eng uzun "
+                       "satrlarini ({lst}) qisqartiring — yoki studiya bu ovoz tezligini taxminan +{rate} % ga oshiradi.",
+        "dead_air": "“{sid}” sahnasi: {name} yozuvi ({rd:.1f} s) sahnani ovozdan {gap:.1f} s uzunroq ushlab turadi "
+                    "({lg}: {sp:.1f} s nutq) — ovozsiz boʻshliq. Satrga bir necha soʻz qoʻshing, klipni kechroq "
+                    "boshlang (trim_start) yoki bitta amalning qisqaroq yozuvini yuboring.",
+        "small_browser": "“{sid}” sahnasi: {name} — brauzer ramkasidagi yotiq {w}×{h} skrinshot; tik 9:16 videoda u "
+                         "taxminan {pct} % oʻlchamda koʻrinadi va matni oʻqilmaydi. Iltimos, satr gapirayotgan qismga "
+                         "kengligi {fw} dan tor focus bering{cur} yoki telefonning tik skrinshotini yuboring.",
+        "cur_focus": " (hozirgi focus kengligi {w:.2f})",
     },
 }
 
@@ -151,7 +191,8 @@ def _words(s: str) -> int:
     return len(s.split())
 
 
-def build(brief: dict, assets: dict, lang: str = "en") -> dict:
+def build(brief: dict, assets: dict, lang: str = "en", timing: dict | None = None,
+          dismissed: list | set | None = None) -> dict:
     lang = lang if lang in LANGS else "en"
     L = T[lang]
     labels, fields = LABELS[lang], FIELD_NAMES[lang]
@@ -163,6 +204,9 @@ def build(brief: dict, assets: dict, lang: str = "en") -> dict:
 
     def add(typ, text, **kw):
         issues.append({"type": typ, "text": text, **kw})
+
+    def lbl(lg):
+        return labels.get(lg, lg)
 
     # ---------------------------------------------------------- files
     refs = []                                        # (file, scene id, role, device)
@@ -253,6 +297,10 @@ def build(brief: dict, assets: dict, lang: str = "en") -> dict:
             elif f == "headline" and _words(_txt(s.get(f), main, main)) > 7:
                 add("too_long", L["long_headline"].format(sid=sid, n=_words(_txt(s.get(f), main, main))), scene=sid)
 
+    # ---------------------------------------------------------- length, languages, dead air, small screenshots
+    if timing:
+        _timing_checks(brief, assets, timing, L, lbl, add)
+
     # ---------------------------------------------------------- suggestions
     sug = []
     shots = [s for s in scenes if s.get("layout") in ("screen", "screens")]
@@ -278,19 +326,88 @@ def build(brief: dict, assets: dict, lang: str = "en") -> dict:
     if pres and pres.get("enabled") and not pres.get("portrait") and not pres.get("portrait_prompt"):
         sug.append({"type": "suggestion", "text": L["sug_presenter"]})
     issues += sug[:5]
+    for it in issues:
+        it.setdefault("key", ":".join(str(it.get(k) or "") for k in ("type", "scene", "lang", "file")))
+    gone = set(dismissed or ())
+    hidden = [i for i in issues if i["key"] in gone]
+    issues = [i for i in issues if i["key"] not in gone]
 
     counts = {}
     for it in issues:
         counts[it["type"]] = counts.get(it["type"], 0) + 1
     blocking = [i for i in issues if i["type"] != "suggestion"]
-    return {"message": message(brief, issues, lang), "issues": issues, "counts": counts, "ok": not blocking, "lang": lang}
+    return {"message": message(brief, issues, lang), "issues": issues, "counts": counts, "ok": not blocking, "lang": lang,
+            "dismissed": len(hidden), "dismissed_keys": [i["key"] for i in hidden]}
+
+
+def _timing_checks(brief: dict, assets: dict, timing: dict, L: dict, lbl, add) -> None:
+    langs = [lg for lg in (brief.get("languages") or [brief.get("language")]) if lg in timing]
+    scenes = brief.get("scenes") or []
+    tgt = brief.get("target_seconds")
+    lo, hi = (tgt * 0.85, tgt * 1.1) if tgt else TARGET
+    target = L["target_one"].format(t=tgt) if tgt else L["target_range"].format(a=TARGET[0], b=TARGET[1])
+
+    def longest(lg, n=3):
+        sc = (timing[lg].get("scenes") or {})
+        ids = sorted(sc, key=lambda i: -(sc[i].get("speech") or 0))[:n]
+        return ", ".join(f"“{i}” {sc[i]['speech']:.1f} s" for i in ids)
+    # 1. total length vs the target (each language; one issue for the longest / shortest)
+    durs = {lg: timing[lg]["duration"] for lg in langs}
+    if durs:
+        lg = max(durs, key=durs.get)
+        if durs[lg] > hi:
+            add("length", L["too_long_video"].format(s=durs[lg], label=lbl(lg), target=target, lst=longest(lg)), lang=lg)
+        lg = min(durs, key=durs.get)
+        if durs[lg] < lo:
+            add("length", L["too_short_video"].format(s=durs[lg], label=lbl(lg), target=target), lang=lg)
+    # 2. one language's lines > 10 % longer than another's
+    sp = {lg: timing[lg].get("speech") or 0 for lg in langs}
+    if len(sp) > 1 and min(sp.values()) > 0:
+        short = min(sp, key=sp.get)
+        for lg in langs:
+            ratio = sp[lg] / sp[short]
+            if lg != short and ratio > 1 + LANG_SPREAD:
+                add("lang_longer", L["lang_longer"].format(label=lbl(lg), label2=lbl(short), p=round((ratio - 1) * 100),
+                                                          a=sp[lg], b=sp[short], lst=longest(lg),
+                                                          rate=min(30, int(round((ratio - 1) * 100 / 5.0)) * 5 or 5)),
+                    lang=lg)
+    # 3. recordings that leave the scene without voice
+    for s in scenes:
+        m = assets.get(s.get("asset")) or {}
+        if s.get("layout") != "screen" or m.get("type") != "video":
+            continue
+        worst = None
+        for lg in langs:
+            st = (timing[lg].get("scenes") or {}).get(s.get("id"))
+            if st and st.get("speech"):
+                gap = st["length"] - st["speech"] - 0.4
+                if gap > DEAD_AIR and (worst is None or gap > worst[1]):
+                    worst = (lg, gap, st["speech"])
+        if worst:
+            rd = (m.get("duration") or 0) - float(s.get("trim_start") or 0)
+            add("dead_air", L["dead_air"].format(sid=s["id"], name=s["asset"], rd=min(rd, 10.0), gap=worst[1], lg=worst[0],
+                                                 sp=worst[2]), scene=s["id"], file=s["asset"])
+    # 4. landscape screenshots in a browser frame of a vertical (9:16-main) video
+    if (brief.get("format") or "9:16") == "9:16":
+        for s in scenes:
+            m = assets.get(s.get("asset")) or {}
+            w, h = m.get("w") or 0, m.get("h") or 0
+            if s.get("layout") != "screen" or s.get("device") not in ("browser", "none") or not (w > h * 1.15):
+                continue
+            fw = (s.get("focus") or {}).get("w")
+            if fw and fw <= FOCUS_W:
+                continue
+            pct = round(100 * 940 / max(w, 1)) if w else 0      # the 9:16 device box is ~940 px wide
+            add("small_browser", L["small_browser"].format(sid=s["id"], name=s["asset"], w=w, h=h, pct=min(pct, 100),
+                                                           fw=FOCUS_W, cur=L["cur_focus"].format(w=fw) if fw else ""),
+                scene=s["id"], file=s["asset"])
 
 
 SECTIONS = [
     ("missing_file",),
-    ("invalid_file", "orientation", "low_resolution", "long_recording"),
+    ("invalid_file", "orientation", "low_resolution", "long_recording", "small_browser", "dead_air"),
     ("translation",),
-    ("too_long", "empty_text"),
+    ("too_long", "empty_text", "length", "lang_longer"),
     ("suggestion",),
 ]
 

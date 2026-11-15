@@ -152,7 +152,7 @@ Interactive docs: http://127.0.0.1:8001/docs
 | `GET /api/projects/{id}/timeline` | preview timeline (estimated lengths where no voice yet) |
 | `GET /api/projects/{id}/voiceover.wav` | current joined voice-over |
 | `GET /api/projects/{id}/voice/{scene}.wav` | one scene's clip (404 if not generated) |
-| `POST /api/projects/{id}/voice` | job: `{"scene"?: id, "force"?: bool, "lang"?: "ru" \| "langs"?: [...]}` (default every language) + word timing |
+| `POST /api/projects/{id}/voice` | job: `{"scene"?: id, "force"?: bool, "lang"?: "ru" \| "langs"?: [...]}` (default every language) + word timing. Lines Ovoz refuses are retried, then skipped: the job ends `error` "N lines failed (…)" with `result.failed` and everything else generated; `GET /api/projects/{id}` → `voice_failures` |
 | `POST /api/projects/{id}/render` | job: `{"allow_silent"?, "skip_voice"?, "workers"?: 8, "langs"?: [...], "formats"?: [...]}` → one MP4 per language × format; result `{renders: [...], outputs: [...]}`; 409 if one is already queued/running for the project |
 | `GET /api/jobs/{job}` · `POST /api/jobs/{job}/cancel` | `{status: queued/running/done/error/cancelled, stage, progress 0..1, message, error, result, position}` |
 | `GET /api/projects/{id}/jobs` | recent jobs of a project |
@@ -169,7 +169,8 @@ Interactive docs: http://127.0.0.1:8001/docs
 | `GET /templates/{id}/{file}` | template files for the preview (never cached: hot reload) |
 | `GET /api/projects/{id}/timeline?template=<id>` | preview another template without saving it (the picker's live preview) |
 | `GET /api/projects/{id}/history` · `GET …/history/{n}` · `POST …/history/{n}/restore` | version list (newest first: `{id, created, updated, kind, summary, scenes}`) · one snapshot with its brief · restore (saved as a new version) |
-| `GET /api/projects/{id}/followup[?format=text][&lang=uz]` | ready-to-send message for the source AI (English, or Uzbek with `lang=uz`) + `issues`, `counts`, `ok` |
+| `GET /api/projects/{id}/followup[?format=text][&lang=uz]` | ready-to-send message for the source AI (English, or Uzbek with `lang=uz`) + `issues` (each with a `key`), `counts`, `ok`, `dismissed` |
+| `POST /api/projects/{id}/followup/dismiss` | `{"key"}` hides one follow-up point for this project, `{"key", "undo": true}` shows it again, `{"reset": true}` shows all |
 
 Render jobs go through one queue, so only one render runs at a time and the others wait. Voice jobs
 use their own queue. A render first generates any missing voice lines. If Ovoz fails it errors,
@@ -200,7 +201,12 @@ The server binds to 127.0.0.1 only and has no authentication. It is meant for lo
   name get `oʻ gʻ` (U+02BB) and the tutuq belgisi `ʼ` (U+02BC), like the captions: "Nimbo'ni ko'ring" →
   "Nimboʼni koʻring" (a product name or a capitalised name ending in *o* + apostrophe + case suffix is
   the tutuq belgisi, not the letter oʻ). Applied at render/preview time; the stored brief and the
-  text sent to the TTS are unchanged. ru/en/ar are untouched.
+  text sent to the TTS are unchanged. en/ar are untouched.
+- **Russian on screen:** a no-break space (U+00A0) ties the one-letter prepositions / conjunctions
+  в к с и а о у я to the next word in headline, sub, kicker, items, callout, button, labels, the caption
+  pill and the `.srt`/`.vtt`, so a line never ends on "в" ("Превратите текст / в голос", not "… текст в /
+  голос"). The renderer breaks headlines only at ordinary spaces; caption chunks never end on such a word;
+  word lists (alignment, word times) are unchanged. The text sent to the TTS is unchanged.
 - **Arabic** (`ar`) renders right to left: `#stage.rtl` with `dir=rtl`, no letter-spacing (it breaks
   Arabic joining), right-aligned lists, the progress bar fills from the right, and side-by-side
   layouts are mirrored (16:9 and 1:1 `screen`: text right, device left; `screens`: first screen on the
@@ -236,7 +242,7 @@ The server binds to 127.0.0.1 only and has no authentication. It is meant for lo
   *Soft pulse* 90 bpm 21 s.
 - Editor **Music** tab: list with ▶ preview, pick one per project, delete (uploads), upload (licence
   required), and the mix settings. Project setting:
-  `music: {track, volume_db: -20, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0}`.
+  `music: {track, volume_db: -15, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0}`.
 - **Mix** (render, `build.music_mix` → `music.mix`): voice-over loudness-matched to −20 LUFS, track to
   −12 LUFS (8 LU apart, like raw speech vs a mastered song), then `volume_db`; ducking by `duck_db`
   while the voice speaks, from the voice-over's own level (10 ms RMS gate at peak − 38 dB, 0.15 s
@@ -289,8 +295,11 @@ language, 23–36 words each; error = |aligned word start − true start|):
 
 ### Exports per render
 
-- `<name>.srt` and `<name>.vtt`: cues from the aligned captions, ≤ 2 lines × 42 characters, ≤ 6 s, split
-  at sentence ends, never across scenes or real pauses; Arabic SRT lines are wrapped in RLE/PDF marks.
+- `<name>.srt` and `<name>.vtt`: cues from the aligned captions, ≤ 2 lines × 42 characters (strict: the
+  line break is the most balanced one that keeps both lines ≤ 42; chunks are merged into a cue only when the
+  result still fits, and a longer cue is split in two), ≤ 6 s, split at sentence ends, never across scenes or
+  real pauses. A line never starts with a dash: the dash stays at the end of the previous line (or cue).
+  Never broken at a no-break space (Russian "в голос"). Arabic SRT lines are wrapped in RLE/PDF marks.
 - `<name>.png` cover: a still without captions and progress bar (`render.py --cover T --cover-out`,
   `index.html?…&cover`). Default: the end of the first scene (everything in, before the exit fade);
   `cover: {scene, t}` in the brief, or *Use this frame as cover* under the preview.
@@ -352,6 +361,18 @@ language, 23–36 words each; error = |aligned word start − true start|):
 - Template code is sandboxed (see *Security* below): render.py serves the page from a virtual origin that
   only exposes the folders the render needs, with no network; the live preview is a sandboxed iframe. A
   template still runs JavaScript inside the render page, so it can draw anything into *its own* video.
+- **Text over an AI b-roll clip** (QA #4: Clean washed the clip out with a light wash, so the kicker and sub
+  vanished, 1.3:1 and 1.8:1). Scenes with footage get `.on-media`; every template now gets a dark scrim behind
+  the content, a dark halo on the type and near-white secondary text, and light templates (`clean`) dim the clip
+  towards near-black (at least 0.62) and switch that scene to white text on dark cards, with a white header and
+  progress bar. The Ovoz hook in Clean, measured on its real clip: kicker 6.8:1, sub 8.3:1, headline 9.8:1
+  (`preview/v2-qafix-contrast-ovoz-clean-before-after.png`, `…-ovoz-clean-mp4-frames.png`). `validate.py` now
+  measures every text of every layout over a bright sample frame (≥ 4.5:1 body, ≥ 3:1 large; all built-ins
+  pass: Clean lowest 5.5:1, Aurora 5.0:1, Bold 3.8:1 large, starter 5.0:1) — see TEMPLATES.md *Text over footage*.
+- **Placeholder in the preview:** until a scene's AI clip exists, the editor preview (and the template picker's
+  live preview) shows a busy stand-in still (`html/broll-placeholder.jpg`, tagged "AI clip placeholder") behind
+  it, so a template's contrast over footage is visible before the slow AI stage. Renders never use it (a missing
+  clip still renders the brand gradient). `preview/v2-qafix-contrast-editor-placeholder*.png`.
 
 ### Transitions
 `lift` (the original), `fade`, `slide`, `zoom`, `wipe`, `blur`, `cut` (`video/html/transitions.js`) plus
@@ -741,6 +762,9 @@ order. Each stage gets the whole GPU, and only one pipeline runs at a time (othe
 - **Cancel** works at any stage. It stops the voice loop, kills the AI subprocess tree, or cancels the
   render.
 - **Retry** resumes at the stage that failed, without redoing finished stages.
+- **Voice lines Ovoz refuses pause the pipeline** (`paused`) with *Try again* / *Continue — those lines
+  silent*; elapsed time is per attempt (plus a total), and the ETA sums every remaining stage (see *Fixes from
+  the Ovoz promo QA run* below).
 - Pipelines are kept in `library/pipelines.json`. After a server restart, a running pipeline shows as
   *interrupted*, and Retry resumes it.
 
@@ -775,7 +799,7 @@ order. Each stage gets the whole GPU, and only one pipeline runs at a time (othe
 |---|---|
 | `POST /api/projects/{id}/make` | `{quality?: "final"\|"draft", allow_silent?: false}` → 202 pipeline (409 + the running one if the project already has one) |
 | `GET /api/projects/{id}/make` | latest pipeline of the project: `{status: queued/running/done/error/cancelled/interrupted, current, eta, stages: {voice, unload, ai, render: {state, progress, message, eta, elapsed, detail}}, notices, result: {render}}` |
-| `GET /api/make` · `GET /api/make/{pid}` · `POST /api/make/{pid}/cancel` · `POST /api/make/{pid}/retry` | all pipelines · one · cancel · resume from the failed stage |
+| `GET /api/make` · `GET /api/make/{pid}` · `POST /api/make/{pid}/cancel` · `POST /api/make/{pid}/retry` | all pipelines · one · cancel · resume from the failed stage (also `paused`; body `{"skip_failed": true}` = continue with the refused voice lines silent). Views carry `elapsed` (this attempt), `total_elapsed`, `attempts`, `eta` (remaining stages) and per-stage `estimate` |
 
 **Verified (2026-11-15).**
 - **Full run from the UI** (Final quality): a 3-scene Uzbek project (9.9 s) using Ovoz's local `navoiy` model.
@@ -795,6 +819,146 @@ order. Each stage gets the whole GPU, and only one pipeline runs at a time (othe
 - **API path** (`POST /api/projects` → `POST …/make {"quality":"draft"}` → poll): MP4 in 176 s with the
   local `qwen3uz` voice and a draft b-roll. A TTS call made directly to Ovoz during stage ③ produced the
   *"Ovoz loaded models again…"* notice.
+
+## Fixes from the Ovoz promo QA run (`../demos/ovoz-promo/REPORT.md`)
+
+### Voice lines Ovoz refuses (bugs #1, #2)
+- **Retry.** `voicelib.tts` retries Ovoz 422 (Microsoft's `NoAudioReceived`, which Ovoz reports as
+  "Matnni tekshiring") and 500/502/504 twice, after 1.5 s and 4 s (× 0.7–1.3 jitter). 400 (bad voice or
+  language), 410 and 503 are not retried. An unreachable Ovoz still stops the job at once.
+- **Keep going.** `build.generate` skips a line that still fails and generates every other line. The voice
+  job then ends as an error, *"1 line failed (ru · languages)"*, with `result.failed` (each entry has `lang`,
+  `scene`, `code`, `status`, `attempts`, `model`, `voice` and the spoken `text`). Generated lines are aligned
+  and joined as usual.
+- **Remembered.** Failures are kept in `build/voice-failures.json` by voice key. `GET /api/projects/{id}` and
+  the `PUT` response return `voice_failures`: the lines that still fail. A line drops off the list as soon as
+  its text or voice changes, or its clip exists.
+- **Per-line actions** (a red box under the Generate/Render buttons, a `✕ RU` badge in the scene list, and a
+  card in the scene form of that language):
+  - *Edit text*: opens the line in its language.
+  - *Try again*.
+  - *Try another voice*: the other voices of that language, same engine first (Svetlana → Dmitriy). *Use for
+    this line* stores `scene.voices.<lang>`; *Use for every RU line* changes the language's voice.
+  - *Render this line silent*: `scene.silent: ["ru"]`. The captions stay, and the line no longer counts as
+    missing voice.
+- **Reasons in the UI language** (EN/UZ), by `code`:
+  - `no_audio_online`: "Microsoft's online voice service (Edge) sent no audio for this sentence, even after 3
+    tries … the text itself is fine".
+  - `no_audio`: a local model returned no audio.
+  - `service_error`, `rejected`, `model_missing`, `unreachable`.
+- **The editor refreshes on every job end**, errors included: scene list, voice dots, timing badges and
+  failures. Before, the editor kept showing "Voice: 0/8" until a reload.
+- **The voice button says what it does:** *Generate missing voice · 3 languages* or *Regenerate every line ·
+  3 languages* (UX 7). A tooltip explains which lines it generates.
+- **"Make video" pauses** instead of failing. The voice stage generates everything it can, then the pipeline
+  becomes `paused` (stage state `paused`, `voice_failures`). The stepper shows the same cards plus two
+  choices:
+  - *Try again* (`POST /api/make/{id}/retry`): after editing the text or picking another voice.
+  - *Continue — those lines silent* (`POST /api/make/{id}/retry {"skip_failed": true}`): known failures are
+    not retried again, the stage ends as "done (note)", and the render runs with `allow_silent` and
+    `skip_voice`.
+- `preview/v2-qafix-voice-failed-{editor,panel,form,panel-uz}.png`, `…-voice-fixed-uz.png`,
+  `…-make-paused.png`: Playwright against `tests/fake_ovoz.py`, a stand-in Ovoz that answers the QA's
+  sentence "Говорит на узбекском, русском, английском и арабском." with Ovoz's real 422.
+  - The other 23 lines were generated.
+  - *Use for this line* with Dmitriy fixed the line.
+  - The paused pipeline continued silent and rendered 2 MP4s. No console errors.
+
+### Make video: elapsed time and ETA (bug #3)
+- `elapsed` is this attempt's time. `total_elapsed` and `attempts` cover all attempts; the stepper shows
+  "· 9 min in total" after a retry.
+- `eta` is the sum over the stages still to run. Each stage gets an `estimate` when the pipeline starts and
+  after every stage:
+  - voice: 1.5 s per Edge line, 3.5 s per local line, plus 0.7 s alignment each;
+  - unload: 6 s;
+  - AI: the AI queue's own estimates for the jobs the project still needs (music, portrait, b-roll incl. a
+    landscape variant, presenter), plus ~25 s when ComfyUI has to start;
+  - render: per language × format, the video length × the measured render seconds per video second of this
+    project's earlier renders (same format, preferably the same template; render metadata now stores
+    `template`), else 1.2×, plus 4 s per output.
+
+  The running stage uses its live ETA (voice lines left, the AI jobs' ETAs, render frames left), else its
+  estimate minus its elapsed time. Before, the ETA covered only the running job ("~7 s left" while b-roll
+  and render were still to come).
+- Measured, 2 outputs (uz + ru 9:16, 37 s each):
+  - At the start of the render stage the ETA said 106 s (1.2× estimate); the render took 70 s.
+  - From the first frames on, the ETA tracked the frames: 67 s left at t = 15 s, and it finished at t = 82 s.
+  - The next run uses the measured 0.95×.
+
+### Follow-up checks (UX 2–4, 6)
+`GET /api/projects/{id}/followup` now also gets the timelines (main format, every language) and checks:
+- **`length`**: the video runs over `target_seconds` + 10 % (a new optional brief field), or outside
+  15–45 s without one. Lists the longest lines.
+- **`lang_longer`**: one language's speech runs > 10 % longer than another's. Lists its longest lines and
+  suggests a voice speed (+5 to +30 %).
+- **`dead_air`**: a screen recording keeps its scene > 2 s past the line, in the worst language.
+- **`small_browser`**: a landscape screenshot in a browser (or bare) frame in a 9:16-main project, with no
+  focus or a focus wider than 0.3. It says the shot is shown at ~65 % and asks for a tighter focus or a phone
+  screenshot.
+
+Every issue has a `key`. *Not needed — hide* in the dialog (`POST /api/projects/{id}/followup/dismiss
+{"key"}`, `{"reset": true}`) stores it in `project.json` (`followup_dismissed`). Dismissed points are left
+out of the message (`dismissed: n`), so a deliberate chips/list scene is no longer suggested as a screen
+scene on every call.
+
+### Music (UX 8)
+- `volume_db` defaults to **−15** (was −20, which left music 20–23 dB under the voice and barely audible on a
+  phone).
+- **Too dark.** Every track's share of energy above 2 kHz is measured (`hf`, first 60 s, stored in
+  `meta.json`). A *generated* track under 2 % is `dark`; the QA's ACE-Step track had 0.5 %.
+  - The music list marks it *◐ dark*.
+  - The settings explain it and offer *Generate again with a new seed* (`POST /api/ai/music` with a random
+    seed).
+  - *Brighten it in the mix* is on by default for dark tracks (`music.brighten`, `false` turns it off):
+    `highshelf=f=2500:g=6` + `highshelf=f=6000:g=2` before the mix, level-compensated. This lifted the QA
+    track from 0.5 % to 1.4 % above 2 kHz.
+  - The builtin pads and uploads are measured but not judged.
+- **Phone speaker preview:** *📱 Phone speaker* in the preview bar and the music tab routes the preview,
+  music, scene clips and track previews through a 200 Hz high-pass (2 × 12 dB/oct, Web Audio). It is
+  remembered per browser.
+
+### Callout placement (bug #5)
+- `callout_position: auto | above | below` (screen scenes; a select in the form when there is a callout).
+- **No focus:** the device box gives up a strip for the callout under the device (or above it), so the
+  label no longer covers the bottom of the phone screen.
+- **With a focus:** `auto` puts the label below the focus area if it fits, else above, else on the side
+  where it covers less of it. The side is decided once from the settled zoom, so every render worker agrees.
+  `above` and `below` force a side.
+- `preview/v2-qafix-callout-before-after-9x16.png` (the QA's "Bir bosishda audio" over the player → under
+  the phone, player visible), `…-callout-focus-auto-vs-below.png`.
+
+### Spoken text vs captions (bug #6)
+- `scene.say_tts` (per language; never falls back to another language) and a project-wide
+  `pronounce: {lang: {word: spoken}}` (whole words, case-insensitive). Captions, `.srt` and on-screen text
+  keep `say`; the TTS gets the spoken form, and the voice cache key uses it.
+- Without an override the key is unchanged, so no clip is regenerated. A pronunciation that reproduces the
+  old text reuses the old clip: the QA's ru lines went from "Овоз" to "Ovoz" + `pronounce` with no new TTS
+  call.
+- Alignment runs on the spoken text. `align.remap_words` maps its word times back onto the caption words:
+  equal words 1:1, a differing run shares the spoken run's time span by character weight, and unspoken
+  caption words get a zero-length slot.
+- The scene form has *🗣 Spoken text (pronunciation)* per language.
+- Verified on the QA project (ru, cached audio): captions and SRT say "Ovoz" (2 lines, 0 "Овоз"), 8/8 lines
+  aligned, hook word times unchanged (`preview/v2-qafix-ru-ovoz-captions-16x9.png`).
+
+### B-roll seed and both orientations (UX 9, suggestion 9)
+- `background.seed` is what "Make video" generates with (default 42, as before). The scene form's seed field
+  starts from it and saves changes. A finished clip writes its real seed back, and the form shows it
+  ("This clip: … · seed 52109").
+- `background.clip_alt` is the same b-roll in the other orientation. The timeline picks the clip whose
+  orientation fits the format instead of hard-cropping.
+- In a project with both orientations, the background section offers *Generate a Horizontal variant* (same
+  prompt and seed, assigned as the variant) and *"Make video" generates both orientations*
+  (`background.both`). It is included in the AI-stage ETA.
+
+### Russian typography, subtitles, history, title (#7–#10)
+- Russian no-break spaces and the SRT line rules: see *Languages* and *Exports* above.
+- A cue no longer ends with an orphan word: a short sentence end that does not fit takes the previous chunk
+  with it ("прямо на вашем компьютере." instead of a 0.7 s "компьютере.").
+- QA project, ru and uz: the longest SRT line went from 44 to 41 characters (ru) and from 43 to 40 (uz),
+  with 0 lines starting with a dash (`preview/v2-qafix-ru-nbsp-16x9.png`).
+- History names both templates ("template: Clean → Aurora"; no template = Aurora).
+- The title field grows with the title, with the full title as a tooltip (`preview/v2-qafix-title-1440.png`).
 
 ## AI layers (optional, local, slow)
 
@@ -1002,7 +1166,7 @@ restart; `render.py` with no arguments still renders the Ovoz promo (641 frames,
 
 ```sh
 video/.venv/Scripts/python -m pip install pytest          # once
-video/.venv/Scripts/python -m pytest video/studio/tests   # 148 tests, ~8–10 s, offline: no GPU, no Ovoz, no network
+video/.venv/Scripts/python -m pytest video/studio/tests   # 185 tests, ~20 s, offline: no GPU, no real Ovoz, no network
 video/.venv/Scripts/python -m pytest video/studio/tests -m slow   # + the real renderer: a 2 s video and the sandbox probe
 ```
 
@@ -1015,7 +1179,11 @@ the alignment fallback, follow-up messages (EN/UZ), history snapshots / coalesci
 manifests and zip import with malicious zips, ComfyUI mapping detection on both sample workflows and upload
 validation, music mix (loudness, peak, ducking) and tone shaping, monitor history persistence, i18n, and API
 smoke tests (example project, update, history, same-origin / Host rejection, upload and body limits, ids in
-URLs, security headers, render-process cleanup).
+URLs, security headers, render-process cleanup); since the QA fixes also voice retries / skipped lines / the
+paused pipeline against `tests/fake_ovoz.py` (a stand-in Ovoz that refuses chosen sentences with its real 422),
+ETA / elapsed, spoken-text overrides and word remapping, follow-up length / language / dead-air / small-screenshot
+checks and dismissals, dark-music detection and brightening, b-roll variants and seeds, Russian no-break spaces,
+SRT line rules and text contrast over footage.
 
 A second studio for manual testing next to the real one (own data, never touches its jobs or workers):
 

@@ -46,6 +46,14 @@ class Cancelled(Exception):
     pass
 
 
+class JobFailed(RuntimeError):
+    """A job that ends in error but still has a result to show (e.g. the voice lines that failed)."""
+
+    def __init__(self, message: str, result: dict):
+        super().__init__(message)
+        self.result = result
+
+
 class Queue:
     def __init__(self, name: str, runner, lock):
         self.name, self.runner, self.lock = name, runner, lock
@@ -76,6 +84,8 @@ class Queue:
                 job.update(status="done", progress=1.0, stage="done")
             except Cancelled:
                 job.update(status="cancelled", stage="cancelled")
+            except JobFailed as e:
+                job.update(status="error", error=str(e), result=e.result, stage="failed")
             except Exception as e:  # report every failure to the UI
                 job.update(status="error", error=str(e) or type(e).__name__, stage="failed")
             job["finished"] = now()
@@ -181,7 +191,11 @@ class Jobs:
             build.voiceover(p, tl)
             voiced += tl["voiced"]
             needed += tl["voice_needed"]
-        return {**res, "voiced": voiced, "voice_needed": needed, "languages": langs}
+        out = {**res, "voiced": voiced, "voice_needed": needed, "languages": langs}
+        if res["failed"]:
+            # every other line was generated (and timed); the editor lists the failed ones with actions
+            raise JobFailed(build.failed_summary(res["failed"]), out)
+        return out
 
     def _render(self, job: dict) -> dict:
         """One MP4 (+ .srt, .vtt, cover .png) per language x format: <lang>-<fmt>-<timestamp>.mp4."""
@@ -202,11 +216,17 @@ class Jobs:
                     raise Cancelled()
                 job.update(progress=round(0.12 * f, 3), message=msg)
             try:
-                build.generate(p, progress=prog, langs=langs)
+                vres = build.generate(p, progress=prog, langs=langs)
             except build.V.TTSError as e:
                 if not prm.get("allow_silent"):
                     raise RuntimeError(f"{e}. Fix the voice settings, or render without voice-over.") from None
                 warnings.append(f"voice-over skipped: {e}")
+            else:
+                if vres["failed"]:
+                    if not prm.get("allow_silent"):
+                        raise JobFailed(build.failed_summary(vres["failed"]), {"failed": vres["failed"],
+                                                                             "generated": vres["generated"]})
+                    warnings.append(f"voice-over skipped: {build.failed_summary(vres['failed'])}")
         job.update(stage="timing", message="word timing", progress=0.12)
         build.align_all(p, langs, progress=lambda f, m: job.update(progress=round(0.12 + 0.03 * f, 3), message=m))
         # 2. timelines (+ voice-over joins and music mixes, shared by the formats of a language)
@@ -255,7 +275,7 @@ class Jobs:
             meta = {"language": lg, "format": f, "duration": tl["duration"], "width": tl["width"], "height": tl["height"],
                     "voiced": tl["voiced"], "voice_needed": tl["voice_needed"], "warnings": warnings,
                     "seconds": round(time.time() - t0, 1), "cover_t": cover_t, "timing": tl.get("timing"),
-                    "music": tl.get("music"), "srt": f"{base}.srt", "vtt": f"{base}.vtt",
+                    "music": tl.get("music"), "template": (tl.get("template") or {}).get("id"), "srt": f"{base}.srt", "vtt": f"{base}.vtt",
                     "cover": f"{base}.png" if (p.renders_dir / f"{base}.png").exists() else None, "batch": stamp}
             final.with_suffix(".json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
             out.replace(final)

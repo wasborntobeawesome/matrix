@@ -353,10 +353,44 @@
     const transport = el("div", { class: "transport" });
     const actions = el("div", { class: "actions" });
     const jobBox = el("div", { class: "jobs", "aria-live": "polite" });
+    const failBox = el("div", { class: "vfails", hidden: true });
     const makeBox = el("div", { class: "make", "aria-live": "polite" });
     const rendersBox = el("div", { class: "renders" });
-    const right = el("section", { class: "col col-preview", "aria-label": t("preview") }, pvBar, previewBox, transport, coverBox, actions, makeBox, jobBox, rendersBox);
+    const right = el("section", { class: "col col-preview", "aria-label": t("preview") }, pvBar, previewBox, transport, coverBox, actions, failBox, makeBox, jobBox, rendersBox);
     // language + format of the live preview (and of the scene form's language tab)
+    // ---------- "phone speaker" listening: a 200 Hz high-pass (2 x 12 dB/oct) on everything the editor plays ----------
+    const PH = { ctx: null, bus: null, hp: null, out: null, done: new WeakSet(), on: false };
+    try { PH.on = localStorage.getItem("studio-phone-speaker") === "1"; } catch { /* private mode */ }
+    function phoneRoute() {
+      if (!PH.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return false;
+        PH.ctx = new AC();
+        PH.bus = PH.ctx.createGain(); PH.out = PH.ctx.createGain();
+        PH.hp = [0, 1].map(() => { const f2 = PH.ctx.createBiquadFilter(); f2.type = "highpass"; f2.frequency.value = 200; f2.Q.value = 0.707; return f2; });
+        PH.hp[0].connect(PH.hp[1]); PH.hp[1].connect(PH.out); PH.out.connect(PH.ctx.destination);
+      }
+      for (const a of [...preview.audioEls, clip, musPrev]) {
+        if (PH.done.has(a)) continue;
+        try { PH.ctx.createMediaElementSource(a).connect(PH.bus); PH.done.add(a); } catch { /* already routed */ }
+      }
+      PH.bus.disconnect();
+      PH.bus.connect(PH.on ? PH.hp[0] : PH.out);
+      PH.ctx.resume().catch(() => {});
+      return true;
+    }
+    function setPhone(on) {
+      PH.on = on;
+      try { localStorage.setItem("studio-phone-speaker", on ? "1" : "0"); } catch { /* private mode */ }
+      if (!phoneRoute()) toast(t("phoneNoAudio"), "error");
+      renderPreviewBar();
+      if (S.tab === "music") renderMusic();
+    }
+    // remembered "on": route on the first click (an AudioContext needs a user gesture)
+    const onPtr = () => { if (PH.on && !PH.ctx) phoneRoute(); };
+    document.addEventListener("pointerdown", onPtr);
+    const phoneBtn = () => el("button", { type: "button", class: `btn small pv-phone ${PH.on ? "on" : ""}`, "aria-pressed": PH.on ? "true" : "false",
+      title: t("phoneSpeakerHelp"), onclick: () => setPhone(!PH.on) }, "📱 " + t("phoneSpeaker"));
     function renderPreviewBar() {
       const kids = [];
       if (multi()) kids.push(el("div", { class: "seg small-seg", role: "radiogroup", "aria-label": t("previewLanguage") },
@@ -368,7 +402,7 @@
       const reload = el("button", { type: "button", class: "icon-btn pv-reload", title: t("tpl.reloadHelp"), "aria-label": t("tpl.reload"),
         onclick: async () => { await loadTemplates(); renderSettings(); refreshTimeline(); } }, "↻");
       pvBar.hidden = false;
-      pvBar.replaceChildren(...(kids.length ? [el("span", { class: "muted small" }, t("previewIn")), ...kids] : []), el("span", { class: "grow" }), reload);
+      pvBar.replaceChildren(...(kids.length ? [el("span", { class: "muted small" }, t("previewIn")), ...kids] : []), el("span", { class: "grow" }), phoneBtn(), reload);
     }
     function renderCover() {
       const c = S.brief.cover;
@@ -402,6 +436,7 @@
         const r = await api("PUT", `/api/projects/${pid}`, { brief: S.brief });
         S.savedVersion = v;
         S.warnings = r.warnings || [];
+        if (r.voice_failures) { S.failures = r.voice_failures; renderFailures(); }
         // keep the local brief object (form closures reference it); the server copy is normalised
         setSave(S.version === v ? "saved" : "saving");
         renderWarnings();
@@ -463,6 +498,7 @@
       document.title = `${S.brief.title} — ${t("appName")}`;
       for (const j of d.jobs || []) if (j.status === "queued" || j.status === "running") trackJob(j);
       S.aiJobs = d.ai_jobs || [];
+      S.failures = d.voice_failures || [];
       S.make = d.make && d.make.id ? d.make : null;
       for (const j of S.aiJobs) S.aiPrev[j.id] = j.status;
     }
@@ -490,7 +526,9 @@
     async function refreshAssets(adopt = false) {
       const d = await api("GET", `/api/projects/${pid}`);
       S.assets = d.assets; S.warnings = d.warnings; S.renders = d.renders;
+      S.failures = d.voice_failures || [];
       if (adopt && S.version === S.savedVersion) adoptBrief(d.brief);
+      renderFailures();
     }
     // Replace the whole brief (server changed it) and rebuild every view that holds references.
     function adoptBrief(nb) {
@@ -505,8 +543,11 @@
 
     // ---------- crumb + settings bar ----------
     function renderCrumb() {
+      // the field grows with the title (up to the free header space); the full title is also its tooltip
+      const fit = inp => { inp.style.setProperty("--chars", Math.max(12, [...(inp.value || "")].length + 2)); inp.title = inp.value; };
       const title = el("input", { class: "title-input", value: S.brief.title, "aria-label": t("title"),
-        oninput: e => { S.brief.title = e.target.value; document.title = `${e.target.value} — ${t("appName")}`; changed(); } });
+        oninput: e => { S.brief.title = e.target.value; fit(e.target); document.title = `${e.target.value} — ${t("appName")}`; changed(); } });
+      fit(title);
       undoBtns.u = el("button", { class: "icon-btn undo-btn", title: t("undoTip"), "aria-label": t("undo"), onclick: undo }, "↶");
       undoBtns.r = el("button", { class: "icon-btn undo-btn", title: t("redoTip"), "aria-label": t("redo"), onclick: redo }, "↷");
       $("#crumb").replaceChildren(el("a", { href: "#/", class: "back" }, "← " + t("back")), title,
@@ -674,7 +715,9 @@
                 st && hasSay ? el("span", { class: `tbadge ${st.timing === "aligned" ? "al" : "es"}`,
                   title: st.timing === "aligned" ? t("timingAlignedHelp") : t("timingEstimatedHelp") },
                   st.timing === "aligned" ? t("timingAligned") : t("timingEstimated")) : null,
-                ...Object.keys(missingFor(sc)).map(lg => el("span", { class: "mbadge", title: t("missingIn", { lang: t("langs." + lg), list: missingFor(sc)[lg].join(", ") }) }, `⚠ ${lg.toUpperCase()}`))),
+                ...Object.keys(missingFor(sc)).map(lg => el("span", { class: "mbadge", title: t("missingIn", { lang: t("langs." + lg), list: missingFor(sc)[lg].join(", ") }) }, `⚠ ${lg.toUpperCase()}`)),
+                ...(S.failures || []).filter(x => x.scene === sc.id).map(x => el("span", { class: "fbadge", title: `${t("vfail.badge", { lang: x.lang.toUpperCase() })} — ${failReason(x)}` }, `✕ ${x.lang.toUpperCase()}`)),
+                ...(sc.silent || []).filter(lg => langs().includes(lg)).map(lg => el("span", { class: "sbadge", title: t("vfail.silentBadge", { lang: lg.toUpperCase() }) }, `🔇 ${lg.toUpperCase()}`))),
               el("span", { class: "scene-say", dir: S.lang === "ar" ? "rtl" : "auto" }, getT(sc.say, S.lang) || getT(sc.say, main()) || getT(sc.headline, S.lang) || "—"))),
           el("div", { class: "scene-tools" },
             hasSay ? el("button", { class: `icon-btn voice-dot ${voiced ? "on" : ""}`, title: voiced ? `${t("listen")} (${t("voiced")})` : t("generateThis"),
@@ -863,6 +906,21 @@
           `${t("timing")}: ${st.timing === "aligned" ? t("timingAligned") : t("timingEstimated")}`) : null;
         f.append(el("div", { class: "field" }, el("label", { for: "say-in" }, t("say") + (multi() ? ` · ${FL.toUpperCase()}` : "")),
           Object.assign(sayIn, { id: "say-in" }), el("div", { class: "row between" }, counter, el("div", { class: "row gap" }, timing, vbtn))));
+        const fl = (S.failures || []).find(x => x.scene === sc.id && x.lang === FL);
+        if (fl) f.append(failureCard(fl));
+        if ((sc.silent || []).includes(FL)) f.append(el("p", { class: "warn small" }, "🔇 " + t("vfail.silentNote", { lang: FL.toUpperCase() }), " ",
+          el("button", { class: "btn small", onclick: () => { sc.silent = sc.silent.filter(x => x !== FL); if (!sc.silent.length) delete sc.silent; changed({ list: true, now: true }); renderSceneForm(); } }, t("vfail.unsilent"))));
+        const lv = sc.voices && sc.voices[FL];
+        if (lv) f.append(el("p", { class: "muted small" }, t("vfail.lineVoice", { lang: FL.toUpperCase(), v: voiceLabel(lv.model, lv.voice) }), " ",
+          el("button", { class: "btn small", onclick: () => { delete sc.voices[FL]; if (!Object.keys(sc.voices).length) delete sc.voices; changed({ list: true, now: true }); renderSceneForm(); } }, t("vfail.lineVoiceReset"))));
+        // spoken text: captions keep `say`, the voice reads this (brand spelling vs phonetic form)
+        const ttsIn = el("textarea", { rows: 2, dir: dirOf(FL), placeholder: t("sayTtsPh"), "aria-label": `${t("sayTts")} (${FL})`,
+          oninput: e => { const v2 = e.target.value; const m = isMap(sc.say_tts) ? { ...sc.say_tts } : {};
+            if (v2.trim()) m[FL] = v2; else delete m[FL];
+            if (Object.keys(m).length) sc.say_tts = m; else delete sc.say_tts; changed(); } });
+        ttsIn.value = isMap(sc.say_tts) ? (sc.say_tts[FL] || "") : "";
+        f.append(el("details", { class: "say-tts", open: !!ttsIn.value }, el("summary", { class: "muted small" }, "🗣 " + t("sayTts")),
+          ttsIn, el("p", { class: "muted tiny" }, t("sayTtsHelp"))));
       }
       // layout fields
       const L = sc.layout;
@@ -914,7 +972,13 @@
         f.append(el("div", { class: "field" }, el("span", { class: "lbl" }, t("asset")),
           assetPicker(sc.asset, ["image", "video"], name => { sc.asset = name; delete sc.focus; changed({ list: true }); renderSceneForm(); })));
         if (sc.asset && S.assets[sc.asset]) f.append(focusPicker(sc));
-        f.append(text("callout", t("callout")), text("headline", t("headline")), text("kicker", t("kicker")), text("sub", t("sub")));
+        f.append(text("callout", t("callout")));
+        if (getT(sc.callout, FL === "all" ? main() : FL) || getT(sc.callout, main())) {
+          const cpos = el("select", { "aria-label": t("calloutPos"), onchange: e => upd("callout_position", e.target.value === "auto" ? null : e.target.value) },
+            ["auto", "above", "below"].map(v => el("option", { value: v, selected: (sc.callout_position || "auto") === v }, t("calloutPositions." + v))));
+          f.append(field(t("calloutPos"), cpos, "narrow"));
+        }
+        f.append(text("headline", t("headline")), text("kicker", t("kicker")), text("sub", t("sub")));
         if (sc.device === "browser") f.append(text("url", t("urlBar"), { ph: "app.example.com" }));
         const adv = el("div", { class: "row gap wrap" }, num("zoom", t("zoom"), 1, 4, 0.1, t("auto")));
         if (S.assets[sc.asset] && S.assets[sc.asset].type === "video") adv.append(num("trim_start", t("trimStart"), 0, 600, 0.1, "0"));
@@ -1066,7 +1130,7 @@
       const tracks = S.music || [];
       const pick = id => {
         if (!id) { delete b.music; }
-        else b.music = { volume_db: -20, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0, ...(b.music || {}), track: id };
+        else b.music = { volume_db: -15, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0, ...(b.music || {}), track: id };
         changed({ now: true }); renderMusic(); setTab("music");
       };
       const playBtn = m => el("button", { class: "icon-btn", "aria-label": `${t("musicPreview")} ${m.title}`, title: t("musicPreview"),
@@ -1080,6 +1144,7 @@
             el("span", { class: "muted small" }, [m.artist, `${Math.round(m.duration)} s`, m.bpm ? `${m.bpm} bpm` : "", m.mood].filter(Boolean).join(" · ")),
             el("span", { class: "muted small" }, `${t("licence")}: ${m.licence}`))),
         el("span", { class: `src-badge ${m.source}` }, t("musicSources." + m.source)),
+        m.dark ? el("span", { class: "dark-badge", title: t("musicDarkTip", { p: ((m.hf || 0) * 100).toFixed(1) }) }, "◐ " + t("musicDark")) : null,
         playBtn(m),
         m.source !== "builtin" ? el("button", { class: "icon-btn danger", "aria-label": `${t("delete")} ${m.title}`, title: t("delete"), onclick: async () => {
           const n = (m.used_in || []).length;
@@ -1110,7 +1175,9 @@
           cur.duck !== false ? slider("duck_db", -30, 0, 1, db, t("musicDuckDb")) : null,
           el("div", { class: "row gap wrap" }, slider("fade_in", 0, 10, 0.5, sec, t("musicFadeIn")), slider("fade_out", 0, 15, 0.5, sec, t("musicFadeOut"))),
           slider("start", 0, Math.max(1, Math.floor(meta ? meta.duration : 60)), 0.5, sec, t("musicStart")),
-          el("p", { class: "muted small" }, t("musicMixHelp"))));
+          el("p", { class: "muted small" }, t("musicMixHelp")),
+          meta && meta.dark ? darkBox(cur, meta) : null,
+          el("div", { class: "row gap" }, phoneBtn(), el("span", { class: "muted small" }, t("phoneSpeakerHelp")))));
       }
       // generate (ACE-Step)
       const gen = b.music && b.music.generate;
@@ -1122,7 +1189,7 @@
         pendMusic.length ? el("div", { class: "jobs" }, pendMusic.map(j => AI.jobRow(j, pollAi))) : null,
         AI.musicForm({ project: pid, duration: S.tl ? Math.ceil(S.tl.duration + 3) : 30,
           onQueued: j => { onAiJob(j); renderMusic(); },
-          onSpec: sp => { b.music = { volume_db: -20, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0, ...(b.music || {}), generate: sp };
+          onSpec: sp => { b.music = { volume_db: -15, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0, ...(b.music || {}), generate: sp };
             changed({ now: true }); toast(t("ai.musicPlannedToast"), "ok"); renderMusic(); } })));
       if (!AI.status) AI.loadStatus().then(() => { if (S.tab === "music") renderMusic(); }).catch(() => {});
       // upload
@@ -1147,12 +1214,32 @@
             try {
               const m = await api("POST", "/api/library/music", fd, true);
               await flush(); await loadMusic(); await refreshAssets(true);
-              b.music = { volume_db: -20, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0, ...(b.music || {}), track: m.id };
+              b.music = { volume_db: -15, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0, ...(b.music || {}), track: m.id };
               changed({ now: true }); toast(t("musicAdded", { name: m.title }), "ok"); setTab("music");
             } catch (e) { err.textContent = e.message; }
           } }, t("musicAddBtn")))));
       panel.replaceChildren(warnBox, el("div", { class: "form" }, el("h3", {}, "♪ " + t("music")), ...kids));
       renderWarnings();
+    }
+
+    // a generated (or any) track with < 2 % of its energy above 2 kHz: nearly inaudible on a phone speaker
+    function darkBox(cur, meta) {
+      const on = cur.brighten != null ? !!cur.brighten : true;
+      const cb = el("input", { type: "checkbox", id: "mu-bright", checked: on, onchange: e => { cur.brighten = e.target.checked; changed({ now: true }); } });
+      const g = (S.brief.music && S.brief.music.generate) || (meta.source === "generated" ? { prompt: meta.prompt, genre: meta.genre, mood: meta.mood, bpm: meta.bpm } : null);
+      const regen = g && (g.prompt || g.genre || g.mood) ? el("button", { class: "btn small", onclick: async () => {
+        const seed = Math.floor(Math.random() * 100000);
+        try {
+          const j = await api("POST", "/api/ai/music", { prompt: g.prompt, genre: g.genre, mood: g.mood, bpm: g.bpm,
+            duration: Math.min(240, Math.max(10, Math.ceil(S.tl ? S.tl.duration + 3 : meta.duration))), seed, project: pid });
+          if (S.brief.music && S.brief.music.generate) S.brief.music.generate.seed = seed;
+          changed({ now: true }); onAiJob(j); toast(t("ai.queued"), "ok"); renderMusic();
+        } catch (e) { toast(e.message, "error", 8000); }
+      } }, "✦ " + t("musicRegenSeed")) : null;
+      return el("div", { class: "warnbox" },
+        el("p", {}, "◐ " + t("musicDarkWarn", { p: ((meta.hf || 0) * 100).toFixed(1) })),
+        el("label", { class: "row gap", for: "mu-bright" }, cb, el("span", {}, t("musicBrighten"))),
+        regen);
     }
 
     // ---------- JSON tab ----------
@@ -1243,7 +1330,7 @@
         toast(t("ai.musicReady", { name: r.title || r.track }), "ok");
         await loadMusic().catch(() => {});
         if (j.params && j.params.assign_project === pid) {
-          S.brief.music = { volume_db: -20, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0, ...(S.brief.music || {}), track: r.track };
+          S.brief.music = { volume_db: -15, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0, ...(S.brief.music || {}), track: r.track };
           changed({ now: true }); refreshTimeline();
         }
         if (S.tab === "music") renderMusic();
@@ -1292,7 +1379,28 @@
       const projProv = S.brief.broll_provider || (AI.status && AI.status.default_provider) || "fastwan-5b";
       box.append(el("p", { class: "muted small" }, t("ai.bgProvider", { p: provName(bg.provider || projProv) }) +
         (bg.provider ? "" : ` (${t("ai.projectDefault")})`) + (bg.image ? ` · ${t("ai.bgAnimates", { a: bg.image })}` : "")));
-      if (cur && cur.provider) box.append(el("p", { class: "muted tiny" }, t("ai.clipFrom", { p: provName(cur.provider), l: cur.licence || "" })));
+      if (cur && cur.provider) box.append(el("p", { class: "muted tiny" }, t("ai.clipFrom", { p: provName(cur.provider), l: cur.licence || "" }) +
+        (cur.seed != null ? ` · ${t("ai.seedN", { n: cur.seed })}` : "")));
+      // a project with both orientations: the other one gets its own clip instead of a hard crop
+      const mainLand = S.brief.format === "16:9";
+      const otherOrient = fmts().some(f2 => (f2 === "16:9") !== mainLand) ? (mainLand ? "portrait" : "landscape") : null;
+      if (otherOrient && (bg.prompt || cur)) {
+        const alt = clips.find(c => c.id === bg.clip_alt);
+        const both = el("input", { type: "checkbox", id: `bg-both-${sc.id}`, checked: !!bg.both,
+          onchange: e => { if (e.target.checked) bg.both = true; else delete bg.both; changed({ now: true }); } });
+        const variantBtn = bg.prompt ? el("button", { class: "btn small", onclick: async () => {
+          try {
+            const j = await api("POST", "/api/ai/broll", { prompt: bg.prompt, seed: bg.seed ?? 42, preset: "final", orientation: otherOrient,
+              provider: bg.provider || projProv, assign: { project: pid, scene: sc.id, dim: bg.dim, blur: bg.blur, variant: true } });
+            toast(j.status === "done" ? t("ai.reused") : t("ai.queued"), "ok"); onAiJob(j);
+          } catch (e) { toast(e.message, "error", 8000); }
+        } }, "✦ " + t("ai.variantMake", { o: t("ai.orientations." + otherOrient) })) : null;
+        box.append(el("div", { class: "variant-box" },
+          el("p", { class: "small" }, alt ? "✓ " + t("ai.variantHave", { o: t("ai.orientations." + otherOrient), id: alt.id, n: alt.seed ?? "?" })
+            : t("ai.variantNone", { o: t("ai.orientations." + otherOrient) })),
+          el("div", { class: "row gap wrap" }, alt ? null : variantBtn,
+            el("label", { class: "row gap small", for: `bg-both-${sc.id}` }, both, el("span", {}, t("ai.variantBoth"))))));
+      }
       if (bg.clip && S.lib && !cur) box.append(el("p", { class: "warn small" }, t("ai.bgMissing", { id: bg.clip })));
       if (!bg.clip) box.append(el("p", { class: "muted small" }, t("ai.bgNone")));
       if (cur && ((cur.w > cur.h) !== (S.brief.format === "16:9"))) {
@@ -1313,7 +1421,8 @@
       box.append(el("details", { class: "gen", open: !!(bg.prompt && !bg.clip) },
         el("summary", {}, "✦ " + t("ai.generateClip")),
         AI.brollForm({ prompt: bg.prompt || "", orientation: S.brief.format === "16:9" ? "landscape" : "portrait",
-          provider: bg.provider || projProv, image: bg.image || "",
+          provider: bg.provider || projProv, image: bg.image || "", seed: bg.seed ?? 42,
+          onSeed: v => { bg.seed = v; changed(); },
           images: Object.entries(S.assets).filter(([, m]) => m.type === "image").map(([n]) => ({ value: n, label: n, ref: { project: pid, asset: n } }))
             .concat((S.portraits || []).map(m => ({ value: m.id, label: `${t("ai.kinds.portrait")}: ${m.name || m.id}`, ref: { portrait: m.id } }))),
           assign: { project: pid, scene: sc.id, dim: bg.dim, blur: bg.blur },
@@ -1724,11 +1833,31 @@
         try { ta.value = (await api("GET", `/api/projects/${pid}/followup?lang=${e.target.value}`)).message; }
         catch (err) { toast(err.message, "error"); }
       } }, el("option", { value: "en", selected: true }, "English"), el("option", { value: "uz" }, "Oʻzbekcha"));
-      const kinds = Object.entries(r.counts || {});
+      const chips = el("div", { class: "row gap wrap" });
+      const list = el("ul", { class: "fu-issues" });
+      const hiddenRow = el("div", { class: "row gap muted small" });
+      // every point can be dismissed for this project (remembered on the server), e.g. a deliberate text scene
+      const draw = r2 => {
+        r = r2;
+        ta.value = r.message;
+        chips.replaceChildren(r.ok ? el("span", { class: "chipx ok" }, "✓ " + t("fu.allGood")) : "",
+          ...Object.entries(r.counts || {}).map(([k, n]) => el("span", { class: `chipx ${k === "suggestion" ? "" : "bad"}` }, `${t("fu.kinds." + k) !== "fu.kinds." + k ? t("fu.kinds." + k) : k}: ${n}`)));
+        list.replaceChildren(...(r.issues || []).map(it => el("li", { class: `fu-issue ${it.type === "suggestion" ? "sug" : ""}` },
+          el("span", { class: "small" }, it.text),
+          el("button", { class: "btn small", title: t("fu.dismissTip"), onclick: () => dismiss({ key: it.key }) }, "✕ " + t("fu.dismiss")))));
+        hiddenRow.replaceChildren(...(r.dismissed ? [t("fu.hidden", { n: r.dismissed }),
+          el("button", { class: "btn small", onclick: () => dismiss({ reset: true }) }, t("fu.showHidden"))] : []));
+      };
+      const dismiss = async body => {
+        try { await api("POST", `/api/projects/${pid}/followup/dismiss`, body); draw(await api("GET", `/api/projects/${pid}/followup?lang=${msgLang.value}`)); }
+        catch (e) { toast(e.message, "error"); }
+      };
+      draw(r);
       modal(t("fu.title"), el("div", { class: "form" },
         el("p", { class: "muted small" }, t("fu.intro")),
-        el("div", { class: "row gap wrap" }, r.ok ? el("span", { class: "chipx ok" }, "✓ " + t("fu.allGood")) : null,
-          ...kinds.map(([k, n]) => el("span", { class: `chipx ${k === "suggestion" ? "" : "bad"}` }, `${t("fu.kinds." + k) !== "fu.kinds." + k ? t("fu.kinds." + k) : k}: ${n}`))),
+        chips,
+        el("details", { class: "fu-details" }, el("summary", { class: "muted small" }, t("fu.issues")), list),
+        hiddenRow,
         el("label", { class: "row gap" }, el("span", { class: "muted small" }, t("fu.msgLang")), msgLang),
         ta, el("p", { class: "muted small" }, t("fu.api"), " ", el("code", {}, `GET /api/projects/${pid}/followup[?lang=uz]`))),
         [{ label: t("close"), onClick: () => {} }, { label: "⧉ " + t("copy"), primary: true, onClick: () => { copyText(ta.value); } }]);
@@ -1867,7 +1996,7 @@
         if (playing) { t0 = cur; t0Perf = performance.now(); if (audio.src) audio.currentTime = cur; syncMusic(true); }
         draw();
       }
-      return { load, seek, toggle, pause, setFormat, get t() { return cur; }, get musicVolume() { return M ? musicAt(cur) : null; },
+      return { load, seek, toggle, pause, setFormat, audioEls: [audio, mus], get t() { return cur; }, get musicVolume() { return M ? musicAt(cur) : null; },
         stop: () => { pause(); audio.src = ""; mus.removeAttribute("src"); removeEventListener("message", onMsg); } };
     })();
 
@@ -1904,13 +2033,19 @@
         const cur = S.jobs[j.id];
         renderJobs();
         if (cur.status === "queued" || cur.status === "running") { timers.push(setTimeout(poll, 700)); return; }
+        // every end (done, error, cancelled): what was generated is on disk — refresh scenes, voice state, failures
+        try { await refreshAssets(); } catch { /* server restarting */ }
+        await refreshTimeline();
+        if (cur.kind === "render") renderRenders();
+        if (S.tab === "scene") renderPanel();
+        const failed = (cur.result && cur.result.failed) || [];
         if (cur.status === "done") {
           toast(cur.kind === "render" ? t("renderDone") : t("voiceDone"), "ok");
           if (cur.result && cur.result.warnings && cur.result.warnings.length) showWarnings(cur.result.warnings);
-          if (cur.kind === "render") { await refreshAssets(); renderRenders(); }
-          await refreshTimeline();
-          if (cur.kind === "voice" && cur.result && cur.result.generated) renderPanel();
           after && after();
+        } else if (cur.status === "error" && failed.length) {
+          toast(t("vfail.toast", { n: failed.length }), "error", 12000);
+          failBox.scrollIntoView({ block: "nearest", behavior: "smooth" });
         } else if (cur.status === "error") {
           toast(t("jobFailed", { msg: cur.error }), "error", 12000);
           if (cur.kind === "render" && /not reachable|Ovoz/i.test(cur.error || "")) {
@@ -1935,14 +2070,86 @@
       }));
       renderActions();
     }
+    // ---------- voice lines Ovoz refused: per-line actions ----------
+    function failReason(x) {
+      return t("vfail.code." + (x.code || "service_error"), { n: x.attempts || 1, model: x.model || "", status: x.status || "", detail: x.detail || x.error || "" });
+    }
+    function voiceLabel(model, voice) {
+      const m = OV.models.find(x => x.id === model);
+      const v = m && (m.voices || []).find(x => x.id === voice);
+      return `${v ? v.name : voice}${m ? ` · ${m.name}` : ` · ${model}`}`;
+    }
+    function otherVoices(lang, model, voice) {
+      // the same engine first (e.g. Svetlana -> Dmitriy), then the other models that speak the language
+      const ms = modelsFor(lang).filter(m => m.available !== false).sort((a, b) => (b.id === model) - (a.id === model));
+      const out = [];
+      for (const m of ms) for (const v of voicesFor(m, lang)) if (!(m.id === model && v.id === voice)) out.push({ model: m.id, voice: v.id, label: `${v.name} · ${m.name}` });
+      return out;
+    }
+    function failureCard(x) {
+      const sc = S.brief.scenes.find(s2 => s2.id === x.scene);
+      if (!sc) return null;
+      const lg = x.lang;
+      const opts = otherVoices(lg, x.model, x.voice);
+      const sel = opts.length ? el("select", { "aria-label": t("vfail.voiceFor") }, opts.map((o, i) => el("option", { value: String(i) }, o.label))) : null;
+      const pick = () => opts[sel ? parseInt(sel.value, 10) || 0 : 0];
+      const regen = async () => { await flush(); startJob("voice", { scene: sc.id, lang: lg }); };
+      return el("div", { class: "vfail", "data-scene": sc.id, "data-lang": lg },
+        el("div", { class: "row between wrap" }, el("b", {}, `${lg.toUpperCase()} · ${sc.id}`),
+          el("span", { class: "muted tiny" }, `${voiceLabel(x.model, x.voice)} · ${t("vfail.tries", { n: x.attempts || 1 })}`)),
+        el("p", { class: "vf-text", dir: lg === "ar" ? "rtl" : "auto" }, `“${getT(sc.say, lg) || x.text}”`),
+        x.text && x.text !== getT(sc.say, lg) ? el("p", { class: "muted tiny" }, `🗣 ${t("sayTts")}: “${x.text}”`) : null,
+        el("p", { class: "small vf-why" }, failReason(x)),
+        el("div", { class: "row gap wrap vf-actions" },
+          el("button", { class: "btn small", onclick: () => editLine(sc.id, lg) }, "✎ " + t("vfail.edit")),
+          el("button", { class: "btn small", onclick: regen }, "↻ " + t("vfail.retry")),
+          el("button", { class: "btn small", onclick: async () => {
+            sc.silent = [...new Set([...(sc.silent || []), lg])];
+            S.failures = (S.failures || []).filter(y => !(y.scene === sc.id && y.lang === lg));
+            changed({ list: true, now: true }); renderFailures(); if (S.tab === "scene") renderPanel(); } }, "🔇 " + t("vfail.silent"))),
+        el("div", { class: "row gap wrap vf-voice" },
+          el("span", { class: "small" }, t("vfail.otherVoice") + ":"),
+          ...(sel ? [sel,
+            el("button", { class: "btn small primary", onclick: async () => {
+              const o = pick();
+              sc.voices = { ...(sc.voices || {}), [lg]: { model: o.model, voice: o.voice } };
+              changed({ list: true, now: true }); await flush(); regen(); } }, t("vfail.useLine")),
+            el("button", { class: "btn small", onclick: async () => {
+              const o = pick();
+              S.brief.voices = S.brief.voices || {};
+              S.brief.voices[lg] = { model: o.model, voice: o.voice, rate: (S.brief.voices[lg] || {}).rate || 0 };
+              if (lg === main()) S.brief.voice = S.brief.voices[lg];
+              changed({ now: true }); renderSettings(); await flush(); startJob("voice", { lang: lg }); } }, t("vfail.useAll", { lang: lg.toUpperCase() }))]
+            : [el("span", { class: "muted small" }, t("vfail.noVoices"))])));
+    }
+    function editLine(sceneId, lg) {
+      const i = S.brief.scenes.findIndex(s2 => s2.id === sceneId);
+      if (i < 0) return;
+      if (multi()) S.formLang = lg;
+      if (S.lang !== lg && langs().includes(lg)) setLang(lg);
+      select(i);
+      setTimeout(() => { const ta = $("#say-in"); if (ta) { ta.focus(); ta.scrollIntoView({ block: "center" }); } }, 60);
+    }
+    function renderFailures() {
+      const fs = (S.failures || []).filter(x => S.brief && S.brief.scenes.some(s2 => s2.id === x.scene));
+      failBox.hidden = !fs.length || !!(S.make && S.make.status === "paused");   // a paused "Make video" shows them itself
+      if (!fs.length) { failBox.replaceChildren(); return; }
+      const busyV = Object.values(S.jobs).some(j => j.kind === "voice" && (j.status === "queued" || j.status === "running"));
+      failBox.replaceChildren(
+        el("div", { class: "row between wrap" }, el("b", { class: "vf-title" }, "⚠ " + (fs.length === 1 ? t("vfail.titleOne") : t("vfail.title", { n: fs.length }))),
+          el("button", { class: "btn small", disabled: busyV || !OV.ok, onclick: async () => { await flush(); startJob("voice", {}); } }, "↻ " + t("vfail.retryAll"))),
+        el("p", { class: "muted small" }, t("vfail.help")),
+        ...fs.map(failureCard));
+    }
     function renderActions() {
       const busy = kind => Object.values(S.jobs).some(j => j.kind === kind && (j.status === "queued" || j.status === "running"));
       const tl = S.tl;
       const allVoiced = tl && tl.voiced >= tl.voice_needed;
       actions.replaceChildren(
-        el("button", { class: "btn", disabled: busy("voice") || !OV.ok, title: OV.ok ? "" : t("ovozDown", { url: OV.url || "" }),
+        el("button", { class: "btn", disabled: busy("voice") || !OV.ok,
+          title: OV.ok ? (allVoiced ? t("voiceBtnAllTip") : t("voiceBtnTip")) : t("ovozDown", { url: OV.url || "" }),
           onclick: async () => { await flush(); startJob("voice", allVoiced ? { force: true } : {}); } },
-          "🎙 " + (allVoiced ? t("regenerate") : t("generateVoice")) + (multi() ? ` (${langs().length})` : "")),
+          "🎙 " + (allVoiced ? t("voiceBtnAll") : t("voiceBtnMissing")) + (multi() ? ` · ${t("nLangs", { n: langs().length })}` : "")),
         el("button", { class: "btn primary", disabled: busy("render"), title: `${langs().join(", ")} × ${fmts().join(", ")}`, onclick: async () => {
           await flush();
           if (!OV.ok && !(tl && tl.voiced >= tl.voice_needed)) {
@@ -2015,8 +2222,8 @@
       catch (e) { if (e.status === 409 && e.data && e.data.id) S.make = e.data; else { toast(e.message, "error", 9000); return; } }
       renderMake(); pollMake(); pollAi();
     }
-    async function makeAction(path) {
-      try { S.make = await api("POST", `/api/make/${S.make.id}/${path}`); renderMake(); pollMake(); }
+    async function makeAction(path, body) {
+      try { S.make = await api("POST", `/api/make/${S.make.id}/${path}`, body); renderMake(); pollMake(); }
       catch (e) { toast(e.message, "error"); }
     }
     async function pollMake() {
@@ -2027,7 +2234,7 @@
       renderMake();
       if (S.make.current !== wasStage || S.make.status !== was) {
         // the server changed the brief (b-roll / portrait / presenter quality) or made a render
-        await refreshAssets(true); renderRenders(); await refreshTimeline();
+        await refreshAssets(true); renderRenders(); await refreshTimeline(); renderMake();
         if (S.make.status === "done" && was !== "done") {
           const rs = (S.make.result || {}).renders || [(S.make.result || {}).render];
           toast(rs.length > 1 ? t("make.doneMany", { n: rs.length }) : t("make.done", { name: rs[0] || "" }), "ok", 8000);
@@ -2050,14 +2257,21 @@
       const failedAt = Object.entries(m.stages).find(([, st]) => ["error", "cancelled", "pending", "running"].includes(st.state));
       const status = el("div", { class: "row between wrap" },
         el("span", { class: `small mk-status mk-${m.status}` }, (m.status === "queued" && m.position ? t("make.queuedPos", { n: m.position }) : t("make.status." + m.status)) +
-          (m.elapsed != null ? ` · ${fmtT(m.elapsed)}` : "") + (m.eta ? ` · ${t("make.eta", { t: fmtT(m.eta) })}` : "")),
+          (m.elapsed != null ? ` · ${fmtT(m.elapsed)}` : "") + (m.eta ? ` · ${t("make.eta", { t: fmtT(m.eta) })}` : "") +
+          (m.total_elapsed != null && (m.attempts || 1) > 1 && m.total_elapsed !== m.elapsed ? ` · ${t("make.total", { t: fmtT(m.total_elapsed) })}` : "")),
         el("div", { class: "row gap" },
           makeActive() ? el("button", { class: "btn small danger", onclick: () => makeAction("cancel") }, t("make.cancel")) : null,
           ["error", "cancelled", "interrupted"].includes(m.status) && failedAt
             ? el("button", { class: "btn small", onclick: () => makeAction("retry") }, t("make.retry", { stage: t("make.stages." + failedAt[0]) })) : null));
+      const paused = m.status === "paused" ? el("div", { class: "mk-pause-box" },
+        el("p", { class: "small" }, t("make.pausedHelp")),
+        el("div", { class: "row gap wrap" },
+          el("button", { class: "btn small primary", onclick: async () => { await flush(); makeAction("retry"); } }, "↻ " + t("make.retryFailed")),
+          el("button", { class: "btn small", onclick: async () => { await flush(); makeAction("retry", { skip_failed: true }); } }, "🔇 " + t("make.continueSilent"))),
+        ...(S.failures || []).map(failureCard)) : null;
       const steps = el("ol", { class: "steps" }, ["voice", "unload", "ai", "render"].map((k, i) => {
         const st = m.stages[k];
-        const icon = st.state === "done" ? "✓" : st.state === "warning" ? "!" : st.state === "error" ? "✕" : st.state === "cancelled" ? "–" : String(i + 1);
+        const icon = st.state === "done" ? "✓" : st.state === "paused" ? "‖" : st.state === "warning" ? "!" : st.state === "error" ? "✕" : st.state === "cancelled" ? "–" : String(i + 1);
         const meta = [];
         if (st.state === "running") {
           if (st.elapsed != null) meta.push(fmtT(st.elapsed));
@@ -2075,7 +2289,8 @@
       const notes = (m.notices || []).map(n => el("div", { class: "warn small notice" }, "⚠ " + n));
       const aiRows = m.current === "ai" ? (S.aiJobs || []).filter(j => (m.ai_jobs || []).includes(j.id) && (j.status === "queued" || j.status === "running"))
         .map(j => AI.jobRow(j, pollAi)) : [];
-      makeBox.replaceChildren(head, status, steps, ...notes, ...aiRows);
+      makeBox.replaceChildren(head, status, ...(paused ? [paused] : []), steps, ...notes, ...aiRows);
+      renderFailures();
     }
 
     // ---------- keyboard ----------
@@ -2113,6 +2328,7 @@
       setTab("scene");
       renderRenders();
       renderActions();
+      renderFailures();
       renderPreviewBar();
       renderCover();
       preview.setFormat(S.fmt);
@@ -2141,6 +2357,8 @@
       clearTimeout(UN.timer);
       closeDrawer();
       document.removeEventListener("keydown", onKey);
+      document.removeEventListener("pointerdown", onPtr);
+      if (PH.ctx) PH.ctx.close().catch(() => {});
       document.removeEventListener("ovoz", onOvoz);
       removeEventListener("beforeunload", onUnload);
     };

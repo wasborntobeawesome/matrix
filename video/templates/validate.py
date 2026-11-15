@@ -19,7 +19,13 @@ What it checks
        - text outside the frame or the format's safe zone, text clipped by an overflow:hidden box,
          scene text overlapping the caption pill or the brand header
        - declared fonts that did not load
-  4. Determinism: renders the same moments twice, in a fresh page and in a different order, and compares
+  4. Contrast over footage: every layout x format (first language) again with an AI b-roll background (the sample
+     frame video/html/broll-placeholder.jpg, or --frame <image|clip>; dim 0.5) and, per text element, the WCAG
+     contrast ratio of its colour against the pixels behind it (a second screenshot with the text hidden; halos and
+     scrims stay). The 10th percentile must reach 4.5:1 (3:1 for text >= 66 px, or >= 50 px semi-bold). Text on
+     its own opaque or gradient box (a button) is skipped. --no-contrast skips it; --sheet DIR also writes the
+     frames to DIR/contrast/.
+  5. Determinism: renders the same moments twice, in a fresh page and in a different order, and compares
      the pixels (rendering uses the software rasteriser here so equal input gives equal pixels).
 Exit code 0 = no errors.
 """
@@ -142,6 +148,199 @@ def settle_time(s: dict) -> float:
     return round(s["start"] + min(3.2, (s["end"] - s["start"]) * 0.72), 3)
 
 
+# ------------------------------------------------------------------ contrast over footage
+# A sample "AI b-roll" frame: busy, mid-tone, with bright warm bokeh and light ribbons — the worst case for
+# text (the QA's Wan 2.2 hook clip measured mean luma 0.43, p90 0.88). The same still is the editor's
+# placeholder for a clip that is not generated yet.
+SAMPLE_FRAME = VIDEO / "html" / "broll-placeholder.jpg"
+CONTRAST_MIN = {"normal": 4.5, "large": 3.0}     # WCAG AA; "large" = >= 66 stage px (24 css px on a phone)
+LARGE_PX = 66
+
+
+def make_sample_frame(out: Path = SAMPLE_FRAME, size: int = 1280, seed: int = 7) -> Path:
+    """Write the deterministic sample frame (numpy + Pillow; no AI model needed)."""
+    import numpy as np
+    from PIL import Image, ImageFilter
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:size, 0:size].astype(np.float32) / size
+    img = np.zeros((size, size, 3), np.float32)
+    top, bot = np.array([18, 52, 46]), np.array([52, 98, 88])
+    img[:] = (top + (bot - top) * yy[..., None]) / 255.0
+    img += 0.10 * np.exp(-((xx - 0.3) ** 2 + (yy - 0.6) ** 2) / 0.05)[..., None] * np.array([0.9, 0.7, 0.4])
+    # glowing ribbons (sound waves)
+    for k in range(4):
+        amp, fr, ph, x0 = rng.uniform(0.06, 0.16), rng.uniform(1.5, 3.2), rng.uniform(0, 6.3), rng.uniform(0.25, 0.75)
+        cx = x0 + amp * np.sin(2 * np.pi * fr * yy + ph)
+        d = np.abs(xx - cx)
+        w = rng.uniform(0.008, 0.02)
+        col = np.array([0.45, 0.95, 0.85]) if k % 2 == 0 else np.array([0.6, 0.7, 1.0])
+        img += (np.exp(-(d / w) ** 2) * 0.85)[..., None] * col
+    # bokeh discs, warm and white, soft edged
+    for _ in range(90):
+        cx, cy, r = rng.uniform(0, 1), rng.uniform(0, 1), rng.uniform(0.02, 0.075)
+        a = rng.uniform(0.35, 0.95)
+        col = np.array([1.0, 0.86, 0.6]) if rng.uniform() < 0.75 else np.array([1.0, 1.0, 1.0])
+        d = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / r
+        m = np.clip((1.0 - d) * 6.0, 0, 1)
+        img = img * (1 - (m * a * 0.85)[..., None]) + (m * a)[..., None] * col
+    img = np.clip(img, 0, 1)
+    im = Image.fromarray((img * 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(2))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    im.save(out, "JPEG", quality=84, optimize=True)
+    return out
+
+
+def frame_from(src: Path | None, tmpdir: Path) -> Path:
+    """The background still for the contrast check: the sample, an image, or a frame of a clip (ffmpeg)."""
+    if not src:
+        if not SAMPLE_FRAME.exists():
+            make_sample_frame()
+        return SAMPLE_FRAME
+    src = Path(src)
+    if src.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+        return src
+    import subprocess
+    out = tmpdir / "contrast-frame.png"
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    subprocess.run([str(VIDEO / "bin" / "ffmpeg.exe"), "-y", "-loglevel", "error", "-ss", "1.5", "-i", str(src),
+                    "-frames:v", "1", str(out)], check=True, capture_output=True)
+    return out
+
+
+def _lin(c):
+    import numpy as np
+    c = np.asarray(c, dtype=np.float64) / 255.0
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+
+
+def luminance(rgb):
+    """WCAG relative luminance of sRGB values (0..255), any array shape [..., 3]."""
+    lin = _lin(rgb)
+    return 0.2126 * lin[..., 0] + 0.7152 * lin[..., 1] + 0.0722 * lin[..., 2]
+
+
+def contrast_ratio(a, b):
+    la, lb = luminance(a), luminance(b)
+    import numpy as np
+    hi, lo = np.maximum(la, lb), np.minimum(la, lb)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def text_contrast(bg_rgb, color: tuple, box: tuple, pct: float = 10.0) -> dict:
+    """Contrast of a text colour (r, g, b[, a]) against the background pixels inside box (x0, y0, x1, y1).
+
+    Returns {p10, mean_bg_luma}: p10 = the contrast that 90 % of the background behind the text reaches
+    (a few bright bokeh spots behind letters are what makes text unreadable, so the mean is not enough)."""
+    import numpy as np
+    h, w = bg_rgb.shape[:2]
+    x0, y0, x1, y1 = (int(round(v)) for v in box)
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return {"p10": None, "mean_bg_luma": None}
+    px = bg_rgb[y0:y1, x0:x1].reshape(-1, 3).astype(np.float64)
+    r, g, b = color[:3]
+    a = color[3] if len(color) > 3 else 1.0
+    fg = a * np.array([r, g, b], np.float64) + (1 - a) * px          # semi-transparent text over each pixel
+    cr = contrast_ratio(fg, px)
+    return {"p10": float(np.percentile(cr, pct)), "mean_bg_luma": float(luminance(px).mean())}
+
+
+# text elements of the visible scene: tight rects, colour, size (gradient-filled text is skipped)
+TEXT_JS = r"""
+() => {
+  const st = document.getElementById("stage"), S = st.getBoundingClientRect();
+  const scene = [...document.querySelectorAll("#scenes > .scene")].find(s => s.style.display !== "none" && parseFloat(s.style.opacity || "1") > 0.6);
+  if (!scene) return [];
+  const out = [], seen = new Set();
+  // any CSS colour (rgb(), color(srgb …) from color-mix, oklch …) -> [r, g, b, a] via a 1x1 canvas
+  const cv = document.createElement("canvas"); cv.width = cv.height = 1;
+  const g2 = cv.getContext("2d", { willReadFrequently: true });
+  const rgbaOf = c => { g2.clearRect(0, 0, 1, 1); g2.fillStyle = "#000"; g2.fillStyle = c; g2.fillRect(0, 0, 1, 1);
+    const d = g2.getImageData(0, 0, 1, 1).data; return [d[0], d[1], d[2], d[3] / 255]; };
+  const visible = el => { for (let e = el; e && e !== st; e = e.parentElement) { const cs = getComputedStyle(e);
+      if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) < 0.5) return false; } return true; };
+  const tw = document.createTreeWalker(scene, NodeFilter.SHOW_TEXT);
+  for (let n = tw.nextNode(); n; n = tw.nextNode()) {
+    const txt = n.textContent.trim(); if (!txt || !/[\p{L}\p{N}]/u.test(txt)) continue;   // emoji-only: colour glyphs
+    const el = n.parentElement;
+    if (!el || el.closest(".device, .callout, .dev-label, .cl-icon, .pb-ring") || !visible(el)) continue;
+    const cs = getComputedStyle(el);
+    if (/text/.test(cs.webkitBackgroundClip || cs.backgroundClip || "") || cs.webkitTextFillColor === "rgba(0, 0, 0, 0)") continue;
+    const r = document.createRange(); r.selectNodeContents(n);
+    const rs = [...r.getClientRects()].filter(x => x.width > 1 && x.height > 1);
+    if (!rs.length) continue;
+    // text on its own opaque or gradient box (a button) does not depend on the footage: not part of this check
+    let boxed = false;
+    for (let e = el; e && e !== scene; e = e.parentElement) { const bs = getComputedStyle(e); if (rgbaOf(bs.backgroundColor)[3] >= 0.9 || /gradient|url\(/.test(bs.backgroundImage)) { boxed = true; break; } }
+    if (boxed) continue;
+    const m = rgbaOf(cs.color);
+    const key = el.className + txt; if (seen.has(key)) continue; seen.add(key);
+    out.push({ text: txt.slice(0, 40), cls: (typeof el.className === "string" ? el.className : "").split(/\s+/)[0] || el.tagName.toLowerCase(),
+      color: m, size: parseFloat(cs.fontSize), weight: parseInt(cs.fontWeight) || 400,
+      rects: rs.map(x => [x.left - S.left, x.top - S.top, x.right - S.left, x.bottom - S.top]) });
+  }
+  return out;
+}
+"""
+HIDE_TEXT_CSS = "#scenes, #scenes * { color: transparent !important; -webkit-text-fill-color: transparent !important; -webkit-text-stroke-color: transparent !important; }"
+
+
+def contrast_level(size: float, weight: int) -> str:
+    return "large" if size >= LARGE_PX or (size >= 0.75 * LARGE_PX and weight >= 600) else "normal"
+
+
+async def contrast_checks(ctx_factory, info: dict, frame: Path, langs: list[str], dim: float = 0.5,
+                          dump: Path | None = None) -> list[dict]:
+    """Render every text layout over `frame` as a b-roll background (dim like the QA's hook: 0.5) and measure
+    each text element's contrast against what is behind it (the frame re-rendered with the text hidden; text
+    shadows / halos stay, they are part of the treatment). Returns [{where, text, ratio, need, ok}]."""
+    from io import BytesIO
+    import numpy as np
+    from PIL import Image
+    out = []
+    for lang in langs:
+        for fmt in FORMATS:
+            tl = test_timeline(info, lang, fmt)
+            for s in tl["scenes"]:
+                s["background"] = {"type": "broll", "placeholder": True, "dim": dim, "blur": 0}
+            tl["broll"] = True
+            tl["broll_placeholder"] = frame.resolve().as_uri()
+            pg, _ = await ctx_factory(tl, f"contrast-{lang}-{fmt.replace(':', 'x')}")
+            for s in tl["scenes"]:
+                if s["layout"] in ("presenter",):
+                    continue
+                t = settle_time(s)
+                await pg.evaluate("t => window.seek(t)", t)
+                await pg.evaluate("t => window.seek(t)", t)
+                items = await pg.evaluate(TEXT_JS)
+                if not items:
+                    continue
+                sty = await pg.add_style_tag(content=HIDE_TEXT_CSS)
+                png = await pg.screenshot(type="png", clip={"x": 0, "y": 0, "width": tl["width"], "height": tl["height"]})
+                await sty.evaluate("e => e.remove()")
+                bg = np.asarray(Image.open(BytesIO(png)).convert("RGB"))
+                if dump:
+                    dump.mkdir(parents=True, exist_ok=True)
+                    stem = f"contrast-{lang}-{fmt.replace(':', 'x')}-{s['id']}"
+                    (dump / f"{stem}.png").write_bytes(await pg.screenshot(type="png", clip={"x": 0, "y": 0, "width": tl["width"], "height": tl["height"]}))
+                    (dump / f"{stem}-behind.png").write_bytes(png)
+                for it in items:
+                    worst = None
+                    for rc in it["rects"]:
+                        r = text_contrast(bg, tuple(it["color"]), rc)
+                        if r["p10"] is not None and (worst is None or r["p10"] < worst):
+                            worst = r["p10"]
+                    if worst is None:
+                        continue
+                    lvl = contrast_level(it["size"], it["weight"])
+                    need = CONTRAST_MIN[lvl]
+                    out.append({"where": f"{lang} {fmt} {s['layout']}{' (' + s['id'] + ')' if s['id'] != s['layout'] else ''}",
+                                "text": it["text"], "cls": it["cls"], "ratio": round(worst, 2), "need": need,
+                                "ok": worst >= need})
+            await pg.close()
+    return out
+
+
 CHECK_JS = r"""
 () => {
   const st = document.getElementById("stage");
@@ -202,9 +401,10 @@ fams => fams.map(f => ({ family: f, ok: document.fonts.check(`700 40px "${f}"`) 
 """
 
 
-async def render_checks(info: dict, langs: list[str], sheet_dir: Path | None, previews_dir: Path | None, tid: str) -> dict:
+async def render_checks(info: dict, langs: list[str], sheet_dir: Path | None, previews_dir: Path | None, tid: str,
+                        contrast_frame: Path | None = None) -> dict:
     from playwright.async_api import async_playwright
-    rep = {"issues": [], "errors": [], "fonts": [], "determinism": [], "frames": 0}
+    rep = {"issues": [], "errors": [], "fonts": [], "determinism": [], "frames": 0, "contrast": []}
     fams = set()
     F = (info.get("tokens") or {}).get("fonts") or {}
     for k in ("display", "body"):
@@ -220,6 +420,8 @@ async def render_checks(info: dict, langs: list[str], sheet_dir: Path | None, pr
         mounts = R.Mounts()
         mounts.add(R.HERE)
         mounts.add(VIDEO / "shared" / "fonts")
+        if contrast_frame:
+            mounts.add(contrast_frame.resolve().parent)
         browser, ctx = await R.open_context(p, 1080, 1920, mounts)
         tmp = Path(__file__).resolve().parent / ".validate-tmp"
         tmp.mkdir(exist_ok=True)
@@ -260,6 +462,10 @@ async def render_checks(info: dict, langs: list[str], sheet_dir: Path | None, pr
                     if lang == langs[0] and fmt == "9:16" and fams:
                         rep["fonts"] = await pg.evaluate(FONTS_JS, sorted(fams))
                     await pg.close()
+            # contrast of every text over footage (the template's b-roll treatment)
+            if contrast_frame:
+                rep["contrast"] = await contrast_checks(page_for, info, contrast_frame, langs[:1],
+                                                        dump=sheet_dir / "contrast" if sheet_dir else None)
             # determinism: same moments, fresh page, different order (incl. transition moments)
             for fmt in FORMATS:
                 tl = test_timeline(info, langs[0], fmt)
@@ -392,8 +598,11 @@ def validate(target: str, args) -> dict:
     if info.get("js_file"):
         tinfo["js"] = info["js_file"]
     langs = ["en", "ar"] if args.quick else ["en", "ar", "ru", "uz"]
+    frame = None if args.no_contrast else frame_from(Path(args.frame) if args.frame else None, HERE / ".validate-tmp")
     r = asyncio.run(render_checks(tinfo, langs, Path(args.sheet) if args.sheet else None,
-                                  d if args.previews else None, rep["template"]))
+                                  d if args.previews else None, rep["template"], frame))
+    rep["contrast"] = r["contrast"]
+    rep["contrast_failed"] = [c for c in r["contrast"] if not c["ok"]]
     rep["errors"] += r["errors"]
     rep["issues"] = r["issues"]
     rep["determinism"] = r["determinism"]
@@ -417,7 +626,18 @@ def main() -> int:
     ap.add_argument("--sheet")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--strict", action="store_true")
+    ap.add_argument("--frame", help="contrast check background: an image or a clip (default: the sample frame "
+                                    "video/html/broll-placeholder.jpg)")
+    ap.add_argument("--no-contrast", action="store_true", help="skip the contrast-over-footage check")
+    ap.add_argument("--make-sample", action="store_true", help="(re)write the sample frame and exit")
     args = ap.parse_args()
+    try:
+        sys.stdout.reconfigure(errors="backslashreplace")     # emoji / Arabic on a legacy console code page
+    except (AttributeError, ValueError):
+        pass
+    if args.make_sample:
+        print(make_sample_frame())
+        return 0
     targets = args.templates or [m["id"] for m in T.list_all()] + [d.name for d in T.ROOT.iterdir()
                                                                    if d.is_dir() and d.name.startswith("_") and (d / "manifest.json").is_file()]
     reports = []
@@ -426,13 +646,19 @@ def main() -> int:
         rep = validate(tgt, args)
         reports.append(rep)
         if not args.json:
-            n_iss = len(rep["issues"])
+            n_iss = len(rep["issues"]) + len(rep.get("contrast_failed") or [])
             ok = not rep["errors"] and not n_iss and not rep["determinism"] and (not args.strict or not rep["warnings"])
             print(f"\n== {rep['template']}: {'OK' if ok else 'PROBLEMS'}  ({rep.get('frames', 0)} frames rendered)")
             for e in rep["errors"]:
                 print(f"  ERROR    {e}")
             for i in rep["issues"]:
                 print(f"  LAYOUT   {i['where']}: {i['what']}")
+            for c in rep.get("contrast_failed") or []:
+                print(f"  CONTRAST {c['where']}: .{c['cls']} “{c['text']}” {c['ratio']}:1 over footage (needs {c['need']}:1)")
+            if rep.get("contrast"):
+                worst = min(rep["contrast"], key=lambda c: c["ratio"] / c["need"])
+                print(f"  contrast {len(rep['contrast'])} texts over footage, lowest {worst['ratio']}:1 "
+                      f"({worst['where']} .{worst['cls']}, needs {worst['need']}:1)")
             for dd in rep["determinism"]:
                 print(f"  NONDET   {dd}")
             for w in rep["warnings"]:
@@ -441,7 +667,8 @@ def main() -> int:
                 print(f"  font     {f['family']}: {'loaded' if f['ok'] else 'NOT LOADED'}")
     if args.json:
         print(json.dumps(reports, ensure_ascii=False, indent=1))
-    bad = any(r["errors"] or r["issues"] or r["determinism"] or (args.strict and r["warnings"]) for r in reports)
+    bad = any(r["errors"] or r["issues"] or r.get("contrast_failed") or r["determinism"] or (args.strict and r["warnings"])
+              for r in reports)
     return 1 if bad else 0
 
 

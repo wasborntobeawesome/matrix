@@ -175,6 +175,25 @@
 #stage.tpl-clean .seg { height: 6px; background: rgba(16,24,40,.1); }
 #stage.tpl-clean .seg .fill { background: var(--text); }
 
+/* ---------- over footage (an AI b-roll clip behind the scene: .scene.on-media) ----------
+   The renderer dims the clip towards near-black and sets light --text / --muted / --surface on the scene
+   (html/style.css); here the brand-coloured details get lighter tints so they keep their contrast. */
+#stage.tpl-clean .scene.on-media .cl-kicker, #stage.tpl-clean .scene.on-media .cl-unit,
+#stage.tpl-clean .scene.on-media .cl-url, #stage.tpl-clean .scene.on-media .cl-row.on .cl-label {
+  color: color-mix(in srgb, var(--primary) 40%, #fff); }
+#stage.tpl-clean .scene.on-media .cl-kicker, #stage.tpl-clean .scene.on-media .cl-sub,
+#stage.tpl-clean .scene.on-media .headline { text-shadow: 0 2px 22px rgba(0,0,0,.5), 0 0 3px rgba(0,0,0,.35); }
+#stage.tpl-clean .scene.on-media .grad {
+  background: linear-gradient(100deg, color-mix(in srgb, var(--primary) 45%, #fff), color-mix(in srgb, var(--accent) 45%, #fff));
+  -webkit-background-clip: text; background-clip: text; text-shadow: none; }
+#stage.tpl-clean .scene.on-media .cl-chip, #stage.tpl-clean .scene.on-media .cl-card {
+  border-color: rgba(255,255,255,.14); box-shadow: 0 14px 36px rgba(0,0,0,.28); backdrop-filter: none; }
+#stage.tpl-clean .scene.on-media .cl-chip.on { border-color: color-mix(in srgb, var(--primary) 55%, #fff); }
+#stage.tpl-clean .scene.on-media .cl-check { border-color: rgba(255,255,255,.4); }
+#stage.tpl-clean .scene.on-media .cl-bar { background: rgba(255,255,255,.18); }
+#stage.tpl-clean .scene.on-media .cl-row + .cl-row::before { background: rgba(255,255,255,.12); }
+#stage.tpl-clean .scene.on-media .cl-idx { opacity: 1; }
+
 /* ---------- right-to-left (Arabic): taller lines for the joined script ---------- */
 #stage.rtl.tpl-clean .headline { line-height: 1.28; }
 #stage.rtl.tpl-clean .cl-sub { line-height: 1.45; }

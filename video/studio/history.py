@@ -108,8 +108,17 @@ def record(p, old_brief: dict | None, new_brief: dict, kind: str = "edit", label
 
 
 def listing(p) -> list[dict]:
-    """Newest first, without the briefs."""
-    return list(reversed(_index(p)))
+    """Newest first, without the briefs. Edit summaries that mention the template are recomputed from the
+    snapshots, so versions saved before template names were shown read "template: Clean → Aurora" too."""
+    idx = _index(p)
+    out = []
+    for i, m in enumerate(idx):
+        if i and m.get("kind") == "edit" and "template" in str(m.get("summary") or ""):
+            a, b = _read(p, idx[i - 1]["id"]), _read(p, m["id"])
+            if a and b:
+                m = {**m, "summary": summarize(a.get("brief"), b.get("brief") or {})}
+        out.append(m)
+    return list(reversed(out))
 
 
 def get(p, sid: str) -> dict | None:
@@ -141,6 +150,17 @@ def _fields(a: dict, b: dict) -> list[str]:
     return out
 
 
+def template_name(tid) -> str:
+    """A template's display name ("clean" -> "Clean"); no template = the default template."""
+    try:
+        import templates as TP          # lazy: history is imported by modules templates may not need
+        tid = tid if isinstance(tid, str) and tid else TP.DEFAULT
+        return str(TP.read_manifest(TP.folder(tid)).get("name") or tid)
+    except Exception:  # an unknown / deleted / broken template: its id
+        tid = tid if isinstance(tid, str) and tid else "aurora"
+        return tid[:1].upper() + tid[1:]
+
+
 def summarize(old: dict | None, new: dict) -> str:
     """A short, human summary of what changed between two briefs (shown in the History panel)."""
     if old is None:
@@ -148,7 +168,10 @@ def summarize(old: dict | None, new: dict) -> str:
     parts = []
     for k, label in TOP_LABELS.items():
         if old.get(k) != new.get(k):
-            if k in ("title", "product", "template", "language", "format") and isinstance(new.get(k), str):
+            if k == "template":
+                # no template = the default (Aurora): name both sides, never "—" or a bare "template"
+                parts.append(f"{label}: {template_name(old.get(k))} → {template_name(new.get(k))}")
+            elif k in ("title", "product", "language", "format") and isinstance(new.get(k), str):
                 a, b = old.get(k), new.get(k)
                 parts.append(f"{label}: {a or '—'} → {b}" if len(f'{a}{b}') < 50 else label)
             elif k == "transition":

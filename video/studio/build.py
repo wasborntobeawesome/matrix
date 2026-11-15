@@ -15,6 +15,8 @@ import hashlib
 import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 import align
@@ -22,7 +24,7 @@ import library
 import music
 import presenter
 import templates
-from brief import FORMATS, localize
+from brief import FORMATS, is_silent, line_voice, localize, tts_text
 from store import Project
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
@@ -54,10 +56,13 @@ def say_of(scene: dict) -> str:
 
 
 def voice_key(brief: dict, scene: dict) -> str | None:
-    text = say_of(scene)
-    if not text:
+    """Cache key of a line's clip (LOCALIZED brief): spoken text + that line's voice + language. A silent
+    line has none. The spoken text is `say` unless `say_tts` / the pronunciation table changes it, so old
+    clips keep their keys."""
+    if not say_of(scene) or is_silent(brief, scene):
         return None
-    v = brief.get("voice", {})
+    text = tts_text(brief, scene)
+    v = line_voice(brief, scene)
     raw = json.dumps([text, v.get("model"), v.get("voice"), int(v.get("rate") or 0), brief.get("language"),
                       v.get("style")], ensure_ascii=False)
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
@@ -90,38 +95,144 @@ def voiced_map(p: Project, brief: dict | None = None) -> dict:
 
 def todo_lines(p: Project, langs: list[str] | None = None, scene_ids: list[str] | None = None,
                force: bool = False) -> list[tuple[str, dict, dict]]:
-    """[(lang, localized brief, scene)] that still need a clip."""
+    """[(lang, localized brief, scene)] that still need a clip (silent lines never do)."""
     brief = p.brief
     out = []
     for lg in langs or langs_of(brief):
         lb = localize(brief, lg)
         for s in lb["scenes"]:
-            if not say_of(s) or (scene_ids is not None and s["id"] not in scene_ids):
+            if not say_of(s) or is_silent(lb, s) or (scene_ids is not None and s["id"] not in scene_ids):
                 continue
             if force or not voice_file(p, voice_key(lb, s)).exists():
                 out.append((lg, lb, s))
     return out
 
 
-def generate(p: Project, scene_ids: list[str] | None = None, force: bool = False, progress=None, api: str = OVOZ,
-             langs: list[str] | None = None) -> dict:
-    """Synthesise missing clips for every language (or `langs` / `scene_ids` only). Raises voicelib.TTSError."""
+# ---------------------------------------------------------------- failed lines
+# A line Ovoz could not voice (after its retries) is remembered in build/voice-failures.json by its voice key,
+# so the editor can offer actions (edit the text, another voice, render it silent) after a reload too. An entry
+# stops applying as soon as the line changes (new key) or its clip exists.
+_fail_lock = threading.Lock()
+
+
+def _failures_file(p: Project) -> Path:
+    return p.build_dir / "voice-failures.json"
+
+
+def _read_failures(p: Project) -> dict:
+    try:
+        d = json.loads(_failures_file(p).read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_failures(p: Project, d: dict) -> None:
+    f = _failures_file(p)
+    if not d:
+        f.unlink(missing_ok=True)
+        return
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(f)
+
+
+def fail_code(e: "V.TTSError", model: str | None) -> str:
+    """Why a line failed, for the UI: no_audio_online (Microsoft's online service sent no audio — the text is
+    usually fine), no_audio (a local model sent none), service_error (5xx), rejected (bad voice / language),
+    model_missing (503), unreachable (Ovoz is down)."""
+    if e.unreachable:
+        return "unreachable"
+    if e.status == 422:
+        return "no_audio_online" if (model or "").lower() in ONLINE_MODELS else "no_audio"
+    if e.status == 503:
+        return "model_missing"
+    if e.status in (400, 404, 410):
+        return "rejected"
+    return "service_error"
+
+
+ONLINE_MODELS = {"edge"}      # Ovoz's online engine (Microsoft Edge voices)
+
+
+def voice_failures(p: Project, brief: dict | None = None) -> list[dict]:
+    """The lines that failed last time and still apply (same text + voice, still no clip), in scene order."""
+    d = _read_failures(p)
+    if not d:
+        return []
+    brief = brief or p.brief
+    out = []
+    for lg in langs_of(brief):
+        lb = localize(brief, lg)
+        for s in lb["scenes"]:
+            k = voice_key(lb, s)
+            if k and k in d and not voice_file(p, k).exists():
+                out.append({**d[k], "key": k, "lang": lg, "scene": s["id"]})
+    return out
+
+
+def generate(p: Project, scene_ids: list[str] | None = None, force: bool = False, progress=None, api: str | None = None,
+             langs: list[str] | None = None, skip_failed: bool = False) -> dict:
+    """Synthesise missing clips for every language (or `langs` / `scene_ids` only).
+
+    A line Ovoz refuses is retried (voicelib.tts) and, if it still fails, recorded and SKIPPED: the other lines
+    are still generated. Returns {generated, total, failed: [{lang, scene, key, code, status, error, model,
+    voice, text, attempts}]}. Only "Ovoz is not reachable" stops the whole run (raises voicelib.TTSError).
+    skip_failed: lines that already failed (unchanged since) are not tried again; they are reported as failed."""
+    api = api or OVOZ
     todo = todo_lines(p, langs, scene_ids, force)
+    known = {f["key"]: f for f in voice_failures(p)} if skip_failed else {}
     total = sum(1 for lg in (langs or langs_of(p.brief)) for s in localize(p.brief, lg)["scenes"]
-                if say_of(s) and (scene_ids is None or s["id"] in scene_ids))
-    made = []
+                if say_of(s) and not is_silent(localize(p.brief, lg), s) and (scene_ids is None or s["id"] in scene_ids))
+    made, failed = [], []
+    multi = len(langs_of(p.brief)) > 1
     for i, (lg, lb, s) in enumerate(todo):
+        tag = f"{lg} · {s['id']}"
         if progress:
-            progress(i / max(1, len(todo)), f"voice: {lg} · {s['id']}")
-        f = voice_file(p, voice_key(lb, s))
+            progress(i / max(1, len(todo)), f"voice: {tag}")
+        key = voice_key(lb, s)
+        if key in known:
+            failed.append(known[key])
+            continue
+        f = voice_file(p, key)
         f.parent.mkdir(parents=True, exist_ok=True)
-        v = lb["voice"]
-        audio = V.tts(say_of(s), v["model"], v["voice"], lg, v.get("rate", 0), v.get("style"), api=api)
+        v = line_voice(lb, s)
+
+        def retrying(n, e, tag=tag, i=i):
+            if progress:
+                progress(i / max(1, len(todo)), f"voice: {tag} · retry {n}/{len(V.RETRY_DELAYS)}")
+        try:
+            audio = V.tts(tts_text(lb, s), v["model"], v["voice"], lg, v.get("rate", 0), v.get("style"), api=api,
+                          on_retry=retrying)
+        except V.TTSError as e:
+            if e.unreachable:
+                raise
+            failed.append({"lang": lg, "scene": s["id"], "key": key, "code": fail_code(e, v.get("model")),
+                           "status": e.status, "error": str(e), "detail": e.detail, "attempts": e.attempts,
+                           "model": v.get("model"), "voice": v.get("voice"), "text": tts_text(lb, s),
+                           "time": round(time.time(), 1)})
+            continue
         V.to_wav(audio, f)
-        made.append(f"{lg}:{s['id']}" if len(langs_of(p.brief)) > 1 else s["id"])
+        made.append(f"{lg}:{s['id']}" if multi else s["id"])
+    with _fail_lock:
+        d = _read_failures(p)
+        for x in failed:
+            d[x["key"]] = {k: x[k] for k in x if k not in ("key", "lang", "scene")}
+        for k in list(d):
+            if voice_file(p, k).exists():
+                d.pop(k)
+        _write_failures(p, d)
     if progress:
         progress(1.0, "voice: done")
-    return {"generated": made, "total": total}
+    return {"generated": made, "total": total, "failed": failed}
+
+
+def failed_summary(failed: list[dict]) -> str:
+    """'2 lines failed (ru · languages, ru · models)' — the job / pipeline error (the UI shows per-line actions)."""
+    n = len(failed)
+    which = ", ".join(f"{x['lang']} · {x['scene']}" for x in failed[:4]) + ("…" if n > 4 else "")
+    return f"{n} line{'s' if n != 1 else ''} failed ({which})"
 
 
 def align_all(p: Project, langs: list[str] | None = None, progress=None) -> dict:
@@ -138,7 +249,7 @@ def align_all(p: Project, langs: list[str] | None = None, progress=None) -> dict
     for i, (lg, lb, s, wav) in enumerate(jobs):
         if progress:
             progress(i / max(1, len(jobs)), f"word timing: {lg} · {s['id']}")
-        r = align.timing(wav, say_of(s), lg, lb.get("product") or "", run=True)
+        r = align.timing(wav, tts_text(lb, s), lg, lb.get("product") or "", run=True)
         res["aligned" if r and r.get("method") == "aligned" else "estimated"] += 1
     if progress:
         progress(1.0, "word timing: done")
@@ -146,11 +257,13 @@ def align_all(p: Project, langs: list[str] | None = None, progress=None) -> dict
 
 
 def timeline(p: Project, brief: dict | None = None, lang: str | None = None, fmt: str | None = None,
-             align_mode: str = "cache", template: str | None = None) -> dict:
+             align_mode: str = "cache", template: str | None = None, placeholder: bool = False) -> dict:
     """Timeline for the renderer: scene times (real clip lengths or estimates), captions, assets.
 
     align_mode: "cache" = use cached word timing only, "queue" = also queue missing alignments in
-    the background (live preview), "run" = align now (renders)."""
+    the background (live preview), "run" = align now (renders).
+    placeholder: a scene that asks for an AI clip that does not exist yet gets a placeholder still
+    (`background.placeholder`, the editor preview only); otherwise it falls back to the brand gradient."""
     raw = brief or p.brief
     main = raw.get("language")
     lb = localize(raw, lang)
@@ -171,13 +284,20 @@ def timeline(p: Project, brief: dict | None = None, lang: str | None = None, fmt
         say = say_of(s)
         if say:
             with_say += 1
+        if say and is_silent(lb, s):
+            with_say -= 1                 # the author chose a silent line: not "missing voice"
         timing = None
         if wav:
             speech = V.duration(wav)
             voiced += 1
-            timing = align.timing(wav, say, lang, product, run=align_mode == "run")
+            spoken = tts_text(lb, s)
+            timing = align.timing(wav, spoken, lang, product, run=align_mode == "run")
             if timing is None and align_mode == "queue":
-                align.request(wav, say, lang, product)
+                align.request(wav, spoken, lang, product)
+            if timing and timing.get("method") == "aligned" and spoken != say:
+                # the voice said `say_tts` / the pronounced form: map its word times onto the caption words
+                timing = {**timing, "words": align.remap_words(timing["words"], V.display_text(say, lang, product).split(),
+                                                               lang)}
         else:
             speech = V.estimate_speech(say, lang, rate)
         pad = s.get("pad", 1.0 if last else 0.4)
@@ -188,7 +308,7 @@ def timeline(p: Project, brief: dict | None = None, lang: str | None = None, fmt
         length = round(length, 3)
         method = "aligned" if timing and timing.get("method") == "aligned" else "estimated"
         scenes.append({**s, "start": round(t, 3), "end": round(t + length, 3), "speech_end": round(t + speech, 3),
-                       "voiced": bool(wav), "timing": method})
+                       "voiced": bool(wav), "timing": method, "silent": bool(say and is_silent(lb, s))})
         if say:
             if method == "aligned":
                 words = [{"w": w["w"], "start": t + w["start"], "end": t + w["end"]} for w in timing["words"]]
@@ -207,7 +327,7 @@ def timeline(p: Project, brief: dict | None = None, lang: str | None = None, fmt
                 used.add(it["asset"])
     if lb["brand"].get("logo"):
         used.add(lb["brand"]["logo"])
-    has_broll = _ai_layers(p, lb, scenes)
+    has_broll = _ai_layers(p, lb, scenes, placeholder, land=W > H)
     tl = {
         "title": lb.get("title"), "language": lang, "format": fmt,
         "width": W, "height": H, "fps": FPS, "duration": duration, "frames": round(duration * FPS),
@@ -249,16 +369,25 @@ def timeline(p: Project, brief: dict | None = None, lang: str | None = None, fmt
     return tl
 
 
-def _ai_layers(p: Project, brief: dict, scenes: list) -> bool:
-    """Resolve b-roll backgrounds against the library (missing clip -> brand gradient)."""
+def _ai_layers(p: Project, brief: dict, scenes: list, placeholder: bool = False, land: bool = False) -> bool:
+    """Resolve b-roll backgrounds against the library (missing clip -> brand gradient, or with `placeholder`
+    a placeholder still, so the editor preview shows the template over footage before the clip exists)."""
     found = False
     for s in scenes:
         bg = s.get("background")
         if not bg:
             continue
         m = library.broll_get(bg.get("clip")) if bg.get("type") == "broll" else None
+        alt = library.broll_get(bg.get("clip_alt")) if bg.get("type") == "broll" and bg.get("clip_alt") else None
+        if alt and (not m or (_is_land(m) != land and _is_land(alt) == land)):
+            m = alt          # the variant made for this orientation instead of a hard crop of the other one
         if not m:
-            s.pop("background")
+            if placeholder and bg.get("type") == "broll":
+                s["background"] = {"type": "broll", "placeholder": True, "dim": bg.get("dim", 0.55),
+                                   "blur": bg.get("blur", 0)}
+                found = True
+            else:
+                s.pop("background")
             continue
         s["background"] = {"type": "broll", "clip": m["id"], "dim": bg.get("dim", 0.55), "blur": bg.get("blur", 0),
                            "w": m.get("w"), "h": m.get("h"), "duration": m.get("duration")}
@@ -266,10 +395,19 @@ def _ai_layers(p: Project, brief: dict, scenes: list) -> bool:
     return found
 
 
+def _is_land(m: dict) -> bool:
+    return (m.get("w") or 0) > (m.get("h") or 0)
+
+
+PLACEHOLDER_URL = "/renderer/broll-placeholder.jpg"   # video/html/broll-placeholder.jpg (templates/validate.py --make-sample)
+
+
 def ai_urls(p: Project, tl: dict, mode: str) -> dict:
     """Fill in where the renderer loads b-roll / presenter media from: 'http' (studio preview) or 'file' (render.py)."""
     if mode == "http":
         tl["broll_base"] = "/api/library/broll/"
+        if any((s.get("background") or {}).get("placeholder") for s in tl.get("scenes") or []):
+            tl["broll_placeholder"] = PLACEHOLDER_URL
     else:
         tl["broll_base"] = library.BROLL.resolve().as_uri() + "/"
     pr = tl.get("presenter")

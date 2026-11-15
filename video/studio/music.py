@@ -55,6 +55,13 @@ DUCK_HOLD = 0.30       # s after speech before releasing
 # a mild low-shelf cut, then make-up gain back to the track's own loudness. The original is kept.
 TONE = {"highpass_hz": 38.0, "shelf_hz": 120.0, "shelf_db": -3.0, "shelf_q": 0.7}
 TONE_VERSION = 1
+# "Too dark" (QA run: 73 % of a generated track's energy under 250 Hz, 0.5 % above 2 kHz — nearly inaudible on a
+# phone speaker, which cuts below ~200 Hz). A GENERATED track with less than DARK_HF of its energy above 2 kHz is
+# marked `dark`; unless the project says brighten: false, the mix lifts it with a gentle high shelf (any track can be
+# brightened with brighten: true).
+DARK_HF = 0.02
+BRIGHTEN = "highshelf=f=2500:g=6:t=s:w=0.6,highshelf=f=6000:g=2:t=s:w=0.6"
+HF_VERSION = 1
 _lock = threading.RLock()
 
 
@@ -78,9 +85,10 @@ def _write(p: Path, d: dict) -> None:
     tmp.replace(p)
 
 
-def decode(path: Path, channels: int = 2) -> np.ndarray:
-    """Any audio -> float32 [n, channels] at 48 kHz."""
-    raw = subprocess.run([FFMPEG, "-v", "error", "-i", str(path), "-ac", str(channels), "-ar", str(SR), "-f", "f32le", "-"],
+def decode(path: Path, channels: int = 2, af: str | None = None, seconds: float | None = None) -> np.ndarray:
+    """Any audio -> float32 [n, channels] at 48 kHz (optionally through an ffmpeg filter / only the first seconds)."""
+    raw = subprocess.run([FFMPEG, "-v", "error", "-i", str(path), *(["-t", f"{seconds:.2f}"] if seconds else []),
+                          *(["-af", af] if af else []), "-ac", str(channels), "-ar", str(SR), "-f", "f32le", "-"],
                          check=True, capture_output=True, creationflags=NOWIN).stdout
     return np.frombuffer(raw, dtype=np.float32).reshape(-1, channels).copy()
 
@@ -164,6 +172,50 @@ def list_tracks() -> list[dict]:
     return sorted(out, key=lambda m: (order.get(m.get("source"), 3), -(m.get("created") or 0)))
 
 
+def hf_fraction(path: Path, af: str | None = None) -> float:
+    """Share of the spectral energy above 2 kHz (first 60 s, mono)."""
+    x = decode(Path(path), 1, af=af, seconds=60)[:, 0].astype(np.float64)
+    n = 8192
+    if len(x) < n:
+        x = np.pad(x, (0, n - len(x)))
+    frames = np.lib.stride_tricks.sliding_window_view(x, n)[:: n // 2]
+    spec = np.abs(np.fft.rfft(frames * np.hanning(n), axis=1)) ** 2
+    freqs = np.fft.rfftfreq(n, 1 / SR)
+    tot = float(np.sum(spec)) or 1.0
+    return round(float(np.sum(spec[:, freqs >= 2000])) / tot, 4)
+
+
+def brightness(meta: dict) -> dict:
+    """meta + {hf, dark} (measured once, stored in meta.json)."""
+    if meta.get("hf_version") == HF_VERSION and "hf" in meta:
+        return meta
+    try:
+        f = MUSIC / meta["id"] / f"track{meta['ext']}"
+        hf = hf_fraction(f)
+    except (OSError, subprocess.CalledProcessError, KeyError, ValueError):
+        return meta
+    meta = {**meta, "hf": hf, "dark": is_dark(hf, meta), "hf_version": HF_VERSION}
+    with _lock:
+        d = _read(MUSIC / meta["id"] / "meta.json")
+        if d:
+            d.update(hf=meta["hf"], dark=meta["dark"], hf_version=HF_VERSION)
+            _write(MUSIC / meta["id"] / "meta.json", d)
+    return meta
+
+
+def is_dark(hf: float, meta: dict) -> bool:
+    """Only generated tracks are judged (the builtin pads are dark by design; uploads are the person's choice)."""
+    return hf < DARK_HF and meta.get("source") == "generated"
+
+
+def brighten_on(m: dict, meta: dict | None) -> bool:
+    """Lift a dark track in the mix? brighten: true / false in the project's music settings; default = when dark."""
+    b = m.get("brighten")
+    if b is not None:
+        return bool(b)
+    return bool((meta or {}).get("dark"))
+
+
 def get(tid: str | None) -> dict | None:
     if not tid or not ID_RE.match(tid):
         return None
@@ -228,6 +280,11 @@ def add_track(src: Path, meta: dict, move: bool = False) -> dict:
                 m[k] = meta[k]
         if tone:
             m["tone"] = tone
+        try:
+            m["hf"] = hf_fraction(d / f"track{ext}")
+            m.update(dark=is_dark(m["hf"], m), hf_version=HF_VERSION)
+        except (OSError, subprocess.CalledProcessError, ValueError):
+            pass
         _write(d / "meta.json", m)
     return m
 
@@ -644,16 +701,25 @@ def preview_info(m: dict, voice: Path | None, duration: float) -> dict:
             _preview_cache.clear()
             _preview_cache[key] = [round(float(x), 1) for x in curve[::step]]
         duck = _preview_cache[key]
+    meta = brightness(meta)
     return {"track": meta["id"], "title": meta["title"], "url": f"/api/library/music/{meta['id']}/track{meta['ext']}",
             "duration": meta["duration"], "gain_db": round(gain, 2), "duck": duck, "duck_step": 0.1,
+            "dark": bool(meta.get("dark")), "hf": meta.get("hf"), "brighten": brighten_on(m, meta),
             **{k: m[k] for k in ("start", "fade_in", "fade_out", "volume_db", "duck_db")}, "duration_video": duration}
+
+
+def _shelf_gain_db(meta: dict) -> float:
+    """Approximate loudness the BRIGHTEN shelf adds to a dark track (energy above 2 kHz x ~4)."""
+    hf = float(meta.get("hf") or 0)
+    return round(10 * np.log10(1 + 3.0 * hf), 2)
 
 
 def mix_key(voice: Path | None, m: dict, duration: float) -> str:
     meta = get(m["track"]) or {}
     vk = [str(voice), voice.stat().st_mtime_ns, voice.stat().st_size] if voice else None
     raw = json.dumps([vk, meta.get("id"), meta.get("lufs"), meta.get("duration"), {k: m.get(k) for k in
-                      ("volume_db", "duck", "duck_db", "fade_in", "fade_out", "start")}, round(duration, 3), MIX_VERSION])
+                      ("volume_db", "duck", "duck_db", "fade_in", "fade_out", "start", "brighten")}, round(duration, 3),
+                      MIX_VERSION, brighten_on(m, meta), BRIGHTEN])
     return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
@@ -663,10 +729,13 @@ def mix(voice: Path | None, m: dict, duration: float, out: Path, stems: bool = F
     stems=True also writes <out>.voice.wav and <out>.music.wav with the final gain applied (for measuring)."""
     t0 = time.time()
     n = int(round(duration * SR))
-    meta = get(m["track"])
-    track = decode(track_file(meta["id"]), 2)
+    meta = brightness(get(m["track"]))
+    bright = brighten_on(m, meta)
+    track = decode(track_file(meta["id"]), 2, af=BRIGHTEN if bright else None)
+    if bright:      # the shelf adds level: bring the lifted track back to the measured loudness
+        track *= 10 ** (-_shelf_gain_db(meta) / 20)
     music = _fit_music(track, n, float(m.get("start") or 0))
-    stats: dict = {"track": meta["id"], "track_lufs": meta["lufs"]}
+    stats: dict = {"track": meta["id"], "track_lufs": meta["lufs"], "brightened": bright, "track_hf": meta.get("hf")}
     if voice:
         v = decode(voice, 1)[:, 0]
         v = np.pad(v[:n], (0, max(0, n - len(v))))

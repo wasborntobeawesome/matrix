@@ -19,7 +19,8 @@ function stack(ctx, text, parent, { maxW, maxH, max = 230, min = 54, lines: maxL
   const box = parent.appendChild(ctx.h("div", "headline bd-stack"));
   box.dataset.fit = "off";                       // sized here, not by the renderer's generic fit
   if (ctx.isArabic(text || "")) box.dir = "rtl";
-  const ws = String(text || "").split(/\s+/).filter(Boolean);
+  // ordinary spaces only: a no-break space (Russian "в голос") keeps a one-letter word on its word's line
+  const ws = String(text || "").split(/[ \t\r\n]+/).filter(Boolean);
   // split the words into n balanced lines (by characters)
   const split = n => {
     const total = ws.reduce((a, w) => a + w.length, 0) + ws.length - 1;
