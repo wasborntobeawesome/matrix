@@ -351,3 +351,86 @@ body.embed { background: #05070d; }
   box-shadow: inset 0 0 0 3px rgba(5,7,15,.6); isolation: isolate; }
 .pb-media { position: absolute; display: block; object-fit: cover; }
 .zoomer { position: absolute; left: 0; top: 0; width: 100%; height: 100%; transform-origin: 0 0; will-change: transform; }
+
+/* ======================================================================
+   1:1 (1080x1080, #stage.square): header y 34-84, content y 100-885,
+   caption pill centred at y 958, progress at y 1036.
+   ====================================================================== */
+#stage.square #brand { top: 30px; gap: 14px; }
+#stage.square .logo { width: 52px; height: 52px; border-radius: 16px; }
+#stage.square .logo-bars { height: 28px; gap: 4px; }
+#stage.square .brand-name { font-size: 36px; }
+#stage.square .scene { top: 100px; height: 785px; padding: 0 80px; }
+#stage.square .scene.screen, #stage.square .scene.screens, #stage.square .scene.presenter { top: 0; height: 100%; padding: 0; }
+#stage.square .kicker { font-size: 26px; padding: 11px 24px; margin-bottom: 30px; }
+#stage.square .sub { font-size: 40px; margin-top: 24px; }
+#stage.square .hero .headline { font-size: 124px; }
+#stage.square .wave { height: 150px; margin-top: 36px; gap: 8px; }
+#stage.square .wave i { width: 8px; }
+#stage.square .chips .headline { font-size: 150px; }
+#stage.square .chip-grid { width: 900px; gap: 20px; margin-top: 44px; }
+#stage.square .chip { height: 112px; border-radius: 32px; font-size: 44px; }
+#stage.square .stat-wrap { width: 420px; height: 420px; }
+#stage.square .stat-num { font-size: 250px; }
+#stage.square .stat .headline { font-size: 84px; margin-top: 24px; }
+#stage.square .stat .sub { font-size: 38px; margin-top: 16px; }
+#stage.square .list .headline { font-size: 88px; }
+#stage.square .items { width: 900px; gap: 14px; margin-top: 36px; }
+#stage.square .item { height: 98px; border-radius: 30px; gap: 24px; padding: 0 24px; }
+#stage.square .item .emo { width: 66px; height: 66px; border-radius: 20px; font-size: 38px; }
+#stage.square .item .label { font-size: 42px; }
+#stage.square .cta .headline { font-size: 112px; }
+#stage.square .cta .sub { margin-top: 22px; }
+#stage.square .pill-wrap { margin-top: 56px; }
+#stage.square .pill { font-size: 64px; padding: 26px 60px 26px 30px; gap: 20px; }
+#stage.square .pill .logo { width: 82px; height: 82px; }
+#stage.square .pill .logo-bars { height: 40px; gap: 6px; }
+#stage.square .cta-url { margin-top: 30px; font-size: 36px; }
+#stage.square .scr-text { left: 70px; right: 70px; top: 100px; }
+#stage.square .scr-text .headline { font-size: 66px; }
+#stage.square .scr-text .sub { font-size: 34px; margin-top: 14px; }
+#stage.square .scr-text .kicker { font-size: 24px; margin-bottom: 20px; }
+#stage.square .scr-text.side { right: auto; width: 450px; text-align: left; }
+#stage.square .scr-text.side .headline { font-size: 76px; }
+#stage.square .scr-text.center { top: 100px; }
+#stage.square .scr-text.center .headline { font-size: 60px; }
+#stage.square .callout { font-size: 34px; padding: 15px 28px; }
+#stage.square .dev-label { font-size: 28px; padding: 11px 24px; }
+#stage.square .cap { top: 958px; max-width: 980px; font-size: 42px; padding: 17px 38px 17px 28px; gap: 18px; }
+#stage.square .cap .eq { height: 34px; }
+#stage.square #progress { top: 1036px; left: 200px; right: 200px; height: 6px; }
+#stage.square .seg { height: 6px; }
+#stage.square .pv-shade { display: none; }
+#stage.square .pv-card { inset: auto; left: 590px; top: 100px; width: 420px; height: 785px; border-radius: 40px;
+  box-shadow: 0 40px 110px rgba(0,0,0,.55), 0 0 0 6px color-mix(in srgb, var(--primary) 70%, transparent),
+              0 0 70px color-mix(in srgb, var(--accent) 30%, transparent); }
+#stage.square .pv-text { left: 70px; right: auto; bottom: auto; width: 480px; top: 300px; }
+#stage.square .pv-text .headline { font-size: 84px; }
+#stage.square .pv-text .sub { font-size: 36px; }
+
+/* ======================================================================
+   Right-to-left (Arabic): mirrored side-by-side layouts, no letter-spacing
+   (it breaks Arabic joining), right-aligned text, progress fills from the right.
+   ====================================================================== */
+#stage.rtl, #stage.rtl * { letter-spacing: 0 !important; }
+#stage.rtl .headline { line-height: 1.25; }
+#stage.rtl .item { text-align: right; }
+#stage.rtl .item .idx { margin-left: 0; margin-right: auto; }
+#stage.rtl .chip .tick { right: auto; left: -10px; }
+#stage.rtl .seg .fill { left: auto; right: 0; }
+#stage.rtl .cap { padding: 24px 34px 24px 44px; }
+#stage.land.rtl #brand { left: auto; right: 120px; }
+#stage.land.rtl .scr-text { left: auto; right: 120px; text-align: right; }
+#stage.land.rtl .scr-text.center { left: 160px; right: 160px; text-align: center; }
+#stage.land.rtl .scene.stat, #stage.land.rtl .scene.list { text-align: right; }
+#stage.land.rtl .pv-card { left: 270px; }
+#stage.land.rtl .pv-text { left: auto; right: 160px; }
+#stage.square.rtl .scr-text.side { left: auto; right: 70px; text-align: right; }
+#stage.square.rtl .pv-card { left: 70px; }
+#stage.square.rtl .pv-text { left: auto; right: 70px; }
+
+/* cover image (render.py --cover): the picture without captions and progress bar */
+body.cover #captions, body.cover #progress, body.cover #play-hint { display: none !important; }
+#stage.rtl .scene.presenter { text-align: right; }
+#stage.square .chip [lang="ar"] { font-size: 46px; }
+#stage.land .chip [lang="ar"] { font-size: 50px; }

@@ -509,7 +509,7 @@ class AIJobs:
         quality = job["preset"]
         job.update(stage="voice", message="checking the voice-over…", progress=0.01)
         try:
-            build.generate(p)
+            build.generate(p, langs=[p.brief.get("language")])   # the presenter speaks the main language
         except build.V.TTSError as e:
             tl0 = build.timeline(p)
             if tl0["voiced"] < tl0["voice_needed"]:

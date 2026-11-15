@@ -29,6 +29,7 @@ import build
 import gpu
 import library as L
 import presenter as PR
+from brief import localize as normalize_l
 from brief import normalize
 from store import Project, StoreError, now
 
@@ -247,13 +248,25 @@ class Pipelines:
             self._save()
             time.sleep(2)
         brief = p.brief
-        todo = [s for s in brief["scenes"] if (s.get("say") or "").strip() and not build.scene_voice(p, brief, s)]
-        total = len([s for s in brief["scenes"] if (s.get("say") or "").strip()])
-        st["detail"] = {"lines": total, "to_generate": len(todo), "model": brief["voice"].get("model"),
-                        "voice": brief["voice"].get("voice")}
+        langs = build.langs_of(brief)
+        todo = build.todo_lines(p)
+        total = sum(1 for lg in langs for s in normalize_l(brief, lg)["scenes"] if build.say_of(s))
+        st["detail"] = {"lines": total, "to_generate": len(todo), "languages": langs,
+                        "model": brief["voice"].get("model"), "voice": brief["voice"].get("voice"),
+                        "voices": {lg: f"{v.get('model')}/{v.get('voice')}" for lg, v in (brief.get("voices") or {}).items()}}
+
+        def finish():
+            st["message"] = "word timing (faster-whisper, CPU)…"
+            self._save()
+            tim = build.align_all(p, langs)
+            st["detail"]["timing"] = tim
+            for lg in langs:
+                build.voiceover(p, build.timeline(p, lang=lg))
+            return tim
         if not todo:
-            st["message"] = f"all {total} lines already voiced"
-            build.voiceover(p, build.timeline(p))
+            tim = finish()
+            st["message"] = (f"all {total} lines already voiced ({len(langs)} language(s)); "
+                             f"timing aligned for {tim['aligned']}/{tim['lines']}")
             return
         t0 = time.time()
         done = [0]
@@ -274,9 +287,10 @@ class Pipelines:
                 raise RuntimeError(f"voice-over failed: {e}") from None
             st["state"] = "warning"
             self._notice(it, f"voice-over skipped (silent scenes): {e}")
-        build.voiceover(p, build.timeline(p))
         st["detail"]["seconds"] = round(time.time() - t0, 1)
-        st["message"] = f"{len(todo)} line(s) generated in {st['detail']['seconds']} s"
+        tim = finish()
+        st["message"] = (f"{len(todo)} line(s) generated in {st['detail']['seconds']} s "
+                         f"({len(langs)} language(s)); timing aligned for {tim['aligned']}/{tim['lines']}")
 
     # ------------------------------------------------------------ 2. free the GPU
     def _unload(self, it: dict, st: dict) -> None:
@@ -366,7 +380,7 @@ class Pipelines:
                 brief["presenter"]["quality"] = q          # the renderer looks for the video of this quality
                 p.save_brief(normalize(brief, p.assets())[0])
             tl = build.timeline(p)
-            pl = PR.plan(p, p.brief, tl, q)
+            pl = PR.plan(p, normalize_l(p.brief), tl, q)
             if pl and pl.get("error"):
                 self._notice(it, f"presenter skipped: {pl['error']}")
             elif pl and not pl["ready"]:
@@ -428,9 +442,13 @@ class Pipelines:
             eta = int(m.group(1)) + 5 if m else (round(el / f * (1 - f)) if f > 0.2 else None)
             st.update(progress=round(f, 3), eta=eta, message=f"{j.get('stage')}: {j.get('message') or ''}".strip(": "))
             if j["status"] == "done":
-                it["result"] = {"render": j["result"]["render"], **{k: j["result"].get(k) for k in ("duration", "format", "seconds")}}
-                st["detail"] = {"render": j["result"]["render"], "seconds": j["result"].get("seconds")}
-                st["message"] = f"{j['result']['render']} ({j['result'].get('duration', 0):.1f} s video)"
+                r = j["result"]
+                rs = r.get("renders") or [r["render"]]
+                it["result"] = {"render": r["render"], "renders": rs,
+                                **{k: r.get(k) for k in ("duration", "format", "seconds")}}
+                st["detail"] = {"render": r["render"], "renders": rs, "seconds": r.get("seconds")}
+                st["message"] = (f"{len(rs)} videos ({', '.join(rs)})" if len(rs) > 1
+                                 else f"{r['render']} ({r.get('duration', 0):.1f} s video)")
                 return
             if j["status"] in ("error", "cancelled"):
                 raise RuntimeError(f"render {j['status']}: {j.get('error') or ''}")

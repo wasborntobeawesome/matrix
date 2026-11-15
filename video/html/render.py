@@ -3,6 +3,8 @@
     video/.venv/Scripts/python video/html/render.py [--timeline T] [--out O]
                                                     [--workers N] [--quality Q]
     video/.venv/Scripts/python video/html/render.py --project video/projects/<id> [--out O]
+                                                    [--timeline DIR/build/timeline-<lang>-<fmt>.json]
+                                                    [--cover T --cover-out cover.png]
 
 --project DIR renders a Video Studio project: DIR/build/timeline.json (+ its
 voiceover.wav, or silence when the timeline has no audio), assets from
@@ -87,7 +89,10 @@ def analyse_audio(wav, fps: int, frames: int, nbands: int = 24) -> dict:
 
 async def render(args) -> None:
     project = Path(args.project).resolve() if args.project else None
-    tl_path = (project / "build" / "timeline.json") if project else Path(args.timeline).resolve()
+    if project and args.timeline == str(DEFAULT_TIMELINE):
+        tl_path = project / "build" / "timeline.json"
+    else:
+        tl_path = Path(args.timeline).resolve()
     tl = json.loads(tl_path.read_text(encoding="utf-8"))
     W, H, fps = tl["width"], tl["height"], tl["fps"]
     frames = int(tl.get("frames") or round(tl["duration"] * fps))
@@ -109,10 +114,14 @@ async def render(args) -> None:
 
     t_start = time.perf_counter()
     report("audio", 0, frames)
-    aud = analyse_audio(audio, fps, frames)
+    # waveforms follow the voice-over even when the muxed audio is the voice + music mix
+    vis = tl.get("analysis_audio")
+    vis = (tl_path.parent / vis).resolve() if vis and (tl_path.parent / vis).exists() else audio
+    aud = analyse_audio(vis, fps, frames)
     build = (project / "build") if project else HERE / "build"
     build.mkdir(parents=True, exist_ok=True)
-    data_js = build / "data.js"
+    stem = tl_path.stem.replace("timeline", "data", 1) if project and tl_path.stem.startswith("timeline-") else "data"
+    data_js = build / f"{stem}.js"
     data_js.write_text(
         "window.TIMELINE = " + json.dumps(tl, ensure_ascii=False) + ";\n"
         "window.AUDIO = " + json.dumps(aud, separators=(",", ":")) + ";\n", encoding="utf-8")
@@ -178,6 +187,16 @@ async def render(args) -> None:
                     print(f"frame {i + 1}/{frames}  {el:5.1f}s  ({(i + 1) / el:4.1f} fps)", flush=True)
 
         await asyncio.gather(writer(), *(worker(k) for k in range(n)))
+        if args.cover is not None and args.cover_out:
+            # cover image: one still without captions / progress bar, as PNG
+            page = await browser.new_page(viewport={"width": W, "height": H}, device_scale_factor=1)
+            await page.goto(url + "&cover")
+            await page.wait_for_function("window.__ready === true", timeout=60000)
+            await page.evaluate("t => window.seek(t)", float(args.cover))
+            await page.evaluate("t => window.seek(t)", float(args.cover))
+            await page.screenshot(path=str(Path(args.cover_out).resolve()), type="png",
+                                  clip={"x": 0, "y": 0, "width": W, "height": H})
+            await page.close()
         await browser.close()
 
     report("encoding", frames, frames)
@@ -219,6 +238,8 @@ def main() -> None:
     ap.add_argument("--stills", help="comma-separated seconds: save PNG stills to preview/ and exit")
     ap.add_argument("--stills-dir", help="where --stills writes PNGs")
     ap.add_argument("--progress", action="store_true", help="print @@PROGRESS json lines")
+    ap.add_argument("--cover", type=float, help="also save a cover PNG of this moment (no captions / progress bar)")
+    ap.add_argument("--cover-out", help="where --cover writes the PNG")
     args = ap.parse_args()
     global PROGRESS
     PROGRESS = args.progress

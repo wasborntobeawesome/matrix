@@ -94,6 +94,7 @@
   const renderMode = params.has("render");
   const embed = params.has("embed");
   if (renderMode) document.body.classList.add("render");
+  if (params.has("cover")) document.body.classList.add("cover");   // cover still: no captions / progress
   if (embed) document.body.classList.add("embed");
   const stage = document.getElementById("stage");
   let CUR = null;
@@ -107,7 +108,11 @@
     const B = brandOf(TL.brand);
     const W = TL.width || 1080, H = TL.height || 1920;
     const LAND = W > H;
+    const SQ = W === H;                       // 1:1 (1080x1080)
+    const RTL = !!TL.rtl || TL.language === "ar";
     const FPS = TL.fps || 30;
+    // mirror a box horizontally for right-to-left languages (side-by-side layouts)
+    const mir = b => (RTL ? { ...b, x: W - b.x - b.w } : b);
     const ASSETS = TL.assets || {};
     const BASE = TL.asset_base || "";
     let seed = 1337;
@@ -116,6 +121,9 @@
     stage.style.width = `${W}px`;
     stage.style.height = `${H}px`;
     stage.classList.toggle("land", LAND);
+    stage.classList.toggle("square", SQ);
+    stage.classList.toggle("rtl", RTL);
+    stage.dir = RTL ? "rtl" : "ltr";
     document.documentElement.lang = TL.language || "en";
 
     const root = document.documentElement.style;
@@ -190,6 +198,10 @@
       const capWords = [];
       for (const c of caps) {
         const ws = c.text.split(/\s+/).filter(Boolean);
+        if (c.words && c.words.length === ws.length) {     // aligned (faster-whisper) word times
+          ws.forEach((w, k) => capWords.push({ w: norm(w), t: c.words[k][0], cap: c }));
+          continue;
+        }
         const total = ws.reduce((a, w) => a + w.length, 0) || 1;
         let acc = 0;
         for (const w of ws) { capWords.push({ w: norm(w), t: c.start + (acc / total) * (c.end - c.start), cap: c }); acc += w.length; }
@@ -311,7 +323,8 @@
     const pBubbleIds = new Set(PT && PT.mode !== "full" && pUrl ? (PT.bubble || []) : []);
     // Bubble rectangle (stage px): 9:16 above the caption pill on the left (inside the safe zone,
     // away from the right-hand button rail); 16:9 bottom-right above the captions.
-    const RB = pBubbleIds.size ? (LAND ? { x: W - 128 - 250, y: 650, w: 250, h: 250 } : { x: 64, y: 1010, w: 258, h: 258 }) : null;
+    const RB = pBubbleIds.size ? (LAND ? { x: W - 128 - 250, y: 650, w: 250, h: 250 }
+      : SQ ? { x: RTL ? W - 56 - 200 : 56, y: 676, w: 200, h: 200 } : { x: 64, y: 1010, w: 258, h: 258 }) : null;
     const reserveFor = sc => (RB && pBubbleIds.has(sc.id) ? RB : null);
     for (const id of ["bgvideo", "pfull", "pbubble"]) { const old = document.getElementById(id); if (old) old.remove(); }
     let pfull = null;
@@ -337,6 +350,8 @@
       if (c.x1 <= R.x - m || c.x0 >= R.x + R.w + m || c.y1 <= R.y - m || c.y0 >= R.y + R.h + m) return null;
       const areas = LAND
         ? [{ x0: 110, x1: R.x - m, y0: 118, y1: 925 }, { x0: 110, x1: W - 110, y0: 118, y1: R.y - m }]
+        : SQ ? [{ x0: 50, x1: W - 50, y0: 100, y1: R.y - m }, R.x < W / 2 ? { x0: R.x + R.w + m, x1: W - 50, y0: 100, y1: 900 }
+                                                                       : { x0: 50, x1: R.x - m, y0: 100, y1: 900 }]
         : [{ x0: 50, x1: W - 50, y0: 318, y1: R.y - m }, { x0: R.x + R.w + m, x1: W - 50, y0: 318, y1: 1272 }];
       let best = null;
       for (const A of areas) {
@@ -358,13 +373,13 @@
         const hl = words(sc.headline, "headline"); el.appendChild(hl.box);
         const sub = sc.sub ? el.appendChild(h("div", "sub", sc.sub)) : null;
         const wave = el.appendChild(h("div", "wave"));
-        const N = LAND ? 61 : 41, bars = [];
+        const N = LAND ? 61 : SQ ? 37 : 41, bars = [];
         for (let i = 0; i < N; i++) {
           const b = h("i"); b.style.background = mix(B.primary, B.accent, i / (N - 1));
           wave.appendChild(b); bars.push(b);
         }
         const t0 = sc.start + (sc.start === 0 ? -0.3 : 0.1);
-        const maxH = LAND ? 150 : 190;
+        const maxH = LAND ? 150 : SQ ? 120 : 190;
         return t => {
           if (kicker) style(kicker, rise(t, t0, { dy: 40, s0: 0.8, d: 0.6, ease: E.outBack }));
           animWords(hl.list, t, t0 + 0.15, 0.12);
@@ -569,22 +584,51 @@
 
         let G = null;  // geometry, computed on first update (needs fonts for text height)
         const RV = reserveFor(sc);
+        // 1:1: phones (tall shots) sit next to the text, browsers / wide shots below it
+        const sqSide = SQ && hasText && (kind === "phone" || (kind === "none" && m.aspect > 1.15));
+        if (sqSide) txt.classList.add("side");
         const layout = () => {
           let box;
           const th = hasText ? txt.offsetHeight : 0;
+          let side = false;
           if (LAND) {
+            // device box ends at y 900: the caption pill (top ≈ 923) stays clear even with the slow camera drift
             if (hasText) {
-              txt.style.top = px(140 + Math.max(0, (760 - th) / 2));
-              box = { x: 770, y: 130, w: 1060, h: 790 };
-            } else box = { x: 160, y: 130, w: 1600, h: 790 };
-            if (RV) box.w = Math.min(box.w, RV.x - 30 - box.x);   // keep the device left of the bubble
+              // right-to-left puts the text column on the right, next to the presenter bubble: keep it above
+              const tb = RTL && RV ? RV.y - 24 : 900;
+              txt.style.top = px(140 + Math.max(0, (tb - 140 - th) / 2));
+              box = mir({ x: 770, y: 130, w: 1060, h: 770 });
+              side = true;
+            } else box = { x: 160, y: 130, w: 1600, h: 770 };
+            if (RV && box.x < RV.x + RV.w && box.x + box.w > RV.x) box.w = Math.min(box.w, RV.x - 30 - box.x);   // keep the device left of the bubble
+          } else if (SQ) {
+            if (sqSide) {
+              // the presenter bubble (bottom-left) stays clear of the text column
+              const tb = RV ? RV.y - 24 : 880;
+              txt.style.top = px(100 + Math.max(0, (tb - 100 - th) / 2));
+              box = mir({ x: 560, y: 100, w: 450, h: 785 });
+              side = true;
+            } else {
+              const top = 100 + (hasText ? th + 26 : 10);
+              box = { x: 70, y: top, w: 940, h: 885 - top };
+              if (RV && box.y + box.h > RV.y) {
+                // presenter bubble: either end the device above it or keep it right of it — whichever is bigger
+                const a = { ...box, h: RV.y - 20 - box.y };
+                const b = RV.x < W / 2 ? { ...box, x: RV.x + RV.w + 24, w: box.x + box.w - (RV.x + RV.w + 24) } : { ...box, w: RV.x - 24 - box.x };
+                const ga = deviceGeom(kind, m.aspect, a, Infinity), gb = deviceGeom(kind, m.aspect, b, Infinity);
+                box = ga.w * ga.h >= gb.w * gb.h ? a : b;
+              }
+            }
           } else {
+            // 9:16: the device ends at y 1325 and this scene's caption pill moves down to y≈1410, so the
+            // caption sits below the phone instead of covering the bottom of its screen
             const top = 330 + (hasText ? th + 40 : 20);
-            box = { x: 70, y: top, w: 940, h: 1400 - top };
+            box = { x: 70, y: top, w: 940, h: 1325 - top };
           }
-          const g = deviceGeom(kind, m.aspect, box, kind === "phone" ? (LAND ? 520 : 600) : Infinity);
+          const g = deviceGeom(kind, m.aspect, box, kind === "phone" ? (LAND ? 520 : SQ ? 420 : 600) : Infinity);
           if (hasText) {
-            const mask = LAND ? `linear-gradient(to right, transparent ${px(box.x - 110)}, #000 ${px(box.x - 20)})`
+            const mask = side ? (RTL ? `linear-gradient(to left, transparent ${px(W - box.x - box.w - 110)}, #000 ${px(W - box.x - box.w - 20)})`
+                                     : `linear-gradient(to right, transparent ${px(box.x - 110)}, #000 ${px(box.x - 20)})`)
                               : `linear-gradient(to bottom, transparent ${px(box.y - 90)}, #000 ${px(box.y - 12)})`;
             camwrap.style.webkitMaskImage = camwrap.style.maskImage = mask;
           }
@@ -677,7 +721,8 @@
             const rx = s * sx0 + tx, ry = s * sy0 + ty, rw = s * zk * G.R.w, rh = s * zk * G.R.h;
             // never above the device area (= below the headline), never into the captions
             const lim = LAND ? { x0: G.box.x, x1: G.box.x + G.box.w, y0: 120, y1: 900 }
-                             : { x0: 50, x1: W - 50, y0: hasText ? G.box.y - 8 : 330, y1: RV ? RV.y - 14 : 1270 };
+                      : SQ ? { x0: 40, x1: W - 40, y0: sqSide ? 100 : (hasText ? G.box.y - 8 : 100), y1: RV ? RV.y - 14 : 890 }
+                      : { x0: 50, x1: W - 50, y0: hasText ? G.box.y - 8 : 330, y1: RV ? RV.y - 14 : 1330 };
             let below = ry + rh + 34 + G.ch <= lim.y1;
             let cy = below ? ry + rh + 34 : ry - 34 - G.ch;
             cy = clamp(cy, lim.y0, lim.y1 - G.ch);
@@ -691,7 +736,8 @@
           } else if (callout) {
             // no focus: callout sits under the device
             const cp = prog(t, sc.start + 1.0, 0.55, E.outBack);
-            place(callout, W / 2 - G.cw / 2, Math.min(G.g.y + G.g.h * s - G.ch * 1.6, LAND ? 860 : (RV ? RV.y - 14 - G.ch : 1240)));
+            const cxn = (LAND || sqSide) ? G.g.x + G.g.w / 2 - G.cw / 2 : W / 2 - G.cw / 2;
+            place(callout, clamp(cxn, 40, W - 40 - G.cw), Math.min(G.g.y + G.g.h * s - G.ch * 1.6, LAND ? 860 : SQ ? 830 : (RV ? RV.y - 14 - G.ch : 1240)));
             callout.style.opacity = clamp((t - sc.start - 1.0) / 0.15).toFixed(3);
             callout.style.transform = `scale(${lerp(0.6, 1, cp).toFixed(4)})`;
             calloutArrow.style.display = "none";
@@ -718,31 +764,35 @@
         let G = null;
         const layout = () => {
           const th = (hl || sub) ? txt.offsetHeight : 0;
-          const top = (LAND ? 140 : 330) + (th ? th + (LAND ? 30 : 50) : 10);
-          const bottom = LAND ? 930 : 1380;
+          const top = (LAND ? 140 : SQ ? 100 : 330) + (th ? th + (LAND ? 30 : SQ ? 24 : 50) : 10);
+          // 9:16 ends at 1325 (the caption pill of screen scenes sits below, at y≈1410); 1:1 above its caption
+          const bottom = LAND ? 930 : SQ ? 885 : 1325;
           const n = Math.max(1, ms.length);
           const boxes = [];
+          const PORT = !LAND && !SQ;
           if (kind === "phone" || kind === "none") {
             const areaW = LAND ? 1640 : 980;
-            const gap = LAND ? 70 : (n === 3 ? -40 : 40);
-            const wEach = n === 3 && !LAND ? 380 : (areaW - gap * (n - 1)) / n;
+            const gap = LAND ? 70 : SQ ? (n === 3 ? 30 : 50) : (n === 3 ? -40 : 40);
+            const wEach = n === 3 && PORT ? 380 : (areaW - gap * (n - 1)) / n;
             const hh = bottom - top - (labels.some(Boolean) ? 70 : 0);
-            const geoms = ms.map(m => deviceGeom(kind, m.aspect, { x: 0, y: 0, w: wEach, h: n === 3 && !LAND ? hh * 0.9 : hh }, LAND ? 420 : 480));
+            const geoms = ms.map(m => deviceGeom(kind, m.aspect, { x: 0, y: 0, w: wEach, h: n === 3 && PORT ? hh * 0.9 : hh }, LAND ? 420 : SQ ? 360 : 480));
             const total = geoms.reduce((a, g) => a + g.w, 0) + gap * (n - 1);
             let x = (W - total) / 2;
             geoms.forEach((g, i) => {
-              const stag = !LAND && n === 2 ? (i ? 50 : -10) : (n === 3 && !LAND ? (i === 1 ? -40 : 30) : 0);
-              boxes.push({ g, x, y: top + (hh - g.h) / 2 + stag, z: n === 3 && i === 1 ? 3 : 1, r: n === 3 ? (i - 1) * (LAND ? 0 : 5) : 0 });
+              const stag = PORT && n === 2 ? (i ? 50 : -10) : (n === 3 && PORT ? (i === 1 ? -40 : 30) : 0);
+              boxes.push({ g, x, y: top + (hh - g.h) / 2 + stag, z: n === 3 && i === 1 ? 3 : 1, r: n === 3 ? (i - 1) * (PORT ? 5 : 0) : 0 });
               x += g.w + gap;
             });
           } else {
             // browser windows cascade diagonally, the last one in front
-            const ww = LAND ? 1100 : 900;
-            const dx = LAND ? 170 : 60, dy = LAND ? 70 : 150;
+            const ww = LAND ? 1100 : SQ ? 800 : 900;
+            const dx = LAND ? 170 : SQ ? 80 : 60, dy = LAND ? 70 : SQ ? 50 : 150;
             const geoms = ms.map(m => deviceGeom(kind, Math.min(m.aspect, 0.62), { x: 0, y: 0, w: ww, h: bottom - top - dy * (n - 1) }));
             const totalW = geoms[0] ? geoms[0].w + dx * (n - 1) : 0;
             geoms.forEach((g, i) => boxes.push({ g, x: (W - totalW) / 2 + dx * i, y: top + dy * i, z: i + 1, r: 0 }));
           }
+          // right-to-left: the first screen is on the right (cascade grows to the left)
+          if (RTL) boxes.forEach(b => { b.x = W - b.x - b.g.w; b.r = -b.r; });
           const devs = boxes.map((b, i) => {
             const { dev, screen } = deviceDom(b.g, items[i].url || sc.url);
             place(dev, b.x, b.y);
@@ -849,6 +899,13 @@
         update = builders[layout](sc, el);
         const lines = { hero: 3, chips: 2, stat: 2, list: 2, cta: 3, screen: 2, screens: 2, presenter: 2 }[layout] || 2;
         el.querySelectorAll(".headline").forEach(hb => fitHeadline(hb, lines));
+        // chips: one line each, shrink long labels (e.g. long translations) instead of wrapping
+        el.querySelectorAll(".chip > span").forEach(sp => {
+          const chip = sp.parentElement;
+          sp.style.whiteSpace = "nowrap";
+          let fs = parseFloat(getComputedStyle(sp).fontSize);
+          for (let i = 0; i < 12 && sp.offsetWidth > chip.clientWidth - 40 && fs > 22; i++) { fs *= 0.92; sp.style.fontSize = `${fs.toFixed(1)}px`; }
+        });
         const RV = reserveFor(sc);
         if (RV && !["screen", "screens", "presenter"].includes(layout)) {
           // centred layouts: scale/move the whole content box so the presenter bubble never covers it
@@ -924,14 +981,19 @@
       const total = ws.reduce((a, w) => a + w.length, 0) || 1;
       let acc = 0;
       if (isArabic(c.text)) txt.dir = "rtl";
+      const timed = c.words && c.words.length === ws.length;   // aligned (faster-whisper) word times
       const wl = ws.map((w, k) => {
         const s = h("span", "w", w + (k < ws.length - 1 ? " " : ""));
         if (isArabic(w)) { s.lang = "ar"; s.dir = "rtl"; }
         txt.appendChild(s);
+        if (timed) return { s, t0: c.words[k][0], t1: k + 1 < ws.length ? c.words[k + 1][0] : c.words[k][1] };
         const t0 = c.start + (acc / total) * (c.end - c.start);
         acc += w.length;
         return { s, t0, t1: c.start + (acc / total) * (c.end - c.start) };
       });
+      // 9:16 screen/screens scenes: the pill moves below the device (y≈1410) instead of covering its screen
+      const own = TL.scenes.find(sc => c.start >= sc.start - 0.01 && c.start < sc.end);
+      if (!LAND && !SQ && own && (own.layout === "screen" || own.layout === "screens")) el.style.top = "1410px";
       capsEl.appendChild(el);
       const prev = TL.captions[i - 1], next = TL.captions[i + 1];
       return {

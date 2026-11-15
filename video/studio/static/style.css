@@ -294,3 +294,53 @@ table.lic td { border-top: 1px solid var(--line); padding: 6px 6px 6px 0; vertic
 .step.s-error { border-color: rgba(255,107,122,.5); } .step.s-error .st-icon { color: var(--danger); border-color: rgba(255,107,122,.6); }
 .mk-done { color: var(--ok); } .mk-error, .mk-interrupted { color: var(--danger); } .mk-running { color: #c9bbff; }
 .notice { background: rgba(245,185,74,.08); border: 1px solid rgba(245,185,74,.3); border-radius: 8px; padding: 6px 8px; }
+
+/* ---------------------------------------------------------------- v2: languages, formats, music, exports */
+.pv-stage.square { aspect-ratio: 1 / 1; height: min(50vh, 560px); }
+.settings .field.auto { flex: 0 0 auto; min-width: 0; max-width: none; }
+.settings .field.narrow2 { flex: 0 0 120px; min-width: 100px; }
+.seg.toggles .seg-btn { padding: 7px 10px; font-weight: 650; font-size: 12px; }
+.seg.toggles .seg-btn.on { background: rgba(124,92,255,.32); color: #fff; }
+.chk { cursor: pointer; }
+.pv-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.cover-box { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 2px 0 8px; }
+.scene-badges { display: flex; gap: 4px; flex-wrap: wrap; }
+.scene-badges:empty { display: none; }
+.tbadge { font-size: 10px; padding: 1px 6px; border-radius: 5px; border: 1px solid var(--line2); color: var(--muted); white-space: nowrap; }
+.tbadge.al { color: var(--ok); border-color: rgba(61,220,151,.35); background: rgba(61,220,151,.07); }
+.tbadge.es { color: #c9b27a; border-color: rgba(245,185,74,.3); }
+.mbadge { font-size: 10px; padding: 1px 6px; border-radius: 5px; color: var(--warn); background: rgba(245,185,74,.1); border: 1px solid rgba(245,185,74,.35); white-space: nowrap; }
+.ltabs { display: flex; gap: 4px; flex-wrap: wrap; padding: 4px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line); }
+.ltab { border: 1px solid transparent; background: transparent; color: var(--muted); padding: 5px 12px; border-radius: 8px; cursor: pointer; font-weight: 650; font-size: 12px; }
+.ltab:hover { color: var(--text); }
+.ltab.on { background: rgba(124,92,255,.25); color: #fff; border-color: rgba(124,92,255,.5); }
+.ltab.miss::after { content: " ⚠"; color: var(--warn); }
+.ltab.all { margin-left: auto; }
+.miss-box { display: flex; gap: 10px; flex-wrap: wrap; padding: 7px 10px; border-radius: 9px; background: rgba(245,185,74,.08); border: 1px solid rgba(245,185,74,.3); }
+.miss-l { white-space: nowrap; }
+.tr-grid { display: grid; gap: 8px; }
+.tr-cell { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.tr-lang { font-size: 10px; font-weight: 700; color: var(--muted); letter-spacing: .06em; }
+.tr-cell.miss input, .tr-cell.miss textarea { border-color: rgba(245,185,74,.6); }
+.tr-cell.miss .tr-lang::after { content: " · missing"; color: var(--warn); font-weight: 600; }
+input::placeholder, textarea::placeholder { color: #5f6886; }
+/* music tab */
+.mtracks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.mtrack { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line); }
+.mtrack.on { border-color: var(--primary); background: #171c33; }
+.mt-pick { flex: 1; min-width: 0; cursor: pointer; align-items: flex-start; }
+.mt-txt { display: flex; flex-direction: column; min-width: 0; }
+.mt-txt .small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.src-badge { font-size: 10px; padding: 1px 6px; border-radius: 5px; background: var(--panel2); color: var(--muted); white-space: nowrap; }
+.src-badge.builtin { color: #9fe3c9; }
+.src-badge.generated { color: #ffcd76; }
+.form > .field.slider { flex: none; }
+.form .row > .field.slider { min-width: 220px; }
+.mt { margin-top: 14px; }
+.upload-music summary { cursor: pointer; color: var(--primary2); }
+/* renders with subtitles + cover */
+.render-list li { align-items: flex-start; }
+.r-cover img { display: block; height: 64px; width: auto; border-radius: 6px; border: 1px solid var(--line2); background: #000; }
+.r-main { flex: 1; min-width: 160px; display: flex; flex-direction: column; gap: 2px; }
+.r-links a { color: var(--primary2); }
+.older-renders { margin-top: 8px; } .older-renders summary { cursor: pointer; padding: 4px 0; }

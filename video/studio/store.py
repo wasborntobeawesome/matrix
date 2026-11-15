@@ -286,7 +286,7 @@ class Project:
     def renders(self) -> list[dict]:
         out = []
         if self.renders_dir.exists():
-            for f in sorted(self.renders_dir.glob("*.mp4"), reverse=True):
+            for f in sorted(self.renders_dir.glob("*.mp4"), key=lambda f: (f.stat().st_mtime, f.name), reverse=True):
                 meta = {}
                 mj = f.with_suffix(".json")
                 if mj.exists():
@@ -294,11 +294,14 @@ class Project:
                         meta = json.loads(mj.read_text(encoding="utf-8"))
                     except ValueError:
                         pass
+                for k, ext in (("srt", ".srt"), ("vtt", ".vtt"), ("cover", ".png")):
+                    meta[k] = f.with_suffix(ext).name if f.with_suffix(ext).exists() else None
                 out.append({"name": f.name, "size": f.stat().st_size, "created": f.stat().st_mtime, **meta})
         return out
 
     def render_path(self, name: str) -> Path:
-        if not re.match(r"^[\w.-]+\.mp4$", name or ""):
+        """A render or one of its sidecar files (.srt, .vtt, cover .png)."""
+        if not re.match(r"^[\w.-]+\.(mp4|srt|vtt|png)$", name or ""):
             raise StoreError("bad render name", 404)
         p = self.renders_dir / name
         if not p.is_file():
@@ -319,7 +322,8 @@ class Project:
             thumb = next(iter(assets))
         renders = self.renders()
         return {"id": self.id, "title": b.get("title"), "product": b.get("product"), "language": b.get("language"),
-                "format": b.get("format"), "scenes": len(b.get("scenes", [])), "assets": len(assets),
+                "format": b.get("format"), "languages": b.get("languages") or [b.get("language")],
+                "formats": b.get("formats") or [b.get("format")], "scenes": len(b.get("scenes", [])), "assets": len(assets),
                 "renders": len(renders), "latest_render": renders[0]["name"] if renders else None,
                 "thumb": thumb, "created": d.get("created"), "updated": d.get("updated"), "source": d.get("source")}
 

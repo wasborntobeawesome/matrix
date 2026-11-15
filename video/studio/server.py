@@ -17,10 +17,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+import align
 import brief as B
 import build
 import inbox
 import library as L
+import music as MU
 import presenter as PR
 from aijobs import AI_PY, DISCLOSURE, LICENCES, AIJobs
 from jobs import Jobs
@@ -46,6 +48,15 @@ make = Pipelines(jobs, ai)
 @app.on_event("startup")
 def _startup() -> None:
     inbox.start()
+
+    def _bg():
+        try:
+            MU.ensure_builtin()          # 3 small CC0 tracks, synthesised once
+        except Exception as e:  # never block the studio on the music library
+            print("builtin music failed:", e)
+        align.load_model()               # warm up faster-whisper (CPU) for word timing
+    import threading
+    threading.Thread(target=_bg, name="warmup", daemon=True).start()
 
 
 @app.exception_handler(StoreError)
@@ -178,8 +189,11 @@ async def create_project(request: Request):
             if isinstance(raw, dict) and isinstance(raw.get("brief"), dict):
                 raw = raw["brief"]
             if isinstance(raw, dict) and raw.get("blank"):
-                raw = B.blank(str(raw.get("product") or "My product")[:60], raw.get("language") or "en",
-                              raw.get("format") or "9:16")
+                langs = raw.get("languages") if isinstance(raw.get("languages"), list) else None
+                fmts = raw.get("formats") if isinstance(raw.get("formats"), list) else None
+                lang = raw.get("language") or (langs[0] if langs else "en")
+                fmt = raw.get("format") or (fmts[0] if fmts else "9:16")
+                raw = B.blank(str(raw.get("product") or "My product")[:60], lang, fmt, langs, fmts)
             files, source = [], request.query_params.get("source", "api")
         p, warnings = import_project(raw, files, source if source in ("api", "ui", "inbox") else "api")
     return {**p.summary(), "warnings": warnings, "url": f"/#/p/{p.id}"}
@@ -191,6 +205,7 @@ def create_example(format: str = "9:16"):
     raw = json.loads((EXAMPLE / "brief.json").read_text(encoding="utf-8"))
     if format in B.FORMATS:
         raw["format"] = format
+        raw.pop("formats", None)
     with tempfile.TemporaryDirectory(prefix="studio-ex-") as tmp:
         files = []
         for f in sorted(EXAMPLE.iterdir()):
@@ -205,9 +220,11 @@ def create_example(format: str = "9:16"):
 def _detail(p: Project) -> dict:
     d = p.read()
     brief = d["brief"]
-    voiced = {s["id"]: bool(build.scene_voice(p, brief, s)) for s in brief["scenes"]}
+    by_lang = build.voiced_map(p, brief)
+    voiced = by_lang.get(brief.get("language")) or {}
     _, warnings = B.normalize(brief, p.assets())
-    return {**d, "assets": p.assets(), "renders": p.renders(), "voiced": voiced, "warnings": warnings,
+    return {**d, "assets": p.assets(), "renders": p.renders(), "voiced": voiced, "voiced_by_lang": by_lang,
+            "missing": B.missing_translations(brief), "warnings": warnings,
             "jobs": jobs.for_project(p.id), "ai_jobs": ai.active(project=p.id), "make": make.latest(p.id),
             "presenter_state": _presenter_state(p)}
 
@@ -293,36 +310,39 @@ def asset_thumb(pid: str, name: str):
 
 # ---------------------------------------------------------------- preview / voice
 @app.get("/api/projects/{pid}/timeline")
-def preview_timeline(pid: str):
-    """Timeline for the live preview (estimated lengths for scenes without voice)."""
+def preview_timeline(pid: str, lang: str | None = None, format: str | None = None):
+    """Timeline for the live preview of one language + format (estimated lengths for scenes without
+    voice; word timing that is not aligned yet is queued in the background)."""
     p = Project.get(pid)
-    tl = build.timeline(p)
-    tl.pop("_parts", None)
+    tl = build.timeline(p, lang=lang, fmt=format, align_mode="queue")
     if tl.get("broll") or tl.get("presenter"):
         build.ai_urls(p, tl, "http")
-    tl.pop("_presenter", None)
+    tl["music"] = build.preview_music(p, tl)
+    for k in [k for k in tl if k.startswith("_")]:
+        tl.pop(k)
     tl["asset_base"] = f"/api/projects/{pid}/files/"
-    tl["audio_url"] = f"/api/projects/{pid}/voiceover.wav?k={tl['audio_key']}" if tl["audio_key"] else None
+    tl["audio_url"] = (f"/api/projects/{pid}/voiceover.wav?lang={tl['language']}&k={tl['audio_key']}"
+                       if tl["audio_key"] else None)
     return JSONResponse(tl, headers=NOCACHE)
 
 
 @app.get("/api/projects/{pid}/voiceover.wav")
-def voiceover(pid: str):
+def voiceover(pid: str, lang: str | None = None):
     p = Project.get(pid)
-    wav = build.voiceover(p, build.timeline(p))
+    wav = build.voiceover(p, build.timeline(p, lang=lang))
     if not wav:
         raise HTTPException(404, "no voice-over yet")
     return FileResponse(wav, media_type="audio/wav", headers=NOCACHE)
 
 
 @app.get("/api/projects/{pid}/voice/{scene_id}.wav")
-def scene_clip(pid: str, scene_id: str):
+def scene_clip(pid: str, scene_id: str, lang: str | None = None):
     p = Project.get(pid)
     brief = p.brief
     s = next((s for s in brief["scenes"] if s["id"] == scene_id), None)
     if not s:
         raise HTTPException(404, "scene not found")
-    f = build.scene_voice(p, brief, s)
+    f = build.scene_voice(p, brief, s, lang)
     if not f:
         raise HTTPException(404, "no voice for this scene yet")
     return FileResponse(f, media_type="audio/wav", headers=NOCACHE)
@@ -330,23 +350,27 @@ def scene_clip(pid: str, scene_id: str):
 
 @app.post("/api/projects/{pid}/voice", status_code=202)
 async def make_voice(pid: str, request: Request):
-    """Generate voice-over. Body (optional): {"scene": "<id>", "force": false}."""
+    """Generate voice-over (+ word timing). Body (optional): {"scene": "<id>", "force": false,
+    "lang": "ru" | "langs": ["uz", "ru"]} — default: every language of the project."""
     Project.get(pid)
-    body = await request.body()
-    prm = json.loads(body) if body.strip() else {}
-    return jobs.submit("voice", pid, scene=prm.get("scene"), force=bool(prm.get("force")))
+    prm = _body(await request.body())
+    return jobs.submit("voice", pid, scene=prm.get("scene"), force=bool(prm.get("force")), lang=prm.get("lang"),
+                       langs=prm.get("langs") if isinstance(prm.get("langs"), list) else None)
 
 
 @app.post("/api/projects/{pid}/render", status_code=202)
 async def make_render(pid: str, request: Request):
-    """Queue a render. Body (optional): {"allow_silent": false, "skip_voice": false, "workers": 8}."""
+    """Queue a render: one MP4 (+ .srt, .vtt, cover .png) per language x format.
+    Body (optional): {"allow_silent": false, "skip_voice": false, "workers": 8,
+    "langs": [...] (default all), "formats": [...] (default all)}."""
     Project.get(pid)
-    body = await request.body()
-    prm = json.loads(body) if body.strip() else {}
+    prm = _body(await request.body())
     if (j := jobs.busy(pid, "render")):
         return JSONResponse(j, status_code=409)
     return jobs.submit("render", pid, allow_silent=bool(prm.get("allow_silent")),
-                       skip_voice=bool(prm.get("skip_voice")), workers=int(prm.get("workers") or 8))
+                       skip_voice=bool(prm.get("skip_voice")), workers=int(prm.get("workers") or 8),
+                       langs=prm.get("langs") if isinstance(prm.get("langs"), list) else None,
+                       formats=prm.get("formats") if isinstance(prm.get("formats"), list) else None)
 
 
 @app.get("/api/jobs/{jid}")
@@ -376,22 +400,108 @@ def renders(pid: str):
     return Project.get(pid).renders()
 
 
+RENDER_TYPES = {".mp4": "video/mp4", ".srt": "application/x-subrip; charset=utf-8", ".vtt": "text/vtt; charset=utf-8",
+                ".png": "image/png"}
+
+
 @app.get("/api/projects/{pid}/renders/{name}")
 def render_file(pid: str, name: str, download: int = 0):
+    """A render (.mp4) or its subtitles (.srt / .vtt) or cover image (.png)."""
     p = Project.get(pid)
     f = p.render_path(name)
+    mt = RENDER_TYPES[f.suffix.lower()]
     if download:
-        return FileResponse(f, media_type="video/mp4", filename=f"{pid}-{name}")
-    return FileResponse(f, media_type="video/mp4")
+        return FileResponse(f, media_type=mt, filename=f"{pid}-{name}")
+    return FileResponse(f, media_type=mt)
 
 
 @app.delete("/api/projects/{pid}/renders/{name}")
 def delete_render(pid: str, name: str):
+    """Delete a render with its .json, .srt, .vtt and cover."""
     p = Project.get(pid)
     f = p.render_path(name)
+    if f.suffix != ".mp4":
+        raise HTTPException(400, "delete the .mp4; its subtitles and cover go with it")
     f.unlink()
-    f.with_suffix(".json").unlink(missing_ok=True)
+    for ext in (".json", ".srt", ".vtt", ".png"):
+        f.with_suffix(ext).unlink(missing_ok=True)
     return {"deleted": name}
+
+
+# ---------------------------------------------------------------- music library
+@app.get("/api/library/music")
+def library_music():
+    used: dict[str, list] = {}
+    for p in Project.all():
+        try:
+            b = p.brief
+        except (OSError, ValueError):
+            continue
+        tr = (b.get("music") or {}).get("track") if isinstance(b.get("music"), dict) else None
+        if tr:
+            used.setdefault(tr, []).append({"project": p.id, "title": b.get("title")})
+    return JSONResponse([{**m, "url": f"/api/library/music/{m['id']}/track{m['ext']}", "used_in": used.get(m["id"], [])}
+                         for m in MU.list_tracks()], headers=NOCACHE)
+
+
+@app.get("/api/library/music/{tid}/{name}")
+def library_music_file(tid: str, name: str):
+    f = MU.track_file(tid)
+    if name != f.name:
+        raise HTTPException(404, "not found")
+    mt = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg", ".m4a": "audio/mp4"}[f.suffix]
+    return FileResponse(f, media_type=mt, headers={"Cache-Control": "max-age=3600"})
+
+
+@app.post("/api/library/music", status_code=201)
+async def library_music_upload(request: Request):
+    """multipart: one audio file (mp3/wav/ogg/m4a, <= 60 MB) + licence (required) + title?, artist?, mood?, bpm?,
+    project? (use it in that project)."""
+    if not request.headers.get("content-type", "").startswith("multipart/form-data"):
+        raise HTTPException(415, "send multipart/form-data")
+    form = await request.form(max_files=2, max_fields=12, max_part_size=1024 * 1024)
+    up = next((v for _, v in form.multi_items() if not isinstance(v, str)), None)
+    if up is None or not up.filename:
+        raise HTTPException(422, "no audio file")
+    licence = str(form.get("licence") or "").strip()
+    if not licence:
+        raise HTTPException(422, "licence is required (e.g. 'CC BY 4.0 — Artist', 'Pixabay licence', 'own recording')")
+    ext = Path(up.filename).suffix.lower()
+    if ext not in MU.EXTS:
+        raise HTTPException(422, "unsupported audio type (mp3, wav, ogg, m4a)")
+    with tempfile.TemporaryDirectory(prefix="studio-mu-") as tmp:
+        dest = Path(tmp) / f"upload{ext}"
+        size = 0
+        with open(dest, "wb") as f:
+            while chunk := await up.read(1 << 20):
+                size += len(chunk)
+                if size > MU.MAX_BYTES:
+                    raise StoreError(f"audio file too large (limit {MU.MAX_BYTES // 2**20} MB)", 413)
+                f.write(chunk)
+        bpm = str(form.get("bpm") or "").strip()
+        m = MU.add_track(dest, {"title": str(form.get("title") or Path(up.filename).stem)[:80],
+                                "artist": str(form.get("artist") or "")[:80], "licence": licence[:160],
+                                "source": "upload", "mood": str(form.get("mood") or "")[:80] or None,
+                                "bpm": int(bpm) if bpm.isdigit() else None, "original_name": up.filename[:120]}, move=True)
+    if form.get("project"):
+        p = Project.get(str(form.get("project")))
+        b = p.brief
+        b["music"] = {**(b.get("music") if isinstance(b.get("music"), dict) else {}), "track": m["id"]}
+        p.save_brief(B.normalize(b, p.assets())[0])
+    return {**m, "url": f"/api/library/music/{m['id']}/track{m['ext']}"}
+
+
+@app.delete("/api/library/music/{tid}")
+def library_music_delete(tid: str):
+    """Delete a track. Projects that used it render without music (with a warning in the editor)."""
+    MU.delete(tid)
+    return {"deleted": tid}
+
+
+@app.get("/api/align/status")
+def align_status():
+    """faster-whisper word timing: model, loaded, error."""
+    return align.status()
 
 
 # ---------------------------------------------------------------- AI: GPU queue, library, presenter
@@ -604,8 +714,8 @@ async def ai_portrait(request: Request):
 
 
 def _presenter_state(p: Project) -> dict | None:
-    brief = p.brief
-    tl = build.timeline(p, brief)
+    brief = B.localize(p.brief)             # the presenter speaks the main language
+    tl = build.timeline(p, p.brief)
     pl = tl.get("_presenter")
     if not pl:
         return None
