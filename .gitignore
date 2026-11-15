@@ -36,3 +36,12 @@ video/comfyui/*
 !video/comfyui/setup.py
 !video/comfyui/extra_model_paths.yaml
 !video/comfyui/README.md
+
+# demo outputs (videos, frames, analysis) stay local; REPORT.md and brief.json are tracked
+video/demos/**/*.mp4
+video/demos/**/*.webm
+video/demos/**/*.wav
+video/demos/**/*.png
+video/demos/**/*.jpg
+video/demos/**/analysis/
+video/demos/**/frames-*/

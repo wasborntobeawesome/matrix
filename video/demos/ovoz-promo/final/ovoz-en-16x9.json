@@ -1,0 +1,28 @@
+{
+ "language": "en",
+ "format": "16:9",
+ "duration": 35.364,
+ "width": 1920,
+ "height": 1080,
+ "voiced": 8,
+ "voice_needed": 8,
+ "warnings": [],
+ "seconds": 42.2,
+ "cover_t": 3.539,
+ "timing": {
+  "aligned": 8,
+  "voiced": 8,
+  "model": "small"
+ },
+ "music": {
+  "track": "m-2dc2e2a963",
+  "lufs": -14.01,
+  "true_peak": -1.5,
+  "music_gain_db": -13.1,
+  "voice_lufs": -20.7
+ },
+ "srt": "en-16x9-20261115-190717.srt",
+ "vtt": "en-16x9-20261115-190717.vtt",
+ "cover": "en-16x9-20261115-190717.png",
+ "batch": "20261115-190717"
+}

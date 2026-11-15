@@ -1,0 +1,45 @@
+1
+00:00:00,000 --> 00:00:05,290
+Ovoz — matnni soniyalarda jonli
+nutqqa aylantiradigan bepul ilova.
+
+2
+00:00:05,702 --> 00:00:07,132
+Oʻzbek,
+
+3
+00:00:07,302 --> 00:00:08,002
+rus,
+
+4
+00:00:08,082 --> 00:00:10,412
+ingliz va arab tillarida gapiradi.
+
+5
+00:00:10,823 --> 00:00:15,173
+Matnni yozing, tugmani bosing
+va audioni darhol tinglang.
+
+6
+00:00:17,993 --> 00:00:22,783
+Toʻqqizta model: Microsoft ovozlari
+va kompyuteringizdagi bepul modellar.
+
+7
+00:00:23,137 --> 00:00:26,607
+Har bir modelning litsenziyasi
+aniq koʻrinib turadi.
+
+8
+00:00:26,999 --> 00:00:31,509
+Navoiy modeli oʻnta hissiyot bilan gapiradi
+— xursand ohangdan pichirlashgacha.
+
+9
+00:00:31,971 --> 00:00:37,141
+Oʻz ovozingizni qoʻshing: rozilik bilan,
+yozuvlar kompyuteringizda qoladi.
+
+10
+00:00:37,607 --> 00:00:40,797
+Ovozni bugunoq bepul sinab koʻring!

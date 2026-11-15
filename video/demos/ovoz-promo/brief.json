@@ -1,0 +1,121 @@
+{
+  "title": "Ovoz — bepul TTS promo",
+  "product": "Ovoz",
+  "language": "uz",
+  "languages": ["uz", "ru", "en"],
+  "format": "9:16",
+  "formats": ["9:16", "16:9"],
+  "brand": { "primary": "#22B394", "accent": "#F2C14E", "background": "#0B1714" },
+  "voices": {
+    "uz": { "model": "navoiy", "voice": "madina", "style": "xursand" },
+    "ru": { "model": "edge", "voice": "ru-RU-SvetlanaNeural" },
+    "en": { "model": "edge", "voice": "en-US-AvaNeural" }
+  },
+  "template": "clean",
+  "broll_provider": "comfy:wan22-14b-lightx2v",
+  "music": {
+    "generate": {
+      "prompt": "uplifting modern tech background, soft marimba plucks, warm synth pads, light claps, gentle steady beat, optimistic, instrumental",
+      "genre": "corporate electronic",
+      "mood": "warm, optimistic",
+      "bpm": 100
+    }
+  },
+  "scenes": [
+    {
+      "id": "hook", "layout": "hero",
+      "kicker": { "uz": "BEPUL · 4 TIL", "ru": "БЕСПЛАТНО · 4 ЯЗЫКА", "en": "FREE · 4 LANGUAGES" },
+      "headline": { "uz": "Matnni ovozga aylantiring", "ru": "Превратите текст в голос", "en": "Turn text into voice" },
+      "sub": { "uz": "Oʻzbek tili — birinchi oʻrinda", "ru": "Узбекский — в приоритете", "en": "Uzbek comes first" },
+      "say": {
+        "uz": "Ovoz — matningizni bir necha soniyada jonli nutqqa aylantiradigan bepul ilova.",
+        "ru": "Овоз — бесплатное приложение, которое за секунды превращает текст в живую речь.",
+        "en": "Ovoz is a free app that turns your text into natural speech in seconds."
+      },
+      "background": {
+        "type": "broll",
+        "prompt": "Slow cinematic dolly through flowing ribbons of emerald and teal light shaped like sound waves, deep dark green background, soft golden bokeh, shallow depth of field, calm and elegant",
+        "provider": "comfy:wan22-14b-lightx2v",
+        "dim": 0.5
+      }
+    },
+    {
+      "id": "languages", "layout": "chips",
+      "headline": { "uz": "Toʻrt tilda gapiradi", "ru": "Говорит на четырёх языках", "en": "Speaks four languages" },
+      "items": ["Oʻzbekcha", "Русский", "English", "العربية"],
+      "say": {
+        "uz": "Oʻzbek, rus, ingliz va arab tillarida — hammasi bitta oddiy sahifada.",
+        "ru": "Узбекский, русский, английский и арабский — всё на одной простой странице.",
+        "en": "Uzbek, Russian, English and Arabic, all on one simple page."
+      }
+    },
+    {
+      "id": "type-and-play", "layout": "screen", "device": "phone", "asset": "ovoz-type-play.mp4",
+      "headline": { "uz": "Yozing va tinglang", "ru": "Напишите и слушайте", "en": "Type it, hear it" },
+      "callout": { "uz": "Bir bosishda audio", "ru": "Аудио в один клик", "en": "Audio in one tap" },
+      "say": {
+        "uz": "Matnni yozing, tugmani bosing va tayyor audioni darhol tinglang yoki yuklab oling.",
+        "ru": "Введите текст, нажмите кнопку — и сразу слушайте или скачивайте готовое аудио.",
+        "en": "Type your text, tap the button, then play or download the audio right away."
+      }
+    },
+    {
+      "id": "models", "layout": "stat",
+      "stat": "9",
+      "headline": { "uz": "ovoz modeli", "ru": "голосовых моделей", "en": "voice models" },
+      "sub": { "uz": "Onlayn va oʻz GPU’ingizda", "ru": "Онлайн и на вашей видеокарте", "en": "Online and on your own GPU" },
+      "say": {
+        "uz": "Toʻqqizta model: Microsoft ovozlari va kompyuteringizda ishlaydigan bepul modellar.",
+        "ru": "Девять моделей: голоса Microsoft и бесплатные модели прямо на вашем компьютере.",
+        "en": "Nine models: Microsoft voices plus free models that run on your own computer."
+      }
+    },
+    {
+      "id": "licences", "layout": "screen", "device": "browser", "asset": "web-models.png", "url": "localhost:8000",
+      "focus": { "x": 0.27, "y": 0.68, "w": 0.46, "h": 0.17 },
+      "headline": { "uz": "Aniq litsenziyalar", "ru": "Понятные лицензии", "en": "Clear licences" },
+      "callout": { "uz": "Notijorat modellar belgilangan", "ru": "Некоммерческие отмечены", "en": "Non-commercial flagged" },
+      "say": {
+        "uz": "Har bir modelda litsenziya belgisi bor, notijorat modellar esa alohida belgilangan.",
+        "ru": "У каждой модели видна лицензия, а некоммерческие отмечены отдельно.",
+        "en": "Every model shows its licence, and non-commercial ones are clearly flagged."
+      }
+    },
+    {
+      "id": "emotions", "layout": "screen", "device": "phone", "asset": "phone-emotions.png",
+      "focus": { "x": 0.06, "y": 0.27, "w": 0.88, "h": 0.23 },
+      "headline": { "uz": "Oʻnta hissiyot", "ru": "Десять эмоций", "en": "Ten emotions" },
+      "callout": { "uz": "Navoiy modeli", "ru": "Модель Navoiy", "en": "Navoiy model" },
+      "say": {
+        "uz": "Navoiy modeli oʻnta hissiyot bilan gapiradi — xursand ohangdan pichirlashgacha.",
+        "ru": "Для узбекского модель Навои передаёт десять эмоций — от радости до шёпота.",
+        "en": "For Uzbek, the Navoiy model speaks with ten emotions, from happy to a whisper."
+      }
+    },
+    {
+      "id": "own-voice", "layout": "list",
+      "headline": { "uz": "Oʻz ovozingiz", "ru": "Ваш собственный голос", "en": "Your own voice" },
+      "items": {
+        "uz": ["🎙️ Ovozingizni qoʻshing", "✅ Faqat rozilik bilan", "🔒 Yozuvlar kompyuteringizda"],
+        "ru": ["🎙️ Добавьте свой голос", "✅ Только с согласия", "🔒 Записи остаются у вас"],
+        "en": ["🎙️ Add your own voice", "✅ Only with consent", "🔒 Recordings stay on your PC"]
+      },
+      "say": {
+        "uz": "Oʻz ovozingizni qoʻshing: faqat rozilik bilan, yozuvlar esa kompyuteringizda qoladi.",
+        "ru": "Добавьте свой голос: только с согласия, и запись остаётся на вашем компьютере.",
+        "en": "Add your own voice, only with consent, and the recordings stay on your computer."
+      }
+    },
+    {
+      "id": "cta", "layout": "cta", "pad": 1.0,
+      "headline": { "uz": "Ovozni sinab koʻring", "ru": "Попробуйте Ovoz", "en": "Try Ovoz" },
+      "sub": { "uz": "Bepul · Oʻzbek tili birinchi", "ru": "Бесплатно · узбекский в приоритете", "en": "Free · Uzbek first" },
+      "button": { "uz": "Bepul boshlash", "ru": "Начать бесплатно", "en": "Start free" },
+      "say": {
+        "uz": "Ovozni bugunoq bepul sinab koʻring!",
+        "ru": "Попробуйте Овоз бесплатно уже сегодня!",
+        "en": "Try Ovoz for free today!"
+      }
+    }
+  ]
+}
