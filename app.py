@@ -86,6 +86,13 @@ def models():
     return [e.info() for e in engines.ENGINES.values()]
 
 
+@app.post("/api/unload", dependencies=[Depends(same_origin_only)])
+async def unload():
+    """Free GPU memory: unload all local models. Used by Video Studio between the
+    voice-over and video steps so each gets the whole GPU."""
+    return {"unloaded": await run_in_threadpool(engines.unload_all)}
+
+
 @app.get("/api/languages")
 def languages():
     return [{"id": k, **v} for k, v in LANGUAGES.items()]

@@ -21,6 +21,21 @@ def get(engine_id: str) -> Engine | None:
     return ENGINES.get(engine_id)
 
 
+def unload_all() -> list[str]:
+    """Unload every loaded local model (and stop worker processes) to free the GPU.
+
+    Waits for a synthesis that is running right now to finish first. Models load
+    again on their next use.
+    """
+    from .base import GPU_LOCK
+
+    with GPU_LOCK:
+        unloaded = [e.id for e in ENGINES.values() if e.kind == "local" and e.loaded]
+        for engine_id in unloaded:
+            ENGINES[engine_id].unload()
+    return unloaded
+
+
 def make_room_for(engine: Engine, headroom_gb: float = 1.5):
     """Unload other local models until `engine` should fit in free GPU memory."""
     try:
