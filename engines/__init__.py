@@ -3,6 +3,7 @@
 from .anadil import AnadilEngine
 from .base import Engine
 from .chatterbox_engine import ChatterboxEngine
+from .chatterbox_ml import ChatterboxMultilingualEngine
 from .edge import EdgeEngine
 from .f5 import F5Engine
 from .mms import MMSEngine
@@ -12,7 +13,7 @@ from .omnivoice_engine import OmniVoiceEngine
 
 ENGINES: dict[str, Engine] = {
     e.id: e
-    for e in (EdgeEngine(), NavoiyEngine(), OmniVoiceEngine(), Qwen3UzbekEngine(), SayroEngine(), ChatterboxEngine(), AnadilEngine(), F5Engine(), MMSEngine())
+    for e in (EdgeEngine(), NavoiyEngine(), OmniVoiceEngine(), Qwen3UzbekEngine(), SayroEngine(), ChatterboxEngine(), ChatterboxMultilingualEngine(), AnadilEngine(), F5Engine(), MMSEngine())
 }
 
 

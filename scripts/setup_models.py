@@ -17,7 +17,9 @@ WEIGHTS = {
     "k2-fsa/OmniVoice": None,
     "mrmuminov/f5-tts-uzbek": ["model.safetensors", "vocab.txt"],
     "Abduqayum/uzbek-tts-natural-speech-chatterbox": ["t3_finetuned_merged.safetensors", "tokenizer.json", "reference_voice.wav"],
-    "ResembleAI/chatterbox": ["ve.safetensors", "s3gen.safetensors", "conds.pt"],
+    "ResembleAI/chatterbox": ["ve.safetensors", "s3gen.safetensors", "conds.pt",  # base of the Uzbek fine-tune
+                              "ve.pt", "s3gen.pt", "t3_mtl23ls_v3.safetensors",  # Chatterbox Multilingual
+                              "grapheme_mtl_merged_expanded_v1.json", "Cangjie5_TC.json"],
     "Anadilorg/Anadil_Uzbek_TTS": ["*.json", "*.safetensors"],
     "openbmb/VoxCPM2": None,
     "facebook/mms-tts-uzb-script_cyrillic": ["*.json", "model.safetensors"],

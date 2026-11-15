@@ -55,6 +55,7 @@
       <div class="field">
         <span class="label">Ovoz</span>
         <div id="voices" class="seg" role="radiogroup"></div>
+        <p id="voiceHint" class="voice-hint" hidden></p>
       </div>
       <div class="field" id="styleField" hidden>
         <span class="label">Hissiyot</span>
@@ -78,6 +79,32 @@
     <p id="error" class="error" role="alert" hidden></p>
     <p id="result" class="result" hidden></p>
     <audio id="player" controls hidden></audio>
+
+    <details class="card add-voice" id="addVoice">
+      <summary>
+        <span class="av-title">＋ Ovoz qoʻshish: <span id="avLang"></span> tilida</span>
+        <span class="hint">ona tilida gapiradigan odamni yozib oling — modellar uning ovozi va talaffuzi bilan gapiradi</span>
+      </summary>
+      <ol class="av-tips">
+        <li>Ona tilida gapiradigan odamni toping va undan ovozini reklamada ishlatishga rozilik oling.</li>
+        <li>Tinch xonada, mikrofonga 20–30 sm masofada, reklamadagidek jonli ohangda quyidagi matnni oʻqisin (5–15 soniya).</li>
+        <li>Natija namunaga oʻxshaydi: shovqin, aks-sado yoki zerikarli ohang ham koʻchadi.</li>
+      </ol>
+      <label for="avName" class="label">Ism</label>
+      <input id="avName" class="input" maxlength="60" placeholder="masalan: Anna (ayol)">
+      <label for="avText" class="label">Oʻqiladigan matn <span class="hint">— aynan aytilgan soʻzlar boʻlishi kerak</span></label>
+      <textarea id="avText" class="av-text" rows="3" maxlength="600"></textarea>
+      <div class="av-actions">
+        <button type="button" id="avRec" class="secondary">● Yozib olish</button>
+        <label class="secondary file-btn">⬆ Fayl yuklash<input type="file" id="avFile" accept="audio/*" hidden></label>
+        <span id="avTime" class="count"></span>
+      </div>
+      <audio id="avPreview" controls hidden></audio>
+      <label class="toggle av-consent"><input type="checkbox" id="avConsent"> Ovoz egasi ovozini klonlash va reklamada ishlatishga rozilik bergan</label>
+      <button type="button" id="avSave" class="primary" disabled>Saqlash</button>
+      <p id="avMsg" class="hint" hidden></p>
+      <div id="avList" class="av-list"></div>
+    </details>
 
     <footer>Ctrl + Enter — tezkor ovozlashtirish</footer>
   </main>

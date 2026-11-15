@@ -24,3 +24,9 @@ video/studio/.server.log
 # video studio AI library (generated clips, portraits, job state)
 video/library/
 video/studio/.server.err.log
+
+# Recordings of real people added through the UI (keep them off GitHub)
+voices/uz/
+voices/ru/
+voices/en/
+voices/ar/
