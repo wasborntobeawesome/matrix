@@ -12,10 +12,10 @@
 
   const fmtDur = s => {
     s = Math.max(0, Math.round(s || 0));
-    if (s < 60) return `${s} s`;
+    if (s < 60) return t("ai.durS", { s });
     const m = Math.floor(s / 60);
-    if (m < 60) return `${m} min ${String(s % 60).padStart(2, "0")} s`;
-    return `${Math.floor(m / 60)} h ${m % 60} min`;
+    if (m < 60) return t("ai.durMin", { m, s: String(s % 60).padStart(2, "0") });
+    return t("ai.durH", { h: Math.floor(m / 60), m: m % 60 });
   };
   const gbOf = mb => (mb == null ? "?" : (mb / 1024).toFixed(1));
 
@@ -49,8 +49,8 @@
         g.ovoz_mb != null ? el("span", {}, el("i", { class: "v-ovoz" }), t("ai.gpuOvoz", { gb: gbOf(ov) })) : null,
         el("span", {}, el("i", { class: "v-ai" }), t("ai.gpuAi", { gb: gbOf(ai) })),
         el("span", {}, el("i", { class: "v-other" }), t("ai.gpuOther", { gb: gbOf(other) })),
-        el("span", {}, el("i", { class: "v-free" }), `${gbOf(g.free_mb)} GB free`)),
-      g.procs && g.procs.length ? el("details", { class: "small muted" }, el("summary", {}, "Processes"),
+        el("span", {}, el("i", { class: "v-free" }), t("ai.gbFree", { gb: gbOf(g.free_mb) }))),
+      g.procs && g.procs.length ? el("details", { class: "small muted" }, el("summary", {}, t("ai.processes")),
         el("ul", { class: "procs" }, g.procs.map(p => el("li", {}, el("span", { class: `who who-${p.who}` }, p.who),
           ` ${p.name} · ${gbOf(p.mb)} GB`)))) : null);
     return box;
@@ -112,7 +112,7 @@
     const used = m.used_in ? (m.used_in.length ? t("ai.usedIn", { n: m.used_in.length }) : t("ai.notUsed")) : "";
     const body = el("div", { class: "clip-body" },
       el("div", { class: "clip-prompt", title: m.prompt }, m.name ? el("b", {}, m.name + " · ") : null, m.prompt),
-      el("div", { class: "muted small" }, [`seed ${m.seed}`, `${m.steps} steps`, used].filter(Boolean).join(" · ")),
+      el("div", { class: "muted small" }, [t("ai.seedN", { n: m.seed }), t("ai.stepsN", { n: m.steps }), used].filter(Boolean).join(" · ")),
       onDelete ? el("button", { class: "btn small danger", onclick: e => { e.stopPropagation(); onDelete(m); } }, t("delete")) : null);
     if (onPick) {
       return el("button", { class: `clip pickable ${selected ? "on" : ""}`, role: "radio", "aria-checked": selected ? "true" : "false",

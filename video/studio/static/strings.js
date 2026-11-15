@@ -1,7 +1,83 @@
-// All UI text in one place so it can be translated (e.g. to Uzbek) later.
-// Use {name} placeholders; app.js fills them via t("key", {name: value}).
-window.STRINGS = {
+// All UI text in one place. English here; Uzbek (Latin) in strings-uz.js, which only overrides keys —
+// anything it lacks falls back to English. Use {name} placeholders; app.js fills them via t("key", {name}).
+// The language is remembered per browser (localStorage "studio-ui-lang"); window.setUiLang("uz"|"en").
+window.STRINGS_EN = {
   appName: "Video Studio",
+  justNow: "just now",
+  minAgo: "{n} min ago",
+  hAgo: "{n} h ago",
+  ovozOffline: "Ovoz TTS offline",
+  serverDown: "studio server not reachable",
+  notFound: "Not found",
+  unavailable: "unavailable",
+  partlySilent: "partly silent",
+  time: "Time",
+  subtitles: "Subtitles",
+  horizontal: "horizontal",
+  vertical: "vertical",
+  moodPh: "calm, upbeat…",
+  auto: "auto",
+  assetTypes: { image: "image", video: "video" },
+  undo: "Undo",
+  redo: "Redo",
+  undoTip: "Undo (Ctrl+Z)",
+  redoTip: "Redo (Ctrl+Shift+Z)",
+  undone: "Undone",
+  redone: "Redone",
+  tabHistory: "History",
+
+  // templates
+  tpl: {
+    template: "Template",
+    pick: "Choose the look of the video",
+    help: "Point at a template to see it in the live preview; click to use it. Brand colours still apply. Every template supports every layout, format and language.",
+    inUse: "in use",
+    kinds: { theme: "theme", full: "full" },
+    confirmDelete: "Delete the template “{name}”? Projects using it go back to Aurora.",
+    noOptions: "{name} has no settings.",
+    options: "{name} settings",
+    applied: "Template: {name}",
+    import: "Import a template",
+    importHelp: "A .zip with manifest.json (plus template.css / template.js, fonts, pictures). It is checked before it is installed.",
+    replace: "Replace if installed",
+    chooseZip: "Choose a .zip file first.",
+    imported: "“{name}” imported",
+    importFailed: "The template was not imported:",
+    importBtn: "Import",
+    docs: "How to make one:",
+    reload: "Reload",
+    reloadHelp: "Re-read the template files (after you edit template.css / template.js) and refresh the preview",
+  },
+  tx: {
+    transition: "Transition",
+    templateDefault: "Template default",
+    projectDefault: "Project default",
+    pickProject: "Transition between scenes (for the whole project)",
+    projectHelp: "Used at every cut unless a scene picks its own. Point at a tile to play it.",
+    notInTemplate: "“{name}” is not in this template — its default is used.",
+    intoScene: "Transition into this scene",
+    names: { lift: "Lift", fade: "Fade", slide: "Slide", zoom: "Zoom", wipe: "Wipe", blur: "Blur", cut: "Cut" },
+  },
+  hist: {
+    title: "Version history",
+    shortcut: "Ctrl+Z / Ctrl+Shift+Z undo and redo single edits",
+    help: "Every save is kept (quick edits are merged; the last 100 versions). Restoring a version saves it as a new version, so you can go back again.",
+    empty: "No versions yet.",
+    current: "current",
+    restore: "Restore",
+    restored: "Restored the version from {when}",
+    kinds: { base: "before history", import: "imported", edit: "edit", restore: "restored" },
+  },
+  fu: {
+    button: "Ask the AI for missing material",
+    help: "Writes a ready-to-send message for the AI that made the brief: missing or unusable files, missing translations, text to fix, suggestions",
+    title: "Follow-up for the source AI",
+    intro: "Copy this message and send it to the AI that wrote the brief. It is in English, which works best for AIs.",
+    allGood: "Nothing required is missing",
+    api: "Coding agents can fetch it:",
+    kinds: { missing_file: "missing files", invalid_file: "unusable files", orientation: "wrong orientation", low_resolution: "low resolution",
+      long_recording: "long recordings", translation: "missing translations", too_long: "too long", empty_text: "empty text", suggestion: "suggestions" },
+  },
   projects: "Projects",
   newProject: "New project",
   fromExample: "Start from example",
@@ -207,7 +283,7 @@ window.STRINGS = {
   voiceDone: "Voice-over ready",
   jobFailed: "Failed: {msg}",
   confirmDeleteRender: "Delete render {name}?",
-  shortcuts: "Space: play/pause · ←/→: 1 s · Alt+↑/↓: move scene",
+  shortcuts: "Space: play/pause · ←/→: 1 s · Alt+↑/↓: move scene · Ctrl+Z / Ctrl+Shift+Z: undo / redo",
 
   // ---------------------------------------------------------------- "Make video" pipeline
   make: {
@@ -243,6 +319,13 @@ window.STRINGS = {
     gpuAi: "AI job {gb} GB",
     gpuOther: "Desktop & other apps {gb} GB",
     gpuUnknown: "GPU status unavailable (nvidia-smi not found)",
+    gbFree: "{gb} GB free",
+    processes: "Processes",
+    seedN: "seed {n}",
+    stepsN: "{n} steps",
+    durS: "{s} s",
+    durMin: "{m} min {s} s",
+    durH: "{h} h {m} min",
     gpuUtil: "load {n}%",
     venvMissing: "The AI environment video/ai/.venv is missing — see video/ai/README.md.",
     queue: "GPU job queue",
@@ -340,3 +423,20 @@ window.STRINGS = {
     projectJobs: "AI jobs",
   },
 };
+
+(() => {
+  const merge = (a, b) => {
+    const o = Array.isArray(a) ? [...a] : { ...a };
+    for (const [k, v] of Object.entries(b || {})) o[k] = v && typeof v === "object" && !Array.isArray(v) && a && typeof a[k] === "object" ? merge(a[k], v) : v;
+    return o;
+  };
+  let saved = "en";
+  try { saved = localStorage.getItem("studio-ui-lang") || "en"; } catch { /* private mode */ }
+  window.UI_LANG = saved === "uz" ? "uz" : "en";
+  window.setUiLang = lang => {
+    window.UI_LANG = lang === "uz" ? "uz" : "en";
+    try { localStorage.setItem("studio-ui-lang", window.UI_LANG); } catch { /* private mode */ }
+    window.STRINGS = window.UI_LANG === "uz" && window.STRINGS_UZ ? merge(window.STRINGS_EN, window.STRINGS_UZ) : window.STRINGS_EN;
+  };
+  window.setUiLang(window.UI_LANG);
+})();

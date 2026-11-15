@@ -1,0 +1,49 @@
+{
+  "id": "clean",
+  "name": "Clean",
+  "description": "Light and minimal, in the spirit of Apple keynotes: soft white surfaces, an app-icon hero, quiet type, gentle drift transitions.",
+  "author": "Video Studio",
+  "version": "1.0.0",
+  "licence": "MIT",
+  "kind": "full",
+  "formats": ["9:16", "1:1", "16:9"],
+  "layouts": ["hero", "chips", "stat", "list", "cta", "screen", "screens", "presenter"],
+  "css": "template.css",
+  "js": "template.js",
+  "default_transition": "drift",
+  "transitions": [{ "id": "drift", "name": "Drift" }],
+  "previews": ["preview-9x16.png", "preview-1x1.png", "preview-16x9.png"],
+  "options": [
+    { "key": "glow", "type": "boolean", "default": true, "label": { "en": "Soft colour glow", "uz": "Yumshoq rang nuri" } },
+    { "key": "button", "type": "select", "default": "brand",
+      "label": { "en": "Button colour", "uz": "Tugma rangi" },
+      "choices": [ { "value": "brand", "label": { "en": "Brand colour", "uz": "Brend rangi" } },
+                   { "value": "dark", "label": { "en": "Graphite", "uz": "Grafit" } } ] }
+  ],
+  "tokens": {
+    "tone": "light",
+    "colors": {
+      "background": "#F5F5F7",
+      "surface": "#FFFFFF",
+      "text": "#1D1D1F",
+      "muted": "#6E6E73",
+      "primary": "brand.primary",
+      "accent": "brand.accent",
+      "line": "rgba(0,0,0,.08)",
+      "line_mix": "#E3E4EA",
+      "track": "rgba(0,0,0,.07)",
+      "on_accent": "#FFFFFF"
+    },
+    "fonts": { "display": "Inter", "body": "Inter", "display_weight": 700, "body_weight": 450 },
+    "radii": { "card": 30, "chip": 26, "button": 999, "pill": 999 },
+    "shadows": {
+      "card": "0 1px 2px rgba(16,24,40,.05), 0 14px 36px rgba(16,24,40,.08)",
+      "device": "0 40px 90px rgba(16,24,40,.22)"
+    },
+    "caption": { "style": "bar", "background": "rgba(255,255,255,.94)", "border": "rgba(16,24,40,.06)",
+                 "text": "#1D1D1F", "highlight": "brand.primary" },
+    "progress": { "style": "bar" },
+    "logo": { "placement": "top-left" },
+    "background": { "blobs": true, "grid": false, "particles": false, "vignette": false }
+  }
+}

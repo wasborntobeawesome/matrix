@@ -125,6 +125,30 @@ source AI can only suggest a mood:
 "cover": { "scene": "hook", "t": 2.0 }                                 // cover PNG moment (default: end of scene 1)
 ```
 
+## Look: template and transitions (optional)
+
+The studio user normally picks the look in the editor; a source AI may suggest one. Brand colours apply
+in every template.
+
+```json
+"template": "clean",                         // aurora (default, dark glow) | clean (light, minimal) | bold (high contrast, social)
+"template_options": { "glow": false },       // settings the template declares (see GET /api/templates)
+"transition": "fade",                        // default between scenes: lift | fade | slide | zoom | wipe | blur | cut (+ template ones, e.g. bold: punch, swipe)
+"scenes": [ { "id": "cta", "layout": "cta", "transition": { "type": "zoom", "duration": 0.6 }, ... } ]   // into this scene
+```
+
+Leave them out when unsure: the studio then uses aurora and its default transition. Unknown templates
+are kept with a warning (the video uses aurora until the template is imported); unknown transitions are
+dropped with a warning. Templates are documented in `video/templates/TEMPLATES.md`.
+
+## Missing material: the follow-up message
+
+`GET http://127.0.0.1:8001/api/projects/<id>/followup` (or `?format=text`) returns a ready-to-send English
+message for the source AI listing files the brief references but that were not received or can't be used,
+screenshots in the wrong orientation or too small, missing translations per language, voice-over lines over
+18 words and empty text, plus suggestions. Answer it with the files (same names) and the changed scenes as
+complete JSON objects; the studio user can also copy it from the editor (*Ask the AI for missing material*).
+
 ## Scene layouts
 
 | layout | fields | what you see |
@@ -247,7 +271,8 @@ Fields:
     presenter {kicker?, headline, sub?}            (AI talking head; needs top-level "presenter")
   optional per scene: pad (seconds of silence after the line, default 0.4), duration (minimum seconds),
     background {type: "broll", prompt, dim?, blur?}   (AI b-roll suggestion; default = brand gradient)
-  optional top level: music {mood}, presenter {enabled, mode: "corner"|"full", scenes: "all"|[ids], portrait_prompt}
+  optional top level: music {mood}, presenter {enabled, mode: "corner"|"full", scenes: "all"|[ids], portrait_prompt},
+    template ("aurora" | "clean" | "bold"; the studio user usually picks it — leave out if unsure)
 
 Example (a fictional app, two languages, two formats):
 {

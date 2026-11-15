@@ -1,0 +1,42 @@
+{
+  "id": "bold",
+  "name": "Bold",
+  "description": "High contrast and very large type for Reels, Shorts and TikTok: stacked headlines that slam in, sticker chips, word-by-word box captions, punch and swipe transitions.",
+  "author": "Video Studio",
+  "version": "1.0.0",
+  "licence": "MIT",
+  "kind": "full",
+  "formats": ["9:16", "1:1", "16:9"],
+  "layouts": ["hero", "chips", "stat", "list", "cta", "screen", "screens", "presenter"],
+  "css": "template.css",
+  "js": "template.js",
+  "default_transition": "punch",
+  "transitions": [{ "id": "punch", "name": "Punch" }, { "id": "swipe", "name": "Swipe" }],
+  "previews": ["preview-9x16.png", "preview-1x1.png", "preview-16x9.png"],
+  "options": [
+    { "key": "stripes", "type": "boolean", "default": true, "label": { "en": "Moving colour bands", "uz": "Harakatlanuvchi rangli chiziqlar" } },
+    { "key": "case", "type": "select", "default": "upper", "label": { "en": "Headline case", "uz": "Sarlavha harflari" },
+      "choices": [ { "value": "upper", "label": { "en": "UPPER CASE", "uz": "KATTA HARFLAR" } },
+                   { "value": "normal", "label": { "en": "As written", "uz": "Yozilganidek" } } ] }
+  ],
+  "tokens": {
+    "tone": "dark",
+    "colors": {
+      "background": "#0B0B0F",
+      "surface": "#17171F",
+      "text": "#FFFFFF",
+      "muted": "#C4C4D0",
+      "primary": "brand.primary",
+      "accent": "brand.accent",
+      "line": "rgba(255,255,255,.14)",
+      "on_accent": "#0B0B0F"
+    },
+    "fonts": { "display": "Inter", "body": "Inter", "display_weight": 900, "body_weight": 650 },
+    "radii": { "card": 16, "chip": 16, "button": 20, "pill": 14 },
+    "shadows": { "card": "none", "device": "0 40px 100px rgba(0,0,0,.6)" },
+    "caption": { "style": "box", "uppercase": true, "text": "#FFFFFF", "highlight": "brand.accent", "highlight_text": "#0B0B0F" },
+    "progress": { "style": "bar" },
+    "logo": { "placement": "top-left" },
+    "background": { "blobs": false, "grid": false, "particles": false, "vignette": false }
+  }
+}

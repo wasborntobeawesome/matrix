@@ -156,7 +156,9 @@ async def render(args) -> None:
     async with async_playwright() as p:
         browser = await p.chromium.launch(args=[
             "--force-color-profile=srgb", "--hide-scrollbars", "--font-render-hinting=none",
-            "--disable-lcd-text", "--autoplay-policy=no-user-gesture-required"])
+            "--disable-lcd-text", "--autoplay-policy=no-user-gesture-required",
+            # template.js is an ES module loaded from file:// (video/templates/<id>/)
+            "--allow-file-access-from-files"])
 
         async def worker(k: int) -> None:
             page = await browser.new_page(viewport={"width": W, "height": H}, device_scale_factor=1)
@@ -213,7 +215,8 @@ async def stills(url: str, W: int, H: int, times: list, out_dir: Path) -> None:
     """Quick look: screenshot single moments straight from the page (no video)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     async with async_playwright() as p:
-        browser = await p.chromium.launch(args=["--force-color-profile=srgb", "--font-render-hinting=none"])
+        browser = await p.chromium.launch(args=["--force-color-profile=srgb", "--font-render-hinting=none",
+                                                "--allow-file-access-from-files"])
         page = await browser.new_page(viewport={"width": W, "height": H})
         page.on("pageerror", lambda e: print(f"[page] {e}", file=sys.stderr))
         page.on("console", lambda m: print(f"[console] {m.text}", file=sys.stderr))

@@ -1,0 +1,36 @@
+{
+  "id": "starter",
+  "name": "Starter",
+  "description": "A minimal template to copy: warm dark theme, a custom hero layout and one custom transition. Everything else uses the built-in layouts.",
+  "author": "Your name",
+  "version": "0.1.0",
+  "licence": "MIT",
+  "kind": "full",
+  "formats": ["9:16", "1:1", "16:9"],
+  "layouts": ["hero", "chips", "stat", "list", "cta", "screen", "screens", "presenter"],
+  "css": "template.css",
+  "js": "template.js",
+  "default_transition": "rise",
+  "transitions": [{ "id": "rise", "name": "Rise" }],
+  "previews": ["preview-9x16.png", "preview-1x1.png", "preview-16x9.png"],
+  "options": [
+    { "key": "ring", "type": "boolean", "default": true, "label": { "en": "Ring behind the hero", "uz": "Sarlavha ortidagi halqa" } }
+  ],
+  "tokens": {
+    "tone": "dark",
+    "colors": {
+      "background": "#1A1410",
+      "surface": "#2A211B",
+      "text": "#FFF8F0",
+      "muted": "#C9B8A6",
+      "primary": "brand.primary",
+      "accent": "#FFB547"
+    },
+    "fonts": { "display": "Inter", "body": "Inter", "display_weight": 800, "body_weight": 500 },
+    "radii": { "card": 24, "chip": 24, "button": 999, "pill": 999 },
+    "caption": { "style": "pill", "background": "rgba(26,20,16,.82)", "highlight": "#FFB547" },
+    "progress": { "style": "dots" },
+    "logo": { "placement": "top-center" },
+    "background": { "blobs": true, "grid": false, "particles": true, "vignette": true }
+  }
+}

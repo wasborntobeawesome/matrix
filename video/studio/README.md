@@ -4,7 +4,10 @@ A local web app for making promo videos about other products. It builds them fro
 screen recordings and an AI-written script (the **brief**). People review and edit the brief in the
 browser, preview it live, generate the voice-over with the Ovoz TTS app, and render MP4s in 9:16, 1:1
 and 16:9, in several languages from one brief (uz, ru, en, ar), with background music, word-accurate
-captions, `.srt`/`.vtt` subtitles and a cover image per video. Everything is free/open source: FastAPI,
+captions, `.srt`/`.vtt` subtitles and a cover image per video. The look comes from a **template**
+(built in: *Aurora*, *Clean*, *Bold*; import your own as a zip — see
+[`../templates/TEMPLATES.md`](../templates/TEMPLATES.md)). The editor has undo/redo, a version history, a
+follow-up message for the source AI, and an English / Uzbek interface. Everything is free/open source: FastAPI,
 Playwright Chromium, FFmpeg, faster-whisper, numpy and plain HTML/JS.
 
 ## Run
@@ -56,7 +59,9 @@ Example assets for a fictional app ("Nimbo") are in [`example/`](example/). Clic
 video/
   html/                 renderer (shared with the original HTML option)
     index.html          stage; ?data=<data.js url> | ?embed (live preview, waits for loadTimeline)
-    app.js              mount(timeline) -> seek(t) is a pure function of t; layouts hero, chips,
+    transitions.js      scene transitions (lift, fade, slide, zoom, wipe, blur, cut), shared with the studio UI
+    app.js              mount(timeline) -> seek(t) is a pure function of t; templates (tokens -> CSS variables,
+                        template.css, template.js layouts/transitions/hooks, run with a frozen clock); layouts hero, chips,
                         stat, list, cta, screen, screens, presenter; phone/browser frames; focus zoom (inside the screen) +
                         callout; recordings (<video>, seek awaits 'seeked'); 9:16, 1:1 (.square) and 16:9 (.land);
                         right-to-left (.rtl, mirrored side-by-side layouts); ?cover = no captions/progress
@@ -73,6 +78,9 @@ video/
     align.py            word timing: faster-whisper (CPU int8) + alignment onto the script, cache, fallback
     music.py            music library (add_track/list/delete), builtin numpy tracks, ducking + loudness mix
     exports.py          .srt / .vtt cues from the aligned captions, cover time
+    templates.py        template discovery, manifest checks, zip import, timeline.template for the renderer
+    history.py          version history: snapshot per save (coalesced), list, restore, change summaries
+    followup.py         "Ask the AI for missing material" message
     jobs.py             background queues: voice (1 worker), render (1 at a time, subprocess)
     inbox.py            shared-folder watcher
     aijobs.py           GPU job queue for the AI layers (b-roll, portrait, presenter; subprocesses)
@@ -80,9 +88,12 @@ video/
     library.py          shared b-roll + portrait library (video/library/)
     presenter.py        talking-head planning, segment cache, assembly
     pipeline.py         "Make video": voice -> free GPU (Ovoz /api/unload) -> AI jobs -> render
-    static/             UI: index.html, app.js, ai.js (AI page + components), style.css, strings.js (all UI text)
+    static/             UI: index.html, app.js, ai.js (AI page + components), style.css, strings.js (English UI text),
+                        strings-uz.js (Uzbek UI text)
     example/            fictional sample brief + screenshots + recording
-  projects/<id>/        (gitignored) project.json, assets/, assets.json, thumbs/,
+  templates/<id>/       manifest.json (+ template.css, template.js, fonts, previews); aurora, clean, bold,
+                        _starter (copy me), validate.py, TEMPLATES.md
+  projects/<id>/        (gitignored) project.json, history/, assets/, assets.json, thumbs/,
                         build/{voice/<hash>.wav, voiceover[-<lang>].wav, mix-<lang>.wav (+.json),
                         timeline-<lang>-<fmt>.json, data-<lang>-<fmt>.js},
                         renders/<lang>-<fmt>-<timestamp>.mp4 (+ .json metadata, .srt, .vtt, .png cover)
@@ -142,6 +153,12 @@ Interactive docs: http://127.0.0.1:8001/docs
 | `POST /api/library/music` | multipart: audio file (mp3/wav/ogg/m4a ≤ 60 MB) + **`licence`** (required) + `title`, `artist`, `mood`, `bpm`, `project` (use it there) |
 | `DELETE /api/library/music/{id}` | delete an uploaded/generated track (projects using it render without music) |
 | `GET /api/align/status` | word-timing model, loaded, error |
+| `GET /api/templates` · `GET /api/templates/{id}` · `GET /api/templates/schema` | installed templates (built-ins first, broken ones with `error`) · one · manifest schema |
+| `POST /api/templates[?replace=1]` · `DELETE /api/templates/{id}` | import a template zip (multipart `file` or raw body; 422 `{errors: [...]}` lists every problem) · delete (not built-ins) |
+| `GET /templates/{id}/{file}` | template files for the preview (never cached: hot reload) |
+| `GET /api/projects/{id}/timeline?template=<id>` | preview another template without saving it (the picker's live preview) |
+| `GET /api/projects/{id}/history` · `GET …/history/{n}` · `POST …/history/{n}/restore` | version list (newest first: `{id, created, updated, kind, summary, scenes}`) · one snapshot with its brief · restore (saved as a new version) |
+| `GET /api/projects/{id}/followup[?format=text]` | ready-to-send English message for the source AI + `issues`, `counts`, `ok` |
 
 Render jobs go through one queue, so only one render runs at a time and the others wait. Voice jobs
 use their own queue. A render first generates any missing voice lines. If Ovoz fails it errors,
@@ -299,6 +316,99 @@ language, 23–36 words each; error = |aligned word start − true start|):
   renderer: identical except the 9:16 and 16:9 `screen`/`screens` scenes (caption/device change above).
   The old CLI (`render.py` without arguments) stills are pixel-identical. Old briefs normalise with
   `languages: [language]`, `formats: [format]`, `voices: {language: voice}` and no warnings.
+
+## Templates, transitions, history, follow-up, Uzbek UI (v2 phase 2)
+
+### Templates
+- `video/templates/<id>/manifest.json` (+ `template.css`, `template.js`, fonts, pictures). **theme** = design
+  tokens only (colours, fonts, radii, shadows, caption / progress / logo style, background picture);
+  **full** = + CSS and an ES module that can replace any layout (`layouts.<name>.build(scene, ctx)` /
+  `seek(el, localT, ctx)`), add transitions and background hooks. Full guide, API, safe zones, Figma
+  workflow: [`../templates/TEMPLATES.md`](../templates/TEMPLATES.md).
+- Built in: **Aurora** (the original look, the default), **Clean** (light, minimal: app-icon hero, check
+  chips, hairline list, *Drift* transition), **Bold** (huge stacked type, stickers, box captions, moving
+  bands, *Punch* / *Swipe*). All support every layout, 9:16 / 1:1 / 16:9, Arabic RTL, Cyrillic and Uzbek.
+- Brief: `template`, `template_options` (settings the manifest declares), `transition`, `scene.transition`.
+  The brand colours keep applying through the tokens (`"primary": "brand.primary"`).
+- Editor: **Template** in the settings bar opens a picker docked on the left, so the live preview stays
+  visible: thumbnails per format, point at one to see it in the preview, click to use it, its options,
+  *Import a template* (zip; every problem is listed), delete imported ones. **↻** re-reads the template
+  files (hot reload while you edit a template).
+- Determinism: template code runs with a frozen clock, seeded `Math.random` and timers refused; CSS
+  animations are paused and seeked; full templates render without compositor hints so a frame never
+  depends on the seek order. `video/templates/validate.py` checks manifests, renders every layout × format
+  × en/ar/ru/uz, flags overflow / safe-zone / caption collisions / fonts and compares double renders.
+- render.py starts Chromium with `--allow-file-access-from-files` so template.js can be an ES module from
+  `file://`. Only import templates you trust: they run JavaScript.
+
+### Transitions
+`lift` (the original), `fade`, `slide`, `zoom`, `wipe`, `blur`, `cut` (`video/html/transitions.js`) plus
+template ones. Project default in the settings bar, per scene in the scene form (“Transition into this
+scene”), each with a tiny animated preview (point at it). Pure functions of the cut's progress.
+
+### Undo / redo and version history
+- Ctrl+Z / Ctrl+Shift+Z (Ctrl+Y) and ↶ ↷ in the top bar; one step per burst of edits (typing in a field is
+  one step). The raw JSON editor keeps the browser's own undo.
+- Every save writes a snapshot to `projects/<id>/history/` (an *edit* younger than 45 s is updated in place,
+  the last 100 are kept). The **History** tab lists time, kind and a change summary (“template: bold →
+  clean · scene “hook”: headline (uz)”) with *Restore*; a restore is saved as a new version and is itself
+  undoable (Ctrl+Z or History).
+
+### “Ask the AI for missing material”
+Button under the scene list (and `GET /api/projects/{id}/followup`): an English message ready to paste into
+the source AI, listing missing or unusable files (a video as logo…), screenshots in the wrong orientation
+for their frame or too small, missing translations per language, voice-over lines over 18 words and empty
+text a layout needs, and up to five suggestions (a screenshot for a text-only scene, a focus area, a logo, a
+screen recording). Copy button in the dialog.
+
+### English / Oʻzbek interface
+EN / OʻZ switch in the top bar, remembered per browser (`localStorage`). Every UI string is in
+`static/strings.js` (English) and `static/strings-uz.js` (Uzbek Latin with oʻ gʻ ʼ, keys checked to match);
+buttons and tabs wrap instead of overflowing. Server messages (warnings, errors, history summaries, the
+follow-up) stay in English.
+
+### Verified (2026-11-15, test server on :8011, Playwright + API)
+
+- **Old projects pixel-identical:** 435 stills (15 old timelines: the 9 `nimbo-ade8` language × format
+  renders, 4 older projects, the original CLI timeline; each scene at 4 moments incl. the exit transition)
+  rendered with the phase-1 renderer and the new one, software raster, one page at a time: 435 / 435
+  identical without a template, and identical with `template: aurora` injected (one presenter-video first
+  frame differed once and matched on re-render — video decode timing). The old `render.py` CLI still
+  renders the Ovoz promo (641 frames, 17 s).
+- **Frame grid**, `nimbo-ade8` (uz + ru + ar, 9 scenes = every layout but presenter) × 9:16 / 1:1 / 16:9 ×
+  aurora / clean / bold: `preview/v2-phase2-grid-<template>-<lang>.png`. Fixed from these: bold chip labels
+  overflowing, stacked headlines measured too small, RTL stat overlapping the header, box captions wrapping
+  at half width, bold callouts covering the 1:1 text column, Arabic line height in clean.
+- **validate.py** on aurora, clean, bold, _starter and the imported starter: OK (108 frames each, no layout,
+  font or determinism problems). It found real issues during development (chip text clipped, a seek-order
+  dependent frame caused by `will-change` raster caching → full templates now render without it).
+- **Template switching from the UI** on `nimbo-ade8`: aurora → clean → bold → aurora, previews per format
+  `preview/v2-phase2-nimbo-<template>-<fmt>.png`; hovering a card previews it live in the editor
+  preview. The project was left on aurora, as before.
+- **Import:** a broken zip (bad id, empty name, code in a theme, colour "blue", caption style "wavy") was
+  rejected with all five errors listed (`v2-phase2-import-errors.png`); `_starter` zipped and imported
+  through the UI, applied, rendered (uz 9:16, 39.4 s video in 50.6 s): `v2-phase2-render-starter-frames.png`.
+- **Render time per template** (`nimbo` uz, 39.4 s = 1181 frames, 8 workers, incl. encoding):
+
+  | template | 9:16 | 16:9 |
+  |---|---|---|
+  | aurora | 49.7 s | 44.0 s |
+  | clean | 42.1 s | 34.8 s |
+  | bold | 33.2 s | 33.4 s |
+
+  Clean and bold are faster: no grid / particles / blurred glass caption to rasterise.
+- **Undo / redo:** typing in a headline → Ctrl+Z restored it, Ctrl+Shift+Z redid it, ↶ undid again; a
+  template change was undone (Ctrl+Z) and redone (Ctrl+Y). **History:** restoring the oldest version
+  reverted the template, Ctrl+Z undid the restore; summaries like “template: bold → clean”
+  (`v2-phase2-history*.png`).
+- **Follow-up:** a deliberately broken brief (missing `search.png` and `logo.png`, a landscape and a
+  400×860 screenshot in phone frames, missing en/uz/ru translations, a 21-word line, empty `say`, one chip)
+  produced all 13 issues + 3 suggestions (`v2-phase2-followup-broken.png`); a complete project only gets
+  suggestions (`…-followup-ok-project.png`).
+- **Uzbek UI:** every key translated (checked by script, no ASCII apostrophes in oʻ/gʻ); projects, editor,
+  template picker, scene transitions, history, follow-up, music and AI pages at 1600 px, 1280 px and 420 px
+  with an overflow check (no clipped buttons/labels, no horizontal scroll): `v2-phase2-uz-*.png`. The
+  choice survives a reload. No console errors.
 
 ## "Make video" (one button, voice first, then video)
 
@@ -556,7 +666,7 @@ presenters. The UI shows the licences and this disclosure on the AI page and in 
 - The renderer captures screenshots: ~30–38 fps with 8 workers (1:1 is faster), so ~30–50 s per output
   for a 40 s video; 3 languages × 3 formats take 6–7 minutes. Recordings slow capture down a little,
   since each frame waits for a seek.
-- The design is dark-only. A light `background` colour is darkened automatically.
+- Aurora and Bold are dark (a light `background` colour is darkened); Clean is the light template.
 - The AI presenter speaks the main language only (its lip-sync is generated from that voice-over);
   renders in other languages leave the bubble out and show the still portrait on `presenter` scenes.
   B-roll is generated for the main format's orientation.

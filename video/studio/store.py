@@ -13,6 +13,7 @@ from pathlib import Path
 from PIL import Image
 
 import brief as B
+import history
 
 STUDIO = Path(__file__).resolve().parent
 VIDEO = STUDIO.parent
@@ -128,12 +129,19 @@ class Project:
     def brief(self) -> dict:
         return self.read()["brief"]
 
-    def save_brief(self, brief: dict) -> None:
+    def save_brief(self, brief: dict, kind: str = "edit", label: str | None = None) -> dict | None:
+        """Write the brief and snapshot it in the version history (rapid edits are coalesced).
+        Returns the snapshot meta (None when nothing changed)."""
         with _lock:
             d = self.read()
+            old = d.get("brief")
             d["brief"] = brief
             d["updated"] = now()
             self._write(d)
+            try:
+                return history.record(self, old, brief, kind, label)
+            except OSError:          # history is a convenience; never fail a save because of it
+                return None
 
     def touch(self) -> None:
         with _lock:
@@ -353,7 +361,7 @@ def import_project(raw_brief, files: list[tuple[Path, str]], source: str) -> tup
         if raw_brief is not None:
             fixed = B.rename_assets(raw_brief, mapping)
             brief, warnings = B.normalize(fixed, p.assets())
-        p.save_brief(brief)
+        p.save_brief(brief, kind="import", label="Imported" if raw_brief is not None else "Created")
     except Exception:
         p.delete()
         raise

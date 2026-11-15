@@ -3,9 +3,9 @@
  */
 (() => {
   "use strict";
-  const STR = window.STRINGS;
+  // UI language (EN / OʻZ): strings.js builds window.STRINGS for the language remembered in this browser
   const t = (key, vars) => {
-    let s = key.split(".").reduce((o, k) => (o == null ? o : o[k]), STR);
+    let s = key.split(".").reduce((o, k) => (o == null ? o : o[k]), window.STRINGS);
     if (s == null) s = key;
     if (vars) s = String(s).replace(/\{(\w+)\}/g, (_, k) => (vars[k] ?? ""));
     return s;
@@ -40,12 +40,31 @@
   const fmtTime = s => { s = Math.max(0, s || 0); return `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, "0")}`; };
   const ago = ts => {
     const d = Date.now() / 1000 - ts;
-    if (d < 60) return "just now";
-    if (d < 3600) return `${Math.round(d / 60)} min ago`;
-    if (d < 86400) return `${Math.round(d / 3600)} h ago`;
-    return new Date(ts * 1000).toLocaleDateString();
+    if (d < 60) return t("justNow");
+    if (d < 3600) return t("minAgo", { n: Math.round(d / 60) });
+    if (d < 86400) return t("hAgo", { n: Math.round(d / 3600) });
+    return fmtDate(ts, false);
   };
-  document.querySelectorAll("[data-t]").forEach(n => { n.textContent = t(n.dataset.t); });
+  // dates: the browser's Uzbek locale data is incomplete ("M11"), so Uzbek uses its own month names
+  const UZ_MONTHS = ["yan", "fev", "mar", "apr", "may", "iyn", "iyl", "avg", "sen", "okt", "noy", "dek"];
+  function fmtDate(ts, withTime = true) {
+    const d = new Date(ts * 1000);
+    if (uiLang() !== "uz") return withTime ? d.toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", second: "2-digit" })
+      : d.toLocaleDateString();
+    const p2 = n => String(n).padStart(2, "0");
+    return `${d.getDate()}-${UZ_MONTHS[d.getMonth()]}` + (withTime ? `, ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}` : ` ${d.getFullYear()}`);
+  }
+  const uiLang = () => window.UI_LANG || "en";
+  // a manifest label may be a string or {"en": "...", "uz": "..."}
+  const lbl = v => (v && typeof v === "object" ? (v[uiLang()] || v.en || Object.values(v)[0] || "") : (v == null ? "" : String(v)));
+  function applyStatic() {
+    document.documentElement.lang = uiLang();
+    document.querySelectorAll("[data-t]").forEach(n => { n.textContent = t(n.dataset.t); });
+    const seg = document.getElementById("ui-lang");
+    if (seg) seg.replaceChildren(...["en", "uz"].map(l => el("button", { type: "button", class: `seg-btn ${uiLang() === l ? "on" : ""}`,
+      "aria-pressed": uiLang() === l ? "true" : "false", title: l === "en" ? "English interface" : "Oʻzbekcha interfeys",
+      onclick: () => { if (l !== uiLang()) { window.setUiLang(l); applyStatic(); route(); } } }, l === "en" ? "EN" : "OʻZ")));
+  }
 
   // ---------------------------------------------------------------- API
   async function api(method, url, body, isForm) {
@@ -99,7 +118,7 @@
     toast(t("copied"), "ok");
   }
 
-  window.SUI = { el, t, api, toast, modal, confirmBox, fmtBytes, ago, $, $$ };
+  window.SUI = { el, t, api, toast, modal, confirmBox, fmtBytes, ago, $, $$, lbl, uiLang };
 
   // ---------------------------------------------------------------- Ovoz status
   const OV = { ok: null, models: [], error: "" };
@@ -112,10 +131,10 @@
         try { OV.models = await api("GET", "/api/voices"); } catch { OV.models = []; }
       }
       if (was !== OV.ok) document.dispatchEvent(new Event("ovoz"));
-    } catch { OV.ok = false; OV.error = "studio server not reachable"; }
+    } catch { OV.ok = false; OV.error = t("serverDown"); }
     const p = $("#ovoz");
     p.className = `pill ${OV.ok ? "ok" : "bad"}`;
-    p.textContent = OV.ok ? t("ovozOk") : "Ovoz TTS offline";
+    p.textContent = OV.ok ? t("ovozOk") : t("ovozOffline");
     p.title = OV.ok ? OV.url : OV.error;
     const b = $("#banner");
     if (!OV.ok && location.hash.startsWith("#/p/")) { b.hidden = false; b.textContent = t("ovozDown", { url: OV.url || "localhost:8000" }); }
@@ -259,7 +278,10 @@
       pid, project: null, brief: null, assets: {}, renders: [], warnings: [], tl: null,
       sel: 0, tab: "scene", version: 0, savedVersion: 0, saving: false, jobs: {}, alive: true,
       lang: null, fmt: null, formLang: null, alignPolls: 0,
+      templates: [], tplPreview: null,
     };
+    // undo / redo: snapshots of the brief (JSON) at the start of each burst of edits
+    const UN = { undo: [], redo: [], stable: null, burst: false, timer: null };
     // ---------- languages / translations ----------
     const main = () => S.brief.language;
     const langs = () => (S.brief.languages && S.brief.languages.length ? S.brief.languages : [S.brief.language]);
@@ -310,7 +332,8 @@
     const left = el("aside", { class: "col col-scenes" },
       el("div", { class: "col-head" }, el("h2", {}, t("scenes")), el("span", { class: "muted small", id: "total-len" })),
       sceneList,
-      el("div", { class: "add-scene" }, addSel, el("button", { class: "btn", onclick: () => addScene(addSel.value) }, "+ " + t("addScene"))));
+      el("div", { class: "add-scene" }, addSel, el("button", { class: "btn", onclick: () => addScene(addSel.value) }, "+ " + t("addScene"))),
+      el("button", { class: "btn followup-btn", title: t("fu.help"), onclick: () => followupDialog() }, "✦ " + t("fu.button")));
     const tabs = el("div", { class: "tabs", role: "tablist" });
     const panel = el("div", { class: "tab-panel", role: "tabpanel" });
     const mid = el("section", { class: "col col-form" }, tabs, panel);
@@ -333,8 +356,10 @@
       if (fmts().length > 1) kids.push(el("div", { class: "seg small-seg", role: "radiogroup", "aria-label": t("previewFormat") },
         fmts().map(f2 => el("button", { type: "button", class: `seg-btn ${f2 === S.fmt ? "on" : ""}`, role: "radio",
           "aria-checked": f2 === S.fmt ? "true" : "false", onclick: () => { S.fmt = f2; renderPreviewBar(); refreshTimeline(); } }, f2))));
-      pvBar.hidden = !kids.length;
-      pvBar.replaceChildren(...(kids.length ? [el("span", { class: "muted small" }, t("previewIn")), ...kids] : []));
+      const reload = el("button", { type: "button", class: "icon-btn pv-reload", title: t("tpl.reloadHelp"), "aria-label": t("tpl.reload"),
+        onclick: async () => { await loadTemplates(); renderSettings(); refreshTimeline(); } }, "↻");
+      pvBar.hidden = false;
+      pvBar.replaceChildren(...(kids.length ? [el("span", { class: "muted small" }, t("previewIn")), ...kids] : []), el("span", { class: "grow" }), reload);
     }
     function renderCover() {
       const c = S.brief.cover;
@@ -353,6 +378,7 @@
     // ---------- save ----------
     function setSave(state) { $("#savestate").textContent = state ? t(state) : ""; $("#savestate").className = `savestate ${state || ""}`; }
     function changed(opts = {}) {
+      noteChange();
       S.version++;
       setSave("saving");
       clearTimeout(saveTimer);
@@ -377,6 +403,48 @@
       } finally { S.saving = false; }
     }
 
+    // ---------- undo / redo ----------
+    function noteChange() {
+      if (!UN.burst) {
+        if (UN.stable != null) { UN.undo.push(UN.stable); if (UN.undo.length > 200) UN.undo.shift(); }
+        UN.redo = [];
+        UN.burst = true;
+      }
+      clearTimeout(UN.timer);
+      UN.timer = setTimeout(settle, 700);
+      renderUndo();
+    }
+    function settle() { clearTimeout(UN.timer); UN.burst = false; UN.stable = JSON.stringify(S.brief); renderUndo(); }
+    function applyState(json, { saved = false } = {}) {
+      UN.stable = json;
+      adoptBrief(JSON.parse(json));
+      renderPreviewBar(); renderCover(); renderActions();
+      S.version++;
+      if (saved) { S.savedVersion = S.version; refreshTimeline(); }
+      else { setSave("saving"); clearTimeout(saveTimer); saveTimer = setTimeout(save, 0); }
+      renderUndo();
+    }
+    function undo() {
+      if (UN.burst) settle();
+      if (!UN.undo.length) return;
+      UN.redo.push(UN.stable);
+      applyState(UN.undo.pop());
+      toast(t("undone"), "info", 1600);
+    }
+    function redo() {
+      if (UN.burst) settle();
+      if (!UN.redo.length) return;
+      UN.undo.push(UN.stable);
+      applyState(UN.redo.pop());
+      toast(t("redone"), "info", 1600);
+    }
+    const undoBtns = { u: null, r: null };
+    function renderUndo() {
+      if (!undoBtns.u) return;
+      undoBtns.u.disabled = !(UN.undo.length || (UN.burst && UN.stable != null));
+      undoBtns.r.disabled = !UN.redo.length || UN.burst;
+    }
+
     // ---------- data ----------
     async function loadProject() {
       const d = await api("GET", `/api/projects/${pid}`);
@@ -393,7 +461,8 @@
     async function refreshTimeline() {
       try {
         syncLangState();
-        S.tl = await api("GET", `/api/projects/${pid}/timeline?lang=${S.lang}&format=${encodeURIComponent(S.fmt)}`);
+        const tq = S.tplPreview ? `&template=${encodeURIComponent(S.tplPreview)}` : "";
+        S.tl = await api("GET", `/api/projects/${pid}/timeline?lang=${S.lang}&format=${encodeURIComponent(S.fmt)}${tq}`);
         preview.load(S.tl);
         if (S.tab === "scene" && S.formSig != null && !panel.contains(document.activeElement)) {
           const sc0 = S.brief.scenes[S.sel], st0 = sc0 && sceneTl(sc0.id);
@@ -429,7 +498,11 @@
     function renderCrumb() {
       const title = el("input", { class: "title-input", value: S.brief.title, "aria-label": t("title"),
         oninput: e => { S.brief.title = e.target.value; document.title = `${e.target.value} — ${t("appName")}`; changed(); } });
-      $("#crumb").replaceChildren(el("a", { href: "#/", class: "back" }, "← " + t("back")), title);
+      undoBtns.u = el("button", { class: "icon-btn undo-btn", title: t("undoTip"), "aria-label": t("undo"), onclick: undo }, "↶");
+      undoBtns.r = el("button", { class: "icon-btn undo-btn", title: t("redoTip"), "aria-label": t("redo"), onclick: redo }, "↷");
+      $("#crumb").replaceChildren(el("a", { href: "#/", class: "back" }, "← " + t("back")), title,
+        el("div", { class: "row undo-row", role: "group", "aria-label": t("undo") }, undoBtns.u, undoBtns.r));
+      renderUndo();
     }
     function field(label, input, cls = "") {
       const id = `f-${Math.random().toString(36).slice(2, 8)}`;
@@ -528,7 +601,7 @@
       const ms = modelsFor(lg);
       const model = el("select", { onchange: e => { v.model = e.target.value; fixVoiceOf(v, lg); syncMain(); renderSettings(); changed(); } },
         OV.models.length ? ms.map(m => el("option", { value: m.id, selected: m.id === v.model, disabled: !m.available },
-          m.name + (m.available ? "" : " (unavailable)"))) : el("option", { value: v.model }, v.model));
+          m.name + (m.available ? "" : ` (${t("unavailable")})`))) : el("option", { value: v.model }, v.model));
       const cur = OV.models.find(m => m.id === v.model);
       const voice = el("select", { onchange: e => { v.voice = e.target.value; syncMain(); changed(); } },
         cur ? voicesFor(cur, lg).map(x => el("option", { value: x.id, selected: x.id === v.voice }, x.name))
@@ -545,6 +618,8 @@
       const caps = el("input", { type: "checkbox", checked: b.captions !== false, onchange: e => { b.captions = e.target.checked; changed(); } });
       const vl = multi() ? ` (${lg.toUpperCase()})` : "";
       settings.replaceChildren(...[
+        el("div", { class: "field auto" }, el("span", { class: "lbl" }, t("tpl.template")), templateButton()),
+        el("div", { class: "field auto" }, el("span", { class: "lbl" }, t("tx.transition")), transitionButton()),
         field(t("product"), product),
         el("div", { class: "field auto" }, el("span", { class: "lbl" }, t("languages")), langSeg),
         mainSel ? field(t("mainLanguage"), mainSel, "narrow2") : null,
@@ -675,9 +750,9 @@
     // ---------- tabs ----------
     function setTab(name) {
       S.tab = name;
-      tabs.replaceChildren(...["scene", "assets", "music", "ai", "json"].map(k => el("button", {
+      tabs.replaceChildren(...["scene", "assets", "music", "ai", "history", "json"].map(k => el("button", {
         class: `tab ${k === name ? "on" : ""}`, role: "tab", "aria-selected": k === name ? "true" : "false",
-        onclick: () => setTab(k) }, t({ scene: "tabScene", assets: "tabAssets", music: "tabMusic", ai: "tabAi", json: "tabJson" }[k]) +
+        onclick: () => setTab(k) }, t({ scene: "tabScene", assets: "tabAssets", music: "tabMusic", ai: "tabAi", history: "tabHistory", json: "tabJson" }[k]) +
         (k === "assets" ? ` (${Object.keys(S.assets).length})` : "") +
         (k === "music" && S.brief.music && S.brief.music.track ? " ♪" : ""))));
       renderPanel();
@@ -688,6 +763,7 @@
       else if (S.tab === "assets") renderAssets();
       else if (S.tab === "music") renderMusic();
       else if (S.tab === "ai") renderAiTab();
+      else if (S.tab === "history") renderHistory();
       else renderJson();
     }
 
@@ -831,7 +907,7 @@
         if (sc.asset && S.assets[sc.asset]) f.append(focusPicker(sc));
         f.append(text("callout", t("callout")), text("headline", t("headline")), text("kicker", t("kicker")), text("sub", t("sub")));
         if (sc.device === "browser") f.append(text("url", t("urlBar"), { ph: "app.example.com" }));
-        const adv = el("div", { class: "row gap wrap" }, num("zoom", t("zoom"), 1, 4, 0.1, "auto"));
+        const adv = el("div", { class: "row gap wrap" }, num("zoom", t("zoom"), 1, 4, 0.1, t("auto")));
         if (S.assets[sc.asset] && S.assets[sc.asset].type === "video") adv.append(num("trim_start", t("trimStart"), 0, 600, 0.1, "0"));
         f.append(adv);
       }
@@ -860,9 +936,10 @@
           changed(); renderSceneForm(); } }, "+ " + t("addScreen")));
         f.append(el("div", { class: "field" }, el("span", { class: "lbl" }, t("screensItems")), box));
       }
+      if (S.sel > 0) f.append(sceneTransition(sc));
       f.append(backgroundSection(sc));
       f.append(el("div", { class: "row gap wrap" }, num("pad", t("pad"), 0, 5, 0.1, S.sel === S.brief.scenes.length - 1 ? "1.0" : "0.4"),
-        num("duration", t("minDuration"), 1, 30, 0.5, "auto")));
+        num("duration", t("minDuration"), 1, 30, 0.5, t("auto"))));
       panel.replaceChildren(warnBox, f);
       renderWarnings();
       refreshMissing();
@@ -944,7 +1021,7 @@
           el("img", { src: `/api/projects/${pid}/thumbs/${encodeURIComponent(n)}`, alt: n, loading: "lazy" }),
           el("figcaption", {},
             el("b", { class: "asset-name", title: n }, n),
-            el("span", { class: "muted small" }, `${m.type} · ${m.w}×${m.h}${m.duration ? ` · ${m.duration.toFixed(1)} s` : ""} · ${fmtBytes(m.size)}`),
+            el("span", { class: "muted small" }, `${t("assetTypes." + m.type)} · ${m.w}×${m.h}${m.duration ? ` · ${m.duration.toFixed(1)} s` : ""} · ${fmtBytes(m.size)}`),
             el("span", { class: `small ${used.length ? "ok-t" : "muted"}` }, used.length ? t("usedIn", { list: used.join(", ") }) : t("unused")),
             el("button", { class: "btn small danger", onclick: async () => {
               if (!confirmBox(t("confirmDeleteAsset", { name: n }))) return;
@@ -1031,7 +1108,7 @@
       const title = el("input", { type: "text", id: "mu-title", placeholder: t("musicTitlePh") });
       const artist = el("input", { type: "text", id: "mu-artist" });
       const lic = el("input", { type: "text", id: "mu-lic", placeholder: t("licencePh"), required: true });
-      const mood = el("input", { type: "text", id: "mu-mood", placeholder: "calm, upbeat…" });
+      const mood = el("input", { type: "text", id: "mu-mood", placeholder: t("moodPh") });
       const err = el("div", { class: "error small", role: "alert" });
       kids.push(el("details", { class: "mt upload-music" }, el("summary", {}, "⇪ " + t("musicUpload")),
         el("div", { class: "form" }, field(t("musicFile"), file), field(t("musicTitle"), title), field(t("musicArtist"), artist),
@@ -1058,7 +1135,7 @@
 
     // ---------- JSON tab ----------
     function renderJson() {
-      const ta = el("textarea", { class: "mono json", spellcheck: "false", "aria-label": t("tabJson") });
+      const ta = el("textarea", { class: "mono json", spellcheck: "false", "aria-label": t("tabJson"), "data-native-undo": "1" });
       ta.value = JSON.stringify(S.brief, null, 2);
       const err = el("div", { class: "error small", role: "alert" });
       panel.replaceChildren(warnBox, el("div", { class: "row gap wrap" },
@@ -1067,9 +1144,12 @@
           try { raw = JSON.parse(ta.value); } catch (e) { err.textContent = t("jsonInvalid", { msg: e.message }); return; }
           try {
             const r = await api("PUT", `/api/projects/${pid}`, { brief: raw });
+            if (UN.burst) settle();
+            if (UN.stable != null) UN.undo.push(UN.stable);
+            UN.redo = []; UN.stable = JSON.stringify(r.brief);
             S.warnings = r.warnings; S.version++; S.savedVersion = S.version;
             err.textContent = ""; toast(t("jsonApplied"), "ok"); showWarnings(r.warnings);
-            adoptBrief(r.brief); refreshTimeline();
+            adoptBrief(r.brief); refreshTimeline(); renderUndo();
           } catch (e) { err.textContent = e.message; }
         } }, t("applyJson")),
         el("button", { class: "btn", onclick: () => copyText(ta.value) }, t("copy")),
@@ -1180,7 +1260,7 @@
       if (bg.clip && S.lib && !cur) box.append(el("p", { class: "warn small" }, t("ai.bgMissing", { id: bg.clip })));
       if (!bg.clip) box.append(el("p", { class: "muted small" }, t("ai.bgNone")));
       if (cur && ((cur.w > cur.h) !== (S.brief.format === "16:9"))) {
-        box.append(el("p", { class: "warn small" }, t("ai.bgOrientWarn", { o: cur.w > cur.h ? "horizontal" : "vertical", f: S.brief.format })));
+        box.append(el("p", { class: "warn small" }, t("ai.bgOrientWarn", { o: cur.w > cur.h ? t("horizontal") : t("vertical"), f: S.brief.format })));
       }
       const slider = (k, min, max, step, fmt) => {
         const out = el("span", { class: "mono small" }, fmt(bg[k] ?? 0));
@@ -1299,6 +1379,296 @@
       box.replaceChildren(...kids);
     }
 
+    // ---------- templates: picker drawer (thumbnails + live preview), options, import ----------
+    const curTplId = () => S.brief.template || "aurora";
+    const tplOf = id => S.templates.find(m => m.id === id) || null;
+    async function loadTemplates() {
+      try { S.templates = await api("GET", "/api/templates"); } catch { S.templates = []; }
+      return S.templates;
+    }
+    const previewFor = (m, fmt) => {
+      const pv = (m && m.previews) || [];
+      const want = `preview-${fmtSlug(fmt || S.fmt)}`;
+      return pv.find(u => u.includes(want)) || pv[0] || null;
+    };
+    function templateButton() {
+      const m = tplOf(curTplId());
+      const src = previewFor(m);
+      return el("button", { type: "button", class: "btn tpl-btn", "aria-haspopup": "dialog", title: t("tpl.pick"), onclick: () => templateDrawer() },
+        src ? el("img", { src, alt: "", class: `tpl-thumb fmt-${fmtSlug(S.fmt)}` }) : el("span", { class: "tpl-thumb ph" }),
+        el("span", { class: "tpl-name" }, m ? lbl(m.name) : curTplId()), el("span", { class: "muted" }, "▾"));
+    }
+    let drawerEl = null;
+    function closeDrawer() {
+      if (!drawerEl) return;
+      drawerEl.remove(); drawerEl = null;
+      if (S.tplPreview) { S.tplPreview = null; refreshTimeline(); }
+    }
+    let hoverTimer = null;
+    function hoverPreview(id) {
+      clearTimeout(hoverTimer);
+      hoverTimer = setTimeout(() => {
+        const want = id && id !== curTplId() ? id : null;
+        if (want === S.tplPreview) return;
+        S.tplPreview = want;
+        refreshTimeline();
+      }, 140);
+    }
+    function templateDrawer(focusId) {
+      if (drawerEl) { closeDrawer(); }
+      const list = el("div", { class: "tpl-grid", role: "listbox", "aria-label": t("tpl.template") });
+      const optsBox = el("div", { class: "tpl-opts" });
+      const importBox = el("div", { class: "tpl-import" });
+      const draw = () => {
+        list.replaceChildren(...S.templates.map(m => {
+          const on = m.id === curTplId();
+          const src = previewFor(m);
+          const card = el("div", { class: `tpl-card ${on ? "on" : ""} ${m.error ? "broken" : ""}`, role: "option", "aria-selected": on ? "true" : "false",
+            tabindex: "0", "data-id": m.id,
+            onmouseenter: () => { if (!m.error) hoverPreview(m.id); }, onfocus: () => { if (!m.error) hoverPreview(m.id); },
+            onclick: e => { if (!e.target.closest(".tpl-del") && !m.error) pickTemplate(m.id); },
+            onkeydown: e => { if ((e.key === "Enter" || e.key === " ") && !m.error) { e.preventDefault(); pickTemplate(m.id); } } },
+            el("div", { class: `tpl-shot fmt-${fmtSlug(S.fmt)}` }, src ? el("img", { src, alt: "", loading: "lazy" }) : el("span", { class: "muted small" }, m.error ? "⚠" : "—")),
+            el("div", { class: "tpl-body" },
+              el("div", { class: "row between" }, el("b", {}, lbl(m.name) || m.id),
+                el("span", { class: `kbadge ${m.kind || ""}` }, m.kind ? t("tpl.kinds." + m.kind) : "")),
+              m.error ? el("div", { class: "error small" }, m.error) : el("div", { class: "muted small tpl-desc" }, lbl(m.description) || ""),
+              el("div", { class: "muted tiny-l" }, [m.author, m.version ? `v${m.version}` : "", m.licence].filter(Boolean).join(" · ")),
+              on ? el("div", { class: "ok-t small" }, "✓ " + t("tpl.inUse")) : null),
+            !m.builtin ? el("button", { class: "icon-btn danger tpl-del", title: t("delete"), "aria-label": `${t("delete")} ${lbl(m.name)}`, onclick: async () => {
+              if (!confirmBox(t("tpl.confirmDelete", { name: lbl(m.name) }))) return;
+              try { await api("DELETE", `/api/templates/${m.id}`); await loadTemplates();
+                if (curTplId() === m.id) { delete S.brief.template; delete S.brief.template_options; changed({ now: true }); renderSettings(); }
+                draw(); } catch (e) { toast(e.message, "error"); } } }, "✕") : null);
+          return card;
+        }));
+        drawOptions();
+      };
+      const drawOptions = () => {
+        const m = tplOf(curTplId());
+        const opts = (m && m.options) || [];
+        if (!opts.length) { optsBox.replaceChildren(el("p", { class: "muted small" }, t("tpl.noOptions", { name: m ? lbl(m.name) : curTplId() }))); return; }
+        const cur = S.brief.template_options || {};
+        const setOpt = (k, v) => { S.brief.template_options = { ...(S.brief.template_options || {}), [k]: v }; changed({ now: true }); };
+        optsBox.replaceChildren(el("h3", {}, t("tpl.options", { name: lbl(m.name) })), ...opts.map(o => {
+          const v = cur[o.key] ?? o.default;
+          const id = `to-${o.key}`;
+          let inp;
+          if (o.type === "boolean") {
+            inp = el("input", { type: "checkbox", id, checked: !!v, onchange: e => setOpt(o.key, e.target.checked) });
+            return el("label", { class: "row gap", for: id }, inp, el("span", {}, lbl(o.label) || o.key));
+          }
+          if (o.type === "select") inp = el("select", { id, onchange: e => setOpt(o.key, e.target.value) },
+            (o.choices || []).map(c => el("option", { value: c.value, selected: c.value === v }, lbl(c.label) || c.value)));
+          else if (o.type === "color") inp = el("input", { type: "color", id, value: v || "#000000", oninput: e => setOpt(o.key, e.target.value) });
+          else if (o.type === "number") inp = el("input", { type: "number", id, value: v ?? "", min: o.min, max: o.max, step: o.step || "any", class: "narrow",
+            onchange: e => setOpt(o.key, parseFloat(e.target.value)) });
+          else inp = el("input", { type: "text", id, value: v ?? "", oninput: e => setOpt(o.key, e.target.value) });
+          return el("div", { class: "field" }, el("label", { for: id }, lbl(o.label) || o.key), inp, o.help ? el("span", { class: "muted small" }, lbl(o.help)) : null);
+        }));
+      };
+      const pickTemplate = id => {
+        if (id === curTplId()) return;
+        if (id === "aurora") delete S.brief.template; else S.brief.template = id;
+        // options belong to one template; transitions it added are dropped when the new one lacks them
+        delete S.brief.template_options;
+        S.tplPreview = null;
+        changed({ now: true });
+        renderSettings(); renderPanel(); draw();
+        toast(t("tpl.applied", { name: lbl((tplOf(id) || {}).name) || id }), "ok", 2200);
+      };
+      // import (.zip)
+      const file = el("input", { type: "file", accept: ".zip,application/zip", id: "tpl-zip" });
+      const repl = el("input", { type: "checkbox", id: "tpl-replace" });
+      const out = el("div", { class: "tpl-result", "aria-live": "polite" });
+      importBox.replaceChildren(el("h3", {}, "⇪ " + t("tpl.import")), el("p", { class: "muted small" }, t("tpl.importHelp")),
+        el("div", { class: "row gap wrap" }, file,
+          el("label", { class: "row gap small", for: "tpl-replace" }, repl, el("span", {}, t("tpl.replace"))),
+          el("button", { class: "btn primary", onclick: async () => {
+            out.replaceChildren();
+            if (!file.files.length) { out.append(el("p", { class: "error small" }, t("tpl.chooseZip"))); return; }
+            const fd = new FormData();
+            fd.append("file", file.files[0], file.files[0].name);
+            try {
+              const m = await api("POST", `/api/templates${repl.checked ? "?replace=1" : ""}`, fd, true);
+              await loadTemplates(); draw();
+              out.append(el("p", { class: "ok-t small" }, "✓ " + t("tpl.imported", { name: lbl(m.name) })),
+                ...(m.warnings && m.warnings.length ? [el("ul", { class: "warn small" }, m.warnings.map(w => el("li", {}, w)))] : []));
+              file.value = "";
+              const c = list.querySelector(`[data-id="${m.id}"]`); if (c) c.scrollIntoView({ block: "nearest" });
+            } catch (e) {
+              const errs = (e.data && e.data.errors) || [e.message];
+              out.append(el("div", { class: "errbox" }, el("b", {}, t("tpl.importFailed")), el("ul", {}, errs.map(x => el("li", {}, x)))));
+            }
+          } }, t("tpl.importBtn"))), out,
+        el("p", { class: "muted small" }, t("tpl.docs"), " ", el("code", {}, "video/templates/TEMPLATES.md"), " · ", el("code", {}, "validate.py")));
+      drawerEl = el("aside", { class: "drawer", role: "dialog", "aria-label": t("tpl.template"),
+        onmouseleave: () => hoverPreview(null), onkeydown: e => { if (e.key === "Escape") closeDrawer(); } },
+        el("div", { class: "drawer-head" }, el("h2", {}, t("tpl.template")),
+          el("div", { class: "row gap" },
+            el("button", { class: "btn small", title: t("tpl.reloadHelp"), onclick: async () => { await loadTemplates(); draw(); refreshTimeline(); } }, "↻ " + t("tpl.reload")),
+            el("button", { class: "icon-btn", "aria-label": t("close"), onclick: closeDrawer }, "✕"))),
+        el("div", { class: "drawer-body" }, el("p", { class: "muted small" }, t("tpl.help")), list, optsBox, importBox));
+      document.body.append(drawerEl);
+      draw();
+      (list.querySelector(".tpl-card.on") || list.querySelector(".tpl-card") || drawerEl).focus();
+    }
+
+    // ---------- transitions: tiny animated previews ----------
+    const TXB = window.VS_TRANSITIONS || {};
+    S.txMods = {};
+    async function tplTransitions() {
+      const m = tplOf(curTplId());
+      if (!m || !m.has_js || !(m.transitions || []).length) return {};
+      const key = `${m.id}@${m.hash}`;
+      if (!S.txMods[key]) S.txMods[key] = import(`/templates/${m.id}/template.js?v=${m.hash}`).then(x => x.transitions || {}).catch(() => ({}));
+      return S.txMods[key];
+    }
+    const txName = id => {
+      const m = tplOf(curTplId());
+      const own = m && (m.transitions || []).find(x => x.id === id);
+      return own ? lbl(own.name) : t("tx.names." + id) !== "tx.names." + id ? t("tx.names." + id) : id;
+    };
+    const txIds = () => [...(TXB.order || []), ...(((tplOf(curTplId()) || {}).transitions || []).map(x => x.id))];
+    const txDefault = () => ((tplOf(curTplId()) || {}).default_transition) || "lift";
+    const txIdOf = v => (v && typeof v === "object" ? v.type : v) || null;
+    // a 64x40 mini stage: scene A (brand primary) hands over to scene B (accent) with transition `id`
+    function txTile(id, { on = false, label = null, onPick = null, sub = null } = {}) {
+      const box = el("span", { class: "tx-mini", "aria-hidden": "true" });
+      const a = box.appendChild(el("i", { class: "tx-a" }, "A")), b = box.appendChild(el("i", { class: "tx-b" }, "B"));
+      const flash = box.appendChild(el("i", { class: "tx-flash" }));
+      let raf = 0, t0 = 0, fn = null;
+      const W = 64, H = 40, rtl = S.lang === "ar";
+      const apply = (node, st) => {
+        st = st || {};
+        node.style.opacity = String(st.o ?? 1);
+        node.style.transform = `translate(${((st.x || 0) * W / 1080).toFixed(2)}px, ${((st.y || 0) * H / 1920).toFixed(2)}px) scale(${st.s ?? 1}) rotate(${st.r || 0}deg)`;
+        node.style.filter = st.blur ? `blur(${(st.blur * W / 1080).toFixed(2)}px)` : "none";
+        node.style.clipPath = st.clip ? `inset(${st.clip.map(v => `${(v * 100).toFixed(1)}%`).join(" ")})` : "";
+        return st.flash || 0;
+      };
+      const frame = p => {
+        if (!fn) return;
+        const c = { W: 1080, H: 1920, rtl };
+        apply(a, p >= 1 ? { o: 0 } : fn.out(p, c));
+        const f = apply(b, p <= 0 ? { o: 0 } : fn.in(p, c));
+        flash.style.opacity = String(Math.min(1, f));
+        if (p <= 0) b.style.opacity = "0";
+      };
+      const resolve = async () => { const own = await tplTransitions(); fn = own[id] || TXB[id] || null; frame(0.5); };
+      resolve();
+      const loop = now => {
+        const cyc = 1.6, k = ((now - t0) / 1000) % cyc;
+        // hold A, play the transition over its own window (scaled to 0.9 s), hold B
+        frame(Math.max(0, Math.min(1, (k - 0.3) / 0.9)));
+        raf = requestAnimationFrame(loop);
+      };
+      const start = () => { cancelAnimationFrame(raf); t0 = performance.now(); raf = requestAnimationFrame(loop); };
+      const stop = () => { cancelAnimationFrame(raf); frame(0.5); };
+      const btn = el(onPick ? "button" : "span", { type: onPick ? "button" : null, class: `tx-tile ${on ? "on" : ""}`, title: label || txName(id),
+        role: onPick ? "radio" : null, "aria-checked": onPick ? (on ? "true" : "false") : null,
+        onmouseenter: start, onmouseleave: stop, onfocus: start, onblur: stop, onclick: onPick ? () => onPick(id) : null },
+        box, el("span", { class: "tx-label" }, label || txName(id)), sub ? el("span", { class: "tx-sub muted" }, sub) : null);
+      return btn;
+    }
+    function transitionButton() {
+      const cur = txIdOf(S.brief.transition);
+      const id = cur || txDefault();
+      const tile = txTile(id, { label: cur ? txName(cur) : `${t("tx.templateDefault")} · ${txName(txDefault())}` });
+      return el("button", { type: "button", class: "btn tx-btn", "aria-haspopup": "dialog", title: t("tx.pickProject"),
+        onclick: e => txPopover(e.currentTarget, cur, v => {
+          if (v) S.brief.transition = v; else delete S.brief.transition;
+          changed({ now: true }); renderSettings();
+        }, t("tx.projectHelp")) }, tile, el("span", { class: "muted" }, "▾"));
+    }
+    let popEl = null;
+    function txPopover(anchor, cur, onPick, help) {
+      if (popEl) { popEl.remove(); popEl = null; }
+      const r = anchor.getBoundingClientRect();
+      const close = () => { if (popEl) { popEl.remove(); popEl = null; document.removeEventListener("mousedown", outside, true); } };
+      const outside = e => { if (popEl && !popEl.contains(e.target) && !anchor.contains(e.target)) close(); };
+      popEl = el("div", { class: "popover", role: "dialog", "aria-label": t("tx.transition"), onkeydown: e => { if (e.key === "Escape") { close(); anchor.focus(); } } },
+        el("p", { class: "muted small" }, help),
+        txGrid(cur, v => { onPick(v); close(); }));
+      popEl.style.left = `${Math.max(8, Math.min(r.left, innerWidth - 470))}px`;
+      popEl.style.top = `${r.bottom + 6 + scrollY}px`;
+      document.body.append(popEl);
+      document.addEventListener("mousedown", outside, true);
+      const f = popEl.querySelector(".tx-tile.on") || popEl.querySelector(".tx-tile"); f && f.focus();
+    }
+    function txGrid(cur, onPick, { defaultLabel = null } = {}) {
+      const grid = el("div", { class: "tx-grid", role: "radiogroup", "aria-label": t("tx.transition") });
+      grid.append(txTile(txDefault(), { on: !cur, label: defaultLabel || t("tx.templateDefault"), sub: txName(txDefault()), onPick: () => onPick(null) }));
+      for (const id of txIds()) grid.append(txTile(id, { on: cur === id, onPick: () => onPick(id) }));
+      if (cur && !txIds().includes(cur)) grid.append(el("p", { class: "warn small" }, t("tx.notInTemplate", { name: cur })));
+      return grid;
+    }
+    function sceneTransition(sc) {
+      const cur = txIdOf(sc.transition);
+      const proj = txIdOf(S.brief.transition) || txDefault();
+      const box = el("div", { class: "field tx-section" });
+      box.append(el("div", { class: "row between" }, el("span", { class: "lbl" }, t("tx.intoScene")),
+        el("span", { class: "muted small" }, cur ? txName(cur) : `${t("tx.projectDefault")} (${txName(proj)})`)),
+        txGrid(cur, v => { if (v) sc.transition = v; else delete sc.transition; changed({ now: true }); renderSceneForm(); },
+          { defaultLabel: t("tx.projectDefault") }));
+      return box;
+    }
+
+    // ---------- version history ----------
+    async function renderHistory() {
+      const box = el("div", { class: "form history" },
+        el("div", { class: "row between" }, el("h3", {}, "🕘 " + t("hist.title")),
+          el("span", { class: "muted small" }, t("hist.shortcut"))),
+        el("p", { class: "muted small" }, t("hist.help")));
+      const listEl = el("ol", { class: "hist-list" }, el("li", { class: "muted small" }, "…"));
+      box.append(listEl);
+      panel.replaceChildren(warnBox, box);
+      renderWarnings();
+      await flush();
+      let items = [];
+      try { items = await api("GET", `/api/projects/${pid}/history`); } catch (e) { listEl.replaceChildren(el("li", { class: "error small" }, e.message)); return; }
+      if (S.tab !== "history") return;
+      if (!items.length) { listEl.replaceChildren(el("li", { class: "muted small" }, t("hist.empty"))); return; }
+      const fmtD = ts => fmtDate(ts, true);
+      listEl.replaceChildren(...items.map((h, i) => el("li", { class: `hist-item ${i === 0 ? "cur" : ""}` },
+        el("div", { class: "hist-main" },
+          el("div", { class: "row gap wrap" }, el("b", {}, fmtD(h.updated || h.created)),
+            el("span", { class: "muted small" }, ago(h.updated || h.created)),
+            el("span", { class: `kbadge k-${h.kind}` }, t("hist.kinds." + h.kind) !== "hist.kinds." + h.kind ? t("hist.kinds." + h.kind) : h.kind),
+            h.scenes != null ? el("span", { class: "muted small" }, t("scenesCount", { n: h.scenes })) : null),
+          el("div", { class: "small hist-sum" }, h.summary || "")),
+        i === 0 ? el("span", { class: "ok-t small nowrap" }, t("hist.current"))
+          : el("button", { class: "btn small", onclick: async () => {
+            await flush();
+            try {
+              const r = await api("POST", `/api/projects/${pid}/history/${h.id}/restore`);
+              if (UN.burst) settle();
+              if (UN.stable != null) UN.undo.push(UN.stable);
+              UN.redo = [];
+              applyState(JSON.stringify(r.brief), { saved: true });
+              S.warnings = r.warnings || [];
+              toast(t("hist.restored", { when: fmtD(h.updated || h.created) }), "ok");
+              if (S.tab === "history") renderHistory();
+            } catch (e) { toast(e.message, "error"); }
+          } }, "↺ " + t("hist.restore")))));
+    }
+
+    // ---------- "Ask the AI for missing material" ----------
+    async function followupDialog() {
+      await flush();
+      let r;
+      try { r = await api("GET", `/api/projects/${pid}/followup`); } catch (e) { toast(e.message, "error"); return; }
+      const ta = el("textarea", { class: "mono tall", spellcheck: "false", "aria-label": t("fu.title"), "data-native-undo": "1" });
+      ta.value = r.message;
+      const kinds = Object.entries(r.counts || {});
+      modal(t("fu.title"), el("div", { class: "form" },
+        el("p", { class: "muted small" }, t("fu.intro")),
+        el("div", { class: "row gap wrap" }, r.ok ? el("span", { class: "chipx ok" }, "✓ " + t("fu.allGood")) : null,
+          ...kinds.map(([k, n]) => el("span", { class: `chipx ${k === "suggestion" ? "" : "bad"}` }, `${t("fu.kinds." + k) !== "fu.kinds." + k ? t("fu.kinds." + k) : k}: ${n}`))),
+        ta, el("p", { class: "muted small" }, t("fu.api"), " ", el("code", {}, `GET /api/projects/${pid}/followup`))),
+        [{ label: t("close"), onClick: () => {} }, { label: "⧉ " + t("copy"), primary: true, onClick: () => { copyText(ta.value); } }]);
+    }
+
     // ---------- preview ----------
     const preview = (() => {
       const frame = el("iframe", { class: "pv-frame", src: "/renderer/index.html?embed", title: t("preview"), tabindex: "-1" });
@@ -1307,7 +1677,7 @@
       audio.preload = "auto";
       let tl = null, loaded = false, playing = false, cur = 0, t0Perf = 0, t0 = 0, audioKey = null, raf = 0;
       const playBtn = el("button", { class: "btn round", "aria-label": t("play"), onclick: () => toggle() }, "▶");
-      const scrub = el("input", { type: "range", min: 0, max: 10, step: 0.01, value: 0, "aria-label": "Time",
+      const scrub = el("input", { type: "range", min: 0, max: 10, step: 0.01, value: 0, "aria-label": t("time"),
         oninput: e => { seek(parseFloat(e.target.value)); } });
       const time = el("span", { class: "mono small time" }, "0:00.0");
       const marks = el("div", { class: "marks", "aria-hidden": "true" });
@@ -1532,7 +1902,7 @@
             el("div", { class: "muted small" }, [r.language ? r.language.toUpperCase() : "", r.format, r.duration ? `${r.duration.toFixed(1)} s` : "", fmtBytes(r.size),
               r.timing && r.timing.voiced ? t("timingCount", { a: r.timing.aligned, n: r.timing.voiced }) : "",
               r.music && r.music.lufs != null ? `♪ ${r.music.lufs.toFixed(1)} LUFS` : "",
-              r.voice_needed && r.voiced < r.voice_needed ? "⚠ partly silent" : ""].filter(Boolean).join(" · ")),
+              r.voice_needed && r.voiced < r.voice_needed ? "⚠ " + t("partlySilent") : ""].filter(Boolean).join(" · ")),
             el("div", { class: "row gap wrap r-links" },
               r.srt ? el("a", { class: "small", href: fileUrl(r.srt, 1) }, ".srt") : null,
               r.vtt ? el("a", { class: "small", href: fileUrl(r.vtt, 1) }, ".vtt") : null,
@@ -1555,7 +1925,7 @@
       const v = el("video", { src: `/api/projects/${pid}/renders/${encodeURIComponent(r.name)}`, controls: true, autoplay: true,
         class: `render-video ${r.format === "16:9" ? "land" : ""}`, crossorigin: "anonymous" });
       if (r.vtt) v.append(el("track", { kind: "subtitles", src: `/api/projects/${pid}/renders/${encodeURIComponent(r.vtt)}`,
-        srclang: r.language || "en", label: (r.language || "").toUpperCase() || "Subtitles" }));
+        srclang: r.language || "en", label: (r.language || "").toUpperCase() || t("subtitles") }));
       const close = modal(r.name, v, [{ label: t("close"), onClick: () => {} }]);
       v.addEventListener("ended", () => {});
       return close;
@@ -1638,6 +2008,14 @@
     // ---------- keyboard ----------
     const onKey = e => {
       const tag = (e.target.tagName || "").toLowerCase();
+      // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y: project undo/redo everywhere except the raw JSON editor
+      const k = (e.key || "").toLowerCase();
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && (k === "z" || k === "y") && !$(".modal-wrap") &&
+          !(e.target.dataset && e.target.dataset.nativeUndo)) {
+        e.preventDefault();
+        if (k === "y" || e.shiftKey) redo(); else undo();
+        return;
+      }
       if (["input", "textarea", "select"].includes(tag) || e.target.isContentEditable || $(".modal-wrap")) return;
       if (e.code === "Space" && !(tag === "button" && e.target.closest(".scene-list, .actions, .renders, .picker, .seg"))) { e.preventDefault(); preview.toggle(); }
       else if (e.key === "ArrowLeft" && !e.altKey) { preview.seek(preview.t - 1); }
@@ -1652,7 +2030,8 @@
     // ---------- boot ----------
     (async () => {
       try { await loadProject(); }
-      catch (e) { view.replaceChildren(el("section", { class: "page" }, el("h1", {}, "Not found"), el("p", {}, e.message), el("a", { href: "#/" }, "← " + t("back")))); return; }
+      catch (e) { view.replaceChildren(el("section", { class: "page" }, el("h1", {}, t("notFound")), el("p", {}, e.message), el("a", { href: "#/" }, "← " + t("back")))); return; }
+      await loadTemplates();
       renderCrumb();
       await checkOvoz();
       if (fixVoice()) changed();
@@ -1672,6 +2051,7 @@
       if (makeActive()) pollMake();
       const st = S.tl && S.tl.scenes[0];
       if (st) preview.seek(Math.min(1.6, st.end - 0.3));
+      settle();
     })();
 
     return () => {
@@ -1685,11 +2065,14 @@
       clip.pause();
       musPrev.pause();
       clearTimeout(alignTimer);
+      clearTimeout(UN.timer);
+      closeDrawer();
       document.removeEventListener("keydown", onKey);
       document.removeEventListener("ovoz", onOvoz);
       removeEventListener("beforeunload", onUnload);
     };
   }
 
+  applyStatic();
   route();
 })();

@@ -14,6 +14,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shared"))
 from voicelib import display_text  # noqa: E402
 
+import templates as TPL  # noqa: E402
+
 LANGS = ["uz", "ru", "en", "ar"]
 FORMATS = {"9:16": (1080, 1920), "1:1": (1080, 1080), "16:9": (1920, 1080)}
 FORMAT_ALIASES = {"portrait": "9:16", "vertical": "9:16", "landscape": "16:9", "horizontal": "16:9", "square": "1:1",
@@ -69,6 +71,13 @@ _background = {
             "blur": {"type": "number", "minimum": 0, "maximum": 24, "default": 0, "description": "Blur in px"},
         }},
     ],
+}
+_transition = {
+    "description": "Scene transition: a built-in (lift = the original look, fade, slide, zoom, wipe, blur, cut) or one the "
+                   "template adds (e.g. bold's punch / swipe); optionally with a duration in seconds",
+    "anyOf": [{"type": "string", "pattern": "^[a-z][a-z0-9-]{1,30}$"},
+              {"type": "object", "required": ["type"], "properties": {
+                  "type": {"type": "string"}, "duration": {"type": "number", "minimum": 0.1, "maximum": 2.0}}}],
 }
 _presenter = {
     "type": "object",
@@ -136,6 +145,12 @@ SCHEMA = {
             "properties": {"model": _str, "voice": _str, "rate": {"type": "integer", "minimum": -50, "maximum": 100}, "style": _str},
         },
         "captions": {"type": "boolean", "default": True},
+        "template": {**_str, "default": "aurora", "description": "Look of the video: a template id from video/templates "
+                     "(built in: aurora = dark glow, clean = light minimal, bold = high-contrast social). The studio user "
+                     "usually picks it; brand colours still apply"},
+        "template_options": {"type": "object", "description": "Settings the chosen template declares in its manifest "
+                             "(options[].key -> value)"},
+        "transition": {**_transition, "description": "Default transition between scenes (default: the template's)"},
         "presenter": _presenter,
         "scenes": {
             "type": "array", "minItems": 1, "maxItems": MAX_SCENES,
@@ -149,6 +164,7 @@ SCHEMA = {
                     "pad": {"type": "number", "minimum": 0, "maximum": 5, "description": "Silence after the line (s), default 0.4"},
                     "duration": {"type": "number", "minimum": 1, "maximum": 30, "description": "Minimum scene length (s)"},
                     "background": _background,
+                    "transition": {**_transition, "description": "Transition into this scene (overrides the project default)"},
                     "kicker": _ls("hero/screen/presenter: small label above the headline"),
                     "headline": _ls("Big on-screen text, 1-5 words"),
                     "sub": _ls("Smaller line under the headline"),
@@ -310,6 +326,29 @@ def normalize(raw, assets: dict | None = None) -> tuple[dict, list[str]]:
         if cv:
             b["cover"] = cv
 
+    if raw.get("template") not in (None, ""):
+        tid = slug(raw.get("template"), "")
+        if not tid:
+            warn.append(f"template '{raw.get('template')}' is not a valid id — using {TPL.DEFAULT}")
+        else:
+            b["template"] = tid
+            if not TPL.exists(tid):
+                warn.append(f"template '{tid}' is not installed — the video uses {TPL.DEFAULT} until it is imported")
+    if isinstance(raw.get("template_options"), dict):
+        to = {str(k)[:40]: v for k, v in raw["template_options"].items() if isinstance(v, (str, int, float, bool))}
+        if to:
+            b["template_options"] = to
+            if b.get("template") and TPL.exists(b["template"]):
+                try:
+                    _, tw = TPL.option_values(TPL.load(b["template"]), to)
+                    warn += tw
+                except TPL.TemplateError:
+                    pass
+    if raw.get("transition") not in (None, ""):
+        tr = _transition_norm(raw.get("transition"), "transition", warn)
+        if tr:
+            b["transition"] = tr
+
     scenes = raw.get("scenes")
     if not isinstance(scenes, list) or not scenes:
         raise BriefError(["brief needs a non-empty 'scenes' array"])
@@ -331,7 +370,7 @@ def normalize(raw, assets: dict | None = None) -> tuple[dict, list[str]]:
             b["presenter"] = pr
     # keep extra top-level keys an AI may add (notes etc.), but not ours twice
     for k, v in raw.items():
-        if k not in b and k not in ("name",) and isinstance(k, str) and len(k) < 40:
+        if k not in b and k not in ("name", "template", "template_options", "transition") and isinstance(k, str) and len(k) < 40:
             b[k] = copy.deepcopy(v)
     if len(b["languages"]) > 1:
         miss = missing_translations(b)
@@ -374,13 +413,17 @@ def _scene(s: dict, i: int, seen: set, warn: list, assets) -> dict:
             o[k] = round(v, 3)
     # keep unknown keys (forward compatible), but never overwrite normalized ones
     for k, v in s.items():
-        skip = ("items", "focus", "device", "asset", "stat", "voiceover", "vo", "background")
+        skip = ("items", "focus", "device", "asset", "stat", "voiceover", "vo", "background", "transition")
         if k not in o and k not in skip and isinstance(k, str):
             o[k] = copy.deepcopy(v)
     if "background" in s:
         bg = _background_norm(s.get("background"), sid, warn)
         if bg:
             o["background"] = bg
+    if s.get("transition") not in (None, ""):
+        tr = _transition_norm(s.get("transition"), f"scene '{sid}': transition", warn)
+        if tr:
+            o["transition"] = tr
 
     def check_asset(name, where):
         if assets is not None and name and name not in assets:
@@ -578,6 +621,23 @@ def _background_norm(v, sid: str, warn: list) -> dict | None:
     o["dim"] = round(_num(v.get("dim"), 0, 0.9, BG_DIM_DEFAULT), 3)
     o["blur"] = round(_num(v.get("blur"), 0, 24, 0), 2)
     return o
+
+
+def _transition_norm(v, where: str, warn: list):
+    """'fade' | {'type': 'fade', 'duration': 0.6}. Unknown ids are dropped with a warning; ids that only some
+    installed template provides are kept (the renderer falls back to the template default elsewhere)."""
+    dur = None
+    if isinstance(v, dict):
+        dur = _num(v.get("duration"), 0.1, 2.0)
+        v = v.get("type")
+    name = slug(v, "") if isinstance(v, str) else ""
+    if not name:
+        warn.append(f"{where}: must be a transition name like 'fade' — ignored")
+        return None
+    if name not in TPL.all_transition_ids():
+        warn.append(f"{where}: '{name}' unknown (built in: {', '.join(TPL.BUILTIN_TRANSITIONS)}) — ignored")
+        return None
+    return {"type": name, "duration": round(dur, 2)} if dur else name
 
 
 def _presenter_norm(v, scene_ids: list, warn: list) -> dict | None:

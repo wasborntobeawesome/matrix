@@ -21,6 +21,7 @@ import align
 import library
 import music
 import presenter
+import templates
 from brief import FORMATS, localize
 from store import Project
 
@@ -145,7 +146,7 @@ def align_all(p: Project, langs: list[str] | None = None, progress=None) -> dict
 
 
 def timeline(p: Project, brief: dict | None = None, lang: str | None = None, fmt: str | None = None,
-             align_mode: str = "cache") -> dict:
+             align_mode: str = "cache", template: str | None = None) -> dict:
     """Timeline for the renderer: scene times (real clip lengths or estimates), captions, assets.
 
     align_mode: "cache" = use cached word timing only, "queue" = also queue missing alignments in
@@ -218,6 +219,11 @@ def timeline(p: Project, brief: dict | None = None, lang: str | None = None, fmt
         "scenes": scenes, "captions": captions, "captions_off": lb.get("captions") is False,
         "voiced": voiced, "voice_needed": with_say,
     }
+    # look: the template (default aurora = the original look) + transitions; URLs are added by
+    # templates.fill_urls() for the preview (http) or render.py (file)
+    tl["template"] = templates.timeline_info(raw, template)
+    if raw.get("transition"):
+        tl["transition"] = raw["transition"]
     if lang == "ar":
         tl["rtl"] = True
     if len(langs_of(raw)) > 1:
@@ -342,6 +348,7 @@ def write_render_timeline(p: Project, lang: str | None = None, fmt: str | None =
         tl["music"] = {k: stats.get(k) for k in ("track", "lufs", "true_peak", "music_gain_db", "voice_lufs")}
     if tl.get("broll") or tl.get("presenter"):
         ai_urls(p, tl, "file")
+    templates.fill_urls(tl.get("template"), "file")
     clean = {k: v for k, v in tl.items() if not k.startswith("_")}
     name = f"timeline-{tl['language']}-{fmt_slug(tl['format'])}.json"
     (p.build_dir / name).write_text(json.dumps(clean, ensure_ascii=False, indent=1), encoding="utf-8")

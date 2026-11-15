@@ -20,10 +20,13 @@ from fastapi.staticfiles import StaticFiles
 import align
 import brief as B
 import build
+import followup
+import history as HI
 import inbox
 import library as L
 import music as MU
 import presenter as PR
+import templates as TP
 from aijobs import AI_PY, DISCLOSURE, LICENCES, AIJobs
 from jobs import Jobs
 from pipeline import Pipelines
@@ -62,6 +65,11 @@ def _startup() -> None:
 @app.exception_handler(StoreError)
 def _store_error(_req, e: StoreError):
     return JSONResponse({"detail": str(e)}, status_code=e.status)
+
+
+@app.exception_handler(TP.TemplateError)
+def _template_error(_req, e: TP.TemplateError):
+    return JSONResponse({"detail": "; ".join(e.errors), "errors": e.errors}, status_code=e.status)
 
 
 @app.exception_handler(B.BriefError)
@@ -241,8 +249,49 @@ async def update_project(pid: str, request: Request):
     body = _parse_brief(await request.body())
     raw = body.get("brief") if isinstance(body, dict) and isinstance(body.get("brief"), dict) else body
     clean, warnings = B.normalize(raw, p.assets())
-    p.save_brief(clean)
-    return {"brief": clean, "warnings": warnings, "updated": p.read()["updated"]}
+    snap = p.save_brief(clean)
+    return {"brief": clean, "warnings": warnings, "updated": p.read()["updated"], "snapshot": snap}
+
+
+# ---------------------------------------------------------------- version history
+@app.get("/api/projects/{pid}/history")
+def project_history(pid: str):
+    """Snapshots of the brief, newest first: [{id, created, updated, kind: base|import|edit|restore, summary, scenes}]."""
+    return JSONResponse(HI.listing(Project.get(pid)), headers=NOCACHE)
+
+
+@app.get("/api/projects/{pid}/history/{sid}")
+def project_history_get(pid: str, sid: str):
+    snap = HI.get(Project.get(pid), sid)
+    if not snap:
+        raise HTTPException(404, "snapshot not found")
+    return snap
+
+
+@app.post("/api/projects/{pid}/history/{sid}/restore")
+def project_history_restore(pid: str, sid: str):
+    """Make snapshot `sid` the current brief. This is saved as a new snapshot, so it can be undone."""
+    p = Project.get(pid)
+    snap = HI.get(p, sid)
+    if not snap:
+        raise HTTPException(404, "snapshot not found")
+    from datetime import datetime
+    when = datetime.fromtimestamp(snap.get("updated") or snap["created"]).strftime("%d %b %H:%M:%S")
+    clean, warnings = B.normalize(snap["brief"], p.assets())
+    meta = p.save_brief(clean, kind="restore", label=f"Restored the version from {when}")
+    return {"brief": clean, "warnings": warnings, "snapshot": meta, "updated": p.read()["updated"]}
+
+
+# ---------------------------------------------------------------- follow-up for the source AI
+@app.get("/api/projects/{pid}/followup")
+def project_followup(pid: str, format: str = "json"):
+    """A ready-to-send English message for the source AI listing missing/invalid files, missing translations,
+    over-long or empty text, badly sized screenshots and suggestions. ?format=text returns just the message."""
+    p = Project.get(pid)
+    r = followup.build(p.brief, p.assets())
+    if format == "text":
+        return PlainTextResponse(r["message"])
+    return JSONResponse(r, headers=NOCACHE)
 
 
 @app.delete("/api/projects/{pid}")
@@ -310,11 +359,16 @@ def asset_thumb(pid: str, name: str):
 
 # ---------------------------------------------------------------- preview / voice
 @app.get("/api/projects/{pid}/timeline")
-def preview_timeline(pid: str, lang: str | None = None, format: str | None = None):
+def preview_timeline(pid: str, lang: str | None = None, format: str | None = None, template: str | None = None):
     """Timeline for the live preview of one language + format (estimated lengths for scenes without
-    voice; word timing that is not aligned yet is queued in the background)."""
+    voice; word timing that is not aligned yet is queued in the background). `template` previews another
+    template without saving it (the template picker's live preview). Template files are re-read on every
+    call, so an edited template.css / template.js shows up on the next preview refresh."""
     p = Project.get(pid)
-    tl = build.timeline(p, lang=lang, fmt=format, align_mode="queue")
+    if template and not TP.exists(template):
+        raise HTTPException(404, f"template '{template}' not found")
+    tl = build.timeline(p, lang=lang, fmt=format, align_mode="queue", template=template)
+    TP.fill_urls(tl.get("template"), "http")
     if tl.get("broll") or tl.get("presenter"):
         build.ai_urls(p, tl, "http")
     tl["music"] = build.preview_music(p, tl)
@@ -814,6 +868,73 @@ def make_retry(mid: str):
     if not it:
         raise HTTPException(409, "only a failed, cancelled or interrupted pipeline can be retried (and none may be active)")
     return it
+
+
+# ---------------------------------------------------------------- templates
+@app.get("/api/templates")
+def templates_list():
+    """Installed templates (video/templates/<id>/), built-ins first; broken ones carry `error`."""
+    return JSONResponse(TP.list_all(), headers=NOCACHE)
+
+
+@app.get("/api/templates/schema")
+def templates_schema():
+    return TP.SCHEMA
+
+
+@app.get("/api/templates/{tid}")
+def templates_get(tid: str):
+    return JSONResponse(TP.public(TP.load(tid)), headers=NOCACHE)
+
+
+@app.post("/api/templates", status_code=201)
+async def templates_import(request: Request, replace: int = 0):
+    """Import a template zip (multipart field `file`, or the raw zip as the body). ?replace=1 updates an
+    installed one. 422 {errors: [...]} lists every problem found."""
+    ctype = request.headers.get("content-type", "")
+    with tempfile.TemporaryDirectory(prefix="studio-tz-") as tmp:
+        dest = Path(tmp) / "template.zip"
+        size, limit = 0, 50 * 1024 * 1024
+        if ctype.startswith("multipart/form-data"):
+            form = await request.form(max_files=2, max_fields=5, max_part_size=1024 * 1024)
+            up = next((v for _, v in form.multi_items() if not isinstance(v, str)), None)
+            if up is None:
+                raise TP.TemplateError("no file — send the template as a .zip")
+            if not (up.filename or "").lower().endswith(".zip"):
+                raise TP.TemplateError(f"{up.filename}: not a .zip file")
+            replace = replace or str(form.get("replace") or "").lower() in ("1", "true", "on", "yes")
+            with open(dest, "wb") as f:
+                while chunk := await up.read(1 << 20):
+                    size += len(chunk)
+                    if size > limit:
+                        raise TP.TemplateError("zip too large (limit 50 MB)", 413)
+                    f.write(chunk)
+        else:
+            body = await request.body()
+            if len(body) > limit:
+                raise TP.TemplateError("zip too large (limit 50 MB)", 413)
+            dest.write_bytes(body)
+        m, warnings = TP.import_zip(dest, replace=bool(replace))
+    return {**m, "warnings": warnings}
+
+
+@app.delete("/api/templates/{tid}")
+def templates_delete(tid: str):
+    used = [p.id for p in Project.all() if (p.brief.get("template") == tid)]
+    TP.delete(tid)
+    return {"deleted": tid, "projects_now_default": used}
+
+
+@app.get("/templates/{tid}/{path:path}", include_in_schema=False)
+def template_file(tid: str, path: str):
+    """Template files (CSS, JS, fonts, pictures) for the live preview; never cached (hot reload)."""
+    d = TP.folder(tid).resolve()
+    f = (d / path).resolve()
+    if d not in f.parents or not f.is_file() or path.split("/")[0].startswith("."):
+        raise HTTPException(404, "not found")
+    mt = {".js": "text/javascript", ".mjs": "text/javascript", ".css": "text/css", ".json": "application/json",
+          ".svg": "image/svg+xml", ".woff2": "font/woff2", ".woff": "font/woff", ".ttf": "font/ttf", ".otf": "font/otf"}
+    return FileResponse(f, media_type=mt.get(f.suffix.lower()), headers=NOCACHE)
 
 
 @app.get("/api/ai-licences")
