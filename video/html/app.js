@@ -73,19 +73,44 @@
   const rgba = (c, a) => `rgba(${hex(c).join(",")},${a})`;
   const lum = c => { const [r, g, b] = hex(c).map(v => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
 
-  function brandOf(b0 = {}) {
+  // Brand colours from the brief + the template's colour tokens. A token is a hex colour, a reference
+  // "brand.primary" / "brand.accent" / "brand.background", or "auto" (derived). Without a template
+  // (or with "aurora") every value is exactly the original look.
+  function brandOf(b0 = {}, tk = {}) {
+    const C = tk.colors || {};
+    const light = tk.tone === "light";
     const b = { ...b0 };
+    const ref = (v, fb) => {
+      if (typeof v !== "string" || !v || v === "auto") return fb;
+      if (v.startsWith("brand.")) return b0[v.slice(6)] != null ? toHex(b0[v.slice(6)], fb) : fb;
+      return toHex(v, fb);
+    };
     b.name = b0.name || "";
-    b.primary = toHex(b0.primary, "#7C5CFF");
-    b.accent = toHex(b0.accent, "#22D3A6");
-    let bg = toHex(b0.background, "#0B1020");
-    // the design is dark-on-light-text; keep the background dark enough to read
-    for (let i = 0; i < 12 && lum(bg) > 0.06; i++) bg = mixHex(bg, "#05070F", 0.25);
+    b.primary = ref(C.primary, toHex(b0.primary, "#7C5CFF"));
+    b.accent = ref(C.accent, toHex(b0.accent, "#22D3A6"));
+    let bg = ref(C.background, light ? "#F5F5F7" : toHex(b0.background, "#0B1020"));
+    if (light) {
+      // light templates: keep the background light enough for dark text
+      for (let i = 0; i < 12 && lum(bg) < 0.72; i++) bg = mixHex(bg, "#FFFFFF", 0.3);
+    } else {
+      // the design is dark-on-light-text; keep the background dark enough to read
+      for (let i = 0; i < 12 && lum(bg) > 0.06; i++) bg = mixHex(bg, "#05070F", 0.25);
+    }
     b.background = bg;
-    b.surface = toHex(b0.surface, mixHex(bg, "#2A3358", 0.45));
-    b.text = toHex(b0.text, "#F5F7FF");
-    b.muted = toHex(b0.muted, "#9AA3C0");
-    b.primaryLight = mixHex(b.primary, "#FFFFFF", 0.3);
+    b.surface = ref(C.surface, toHex(b0.surface, light ? "#FFFFFF" : mixHex(bg, "#2A3358", 0.45)));
+    b.text = ref(C.text, toHex(b0.text, light ? "#1D1D1F" : "#F5F7FF"));
+    b.muted = ref(C.muted, toHex(b0.muted, light ? "#6E6E73" : "#9AA3C0"));
+    b.primaryLight = ref(C.primary_light, mixHex(b.primary, "#FFFFFF", 0.3));
+    // colours the layouts set from script (borders, rings, captions); null = the original literal
+    b.light = light;
+    b.line = typeof C.line === "string" ? C.line : (light ? "rgba(0,0,0,.08)" : null);
+    b.lineMix = ref(C.line_mix, light ? "#D9DCE3" : null);
+    b.track = typeof C.track === "string" ? C.track : (light ? "rgba(0,0,0,.08)" : null);
+    const cap = tk.caption || {};
+    b.capText = ref(cap.text, b.text);
+    b.capHi = ref(cap.highlight, b.accent);
+    const sh = tk.shadows || {};
+    b.shadowCard = typeof sh.card === "string" ? sh.card : (light ? "0 14px 34px rgba(16,24,40,.10)" : "0 20px 50px rgba(0,0,0,.35)");
     return b;
   }
 
@@ -94,6 +119,7 @@
   const renderMode = params.has("render");
   const embed = params.has("embed");
   if (renderMode) document.body.classList.add("render");
+  if (params.has("cover")) document.body.classList.add("cover");   // cover still: no captions / progress
   if (embed) document.body.classList.add("embed");
   const stage = document.getElementById("stage");
   let CUR = null;
@@ -101,13 +127,95 @@
   let playing = false;
   window.__ready = false;
 
+  // ---------- templates (video/templates/<id>/: manifest tokens, template.css, template.js) ----------
+  // The timeline carries `template: {id, kind, base, css, js, version, tokens, options, ...}` (see
+  // video/templates/TEMPLATES.md). CSS, fonts and the ES module are loaded before mount(); a template
+  // that fails to load falls back to the built-in look, and the error is kept in window.__tplErrors.
+  const TPL = { cssUrl: null, link: null, mods: {}, fonts: {}, vars: [] };
+  window.__tplErrors = [];
+  const tplUrl = (T, name) => (T.base || "") + name + (T.version ? `?v=${encodeURIComponent(T.version)}` : "");
+  function loadTemplate(T) {
+    window.__tplErrors = [];
+    const jobs = [];
+    // stylesheet (swapped only when its URL changes, i.e. on a template switch or a file edit)
+    const cssUrl = T && T.css ? tplUrl(T, T.css) : null;
+    if (cssUrl !== TPL.cssUrl) {
+      const old = TPL.link;
+      TPL.cssUrl = cssUrl; TPL.link = null;
+      if (cssUrl) {
+        const link = document.createElement("link");
+        link.rel = "stylesheet"; link.href = cssUrl; link.id = "tpl-css";
+        TPL.link = link;
+        jobs.push(new Promise(res => {
+          link.onload = () => { if (old) old.remove(); res(); };
+          link.onerror = () => { window.__tplErrors.push(`template.css failed to load: ${cssUrl}`); if (old) old.remove(); res(); };
+        }));
+        document.head.appendChild(link);
+      } else if (old) old.remove();
+    }
+    // bundled fonts
+    const files = (T && T.tokens && T.tokens.fonts && T.tokens.fonts.files) || [];
+    for (const f of files) {
+      if (!f || !f.family || !f.src) continue;
+      const url = tplUrl(T, f.src);
+      if (!TPL.fonts[url]) {
+        try {
+          const ff = new FontFace(f.family, `url("${url}")`, { weight: String(f.weight || "400"), style: f.style || "normal" });
+          document.fonts.add(ff);
+          TPL.fonts[url] = ff.load().catch(e => { window.__tplErrors.push(`font ${f.family} (${f.src}) failed to load: ${e.message || e}`); });
+        } catch (e) { window.__tplErrors.push(`font ${f.family}: ${e.message}`); TPL.fonts[url] = Promise.resolve(); }
+      }
+      jobs.push(TPL.fonts[url]);
+    }
+    // ES module with layouts / transitions / hooks
+    let mod = Promise.resolve(null);
+    if (T && T.js) {
+      const url = tplUrl(T, T.js);
+      if (!TPL.mods[url]) {
+        TPL.mods[url] = import(new URL(url, location.href).href).catch(e => {
+          window.__tplErrors.push(`template.js failed to load: ${e.message || e}`);
+          console.error(e);
+          return null;
+        });
+      }
+      mod = TPL.mods[url];
+    }
+    return Promise.all([mod, ...jobs]).then(([m]) => m);
+  }
+
+  // Template code runs with a frozen clock and a seeded Math.random, and timers are refused, so a
+  // template cannot depend on wall-clock time (every frame must be a pure function of t).
+  let detWarned = false;
+  function deterministic(seedN, tNow, fn) {
+    const R = Math.random, DN = Date.now, PN = performance.now, ST = window.setTimeout, SI = window.setInterval, RAF = window.requestAnimationFrame;
+    let s = (seedN >>> 0) || 1;
+    Math.random = () => { s = (s + 0x6D2B79F5) >>> 0; let x = Math.imul(s ^ (s >>> 15), 1 | s); x = (x + Math.imul(x ^ (x >>> 7), 61 | x)) ^ x; return ((x ^ (x >>> 14)) >>> 0) / 4294967296; };
+    Date.now = () => 1700000000000 + Math.round(tNow * 1000);
+    performance.now = () => tNow * 1000;
+    const refuse = name => () => { if (!detWarned) { detWarned = true; window.__tplErrors.push(`template called ${name}(): timers are not allowed (drive everything from seek(t))`); } return 0; };
+    window.setTimeout = refuse("setTimeout"); window.setInterval = refuse("setInterval"); window.requestAnimationFrame = refuse("requestAnimationFrame");
+    try { return fn(); }
+    finally { Math.random = R; Date.now = DN; performance.now = PN; window.setTimeout = ST; window.setInterval = SI; window.requestAnimationFrame = RAF; }
+  }
+
   // ======================================================================
-  function mount(TL, AUD) {
+  function mount(TL, AUD, MOD) {
     TL = { captions: [], scenes: [], ...TL };
-    const B = brandOf(TL.brand);
+    const TT = TL.template || null;                       // template info from the studio (null = built-in look)
+    const TK = (TT && TT.tokens) || {};
+    const M = MOD || {};                                  // template.js exports
+    const B = brandOf(TL.brand, TK);
     const W = TL.width || 1080, H = TL.height || 1920;
     const LAND = W > H;
+    const SQ = W === H;                       // 1:1 (1080x1080)
+    const RTL = !!TL.rtl || TL.language === "ar";
     const FPS = TL.fps || 30;
+    const FMT = LAND ? "16:9" : SQ ? "1:1" : "9:16";
+    // title-safe zone (platform UI stays clear of it) and the scene content area, in stage px
+    const SAFE = LAND ? { x0: 60, y0: 20, x1: 1860, y1: 1060 } : SQ ? { x0: 30, y0: 20, x1: 1050, y1: 1060 } : { x0: 50, y0: 220, x1: 1030, y1: 1560 };
+    const AREA = LAND ? { x0: 110, y0: 118, x1: 1810, y1: 915 } : SQ ? { x0: 40, y0: 96, x1: 1040, y1: 900 } : { x0: 50, y0: 318, x1: 1030, y1: 1270 };
+    // mirror a box horizontally for right-to-left languages (side-by-side layouts)
+    const mir = b => (RTL ? { ...b, x: W - b.x - b.w } : b);
     const ASSETS = TL.assets || {};
     const BASE = TL.asset_base || "";
     let seed = 1337;
@@ -116,6 +224,9 @@
     stage.style.width = `${W}px`;
     stage.style.height = `${H}px`;
     stage.classList.toggle("land", LAND);
+    stage.classList.toggle("square", SQ);
+    stage.classList.toggle("rtl", RTL);
+    stage.dir = RTL ? "rtl" : "ltr";
     document.documentElement.lang = TL.language || "en";
 
     const root = document.documentElement.style;
@@ -126,6 +237,60 @@
     root.setProperty("--accent", B.accent);
     root.setProperty("--text", B.text);
     root.setProperty("--muted", B.muted);
+
+    // template tokens -> CSS variables + classes on #stage (only what the manifest sets; the rest keeps
+    // the built-in values, so aurora / no template is exactly the original look)
+    for (const k of TPL.vars) root.removeProperty(k);
+    TPL.vars = [];
+    const setVar = (k, v) => { if (v == null || v === "") return; root.setProperty(k, String(v)); TPL.vars.push(k); };
+    const STACK = `"Noto Sans Arabic", "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", system-ui, sans-serif`;
+    const fam = f => (typeof f === "string" && f ? `"${f.replace(/"/g, "")}", ${STACK}` : null);
+    const F = TK.fonts || {};
+    setVar("--font", fam(F.body));
+    setVar("--font-display", fam(F.display));
+    if (F.display_weight) setVar("--w-display", F.display_weight);
+    if (F.body_weight) setVar("--w-body", F.body_weight);
+    const Rd = TK.radii || {};
+    for (const k of ["card", "chip", "button", "pill"]) if (Rd[k] != null) setVar(`--r-${k}`, typeof Rd[k] === "number" ? `${Rd[k]}px` : Rd[k]);
+    const Sh = TK.shadows || {};
+    if (Sh.card) setVar("--shadow-card", Sh.card);
+    if (Sh.device) setVar("--shadow-device", Sh.device);
+    const Cp = TK.caption || {};
+    if (Cp.background) setVar("--cap-bg", Cp.background);
+    if (Cp.border) setVar("--cap-border", Cp.border);
+    if (Cp.text) setVar("--cap-text", B.capText);
+    if (Cp.highlight) setVar("--cap-hi", B.capHi);
+    if (Cp.highlight_text) setVar("--cap-hi-text", Cp.highlight_text);
+    const Col = TK.colors || {};
+    if (Col.on_accent) setVar("--on-accent", Col.on_accent);
+    if (B.line) setVar("--line", B.line);
+    if (Col.overlay) setVar("--tpl-overlay", Col.overlay);
+    const opts = (TT && TT.options) || {};
+    for (const [k, v] of Object.entries(opts)) {
+      const key = String(k).replace(/[^\w-]/g, "");
+      if (typeof v === "number") setVar(`--opt-${key}`, v);
+      else if (typeof v === "string" && /^#[0-9a-f]{3,8}$/i.test(v)) setVar(`--opt-${key}`, v);
+    }
+    // classes: tpl-<id>, tone-light, cap-<style>, prog-<style>, logo-<placement>, opt-<key>[-<value>]
+    stage.className = stage.className.split(/\s+/).filter(c => c && !/^(tpl-|tone-|cap-|prog-|logo-|opt-|tx-)/.test(c)).join(" ");
+    if (TT && TT.id) stage.classList.add(`tpl-${TT.id}`);
+    // full templates: no compositor layer hints, so Chromium re-rasterises scaled text every frame and a
+    // frame never depends on which frames were drawn before it (seek order)
+    if (TT && TT.kind === "full") stage.classList.add("tpl-full");
+    if (B.light) stage.classList.add("tone-light");
+    if (Cp.style && Cp.style !== "pill") stage.classList.add(`cap-${Cp.style}`);
+    if (Cp.uppercase) stage.classList.add("cap-upper");
+    const Pg = TK.progress || {};
+    if (Pg.style && Pg.style !== "segments") stage.classList.add(`prog-${Pg.style}`);
+    const Lg = TK.logo || {};
+    // left/right placements are mirrored for right-to-left languages (the header sits at the start side)
+    const LP = RTL ? ({ "top-left": "top-right", "top-right": "top-left" }[Lg.placement] || Lg.placement) : Lg.placement;
+    if (LP && LP !== "auto") stage.classList.add(`logo-${LP}`);
+    for (const [k, v] of Object.entries(opts)) {
+      const key = String(k).replace(/[^\w-]/g, "");
+      if (v === true) stage.classList.add(`opt-${key}`);
+      else if (typeof v === "string" && /^[\w-]{1,40}$/.test(v)) stage.classList.add(`opt-${key}-${v}`);
+    }
 
     const assetUrl = name => {
       const m = ASSETS[name];
@@ -190,6 +355,10 @@
       const capWords = [];
       for (const c of caps) {
         const ws = c.text.split(/\s+/).filter(Boolean);
+        if (c.words && c.words.length === ws.length) {     // aligned (faster-whisper) word times
+          ws.forEach((w, k) => capWords.push({ w: norm(w), t: c.words[k][0], cap: c }));
+          continue;
+        }
         const total = ws.reduce((a, w) => a + w.length, 0) || 1;
         let acc = 0;
         for (const w of ws) { capWords.push({ w: norm(w), t: c.start + (acc / total) * (c.end - c.start), cap: c }); acc += w.length; }
@@ -311,7 +480,8 @@
     const pBubbleIds = new Set(PT && PT.mode !== "full" && pUrl ? (PT.bubble || []) : []);
     // Bubble rectangle (stage px): 9:16 above the caption pill on the left (inside the safe zone,
     // away from the right-hand button rail); 16:9 bottom-right above the captions.
-    const RB = pBubbleIds.size ? (LAND ? { x: W - 128 - 250, y: 650, w: 250, h: 250 } : { x: 64, y: 1010, w: 258, h: 258 }) : null;
+    const RB = pBubbleIds.size ? (LAND ? { x: W - 128 - 250, y: 650, w: 250, h: 250 }
+      : SQ ? { x: RTL ? W - 56 - 200 : 56, y: 676, w: 200, h: 200 } : { x: 64, y: 1010, w: 258, h: 258 }) : null;
     const reserveFor = sc => (RB && pBubbleIds.has(sc.id) ? RB : null);
     for (const id of ["bgvideo", "pfull", "pbubble"]) { const old = document.getElementById(id); if (old) old.remove(); }
     let pfull = null;
@@ -337,6 +507,8 @@
       if (c.x1 <= R.x - m || c.x0 >= R.x + R.w + m || c.y1 <= R.y - m || c.y0 >= R.y + R.h + m) return null;
       const areas = LAND
         ? [{ x0: 110, x1: R.x - m, y0: 118, y1: 925 }, { x0: 110, x1: W - 110, y0: 118, y1: R.y - m }]
+        : SQ ? [{ x0: 50, x1: W - 50, y0: 100, y1: R.y - m }, R.x < W / 2 ? { x0: R.x + R.w + m, x1: W - 50, y0: 100, y1: 900 }
+                                                                       : { x0: 50, x1: R.x - m, y0: 100, y1: 900 }]
         : [{ x0: 50, x1: W - 50, y0: 318, y1: R.y - m }, { x0: R.x + R.w + m, x1: W - 50, y0: 318, y1: 1272 }];
       let best = null;
       for (const A of areas) {
@@ -358,13 +530,13 @@
         const hl = words(sc.headline, "headline"); el.appendChild(hl.box);
         const sub = sc.sub ? el.appendChild(h("div", "sub", sc.sub)) : null;
         const wave = el.appendChild(h("div", "wave"));
-        const N = LAND ? 61 : 41, bars = [];
+        const N = LAND ? 61 : SQ ? 37 : 41, bars = [];
         for (let i = 0; i < N; i++) {
           const b = h("i"); b.style.background = mix(B.primary, B.accent, i / (N - 1));
           wave.appendChild(b); bars.push(b);
         }
         const t0 = sc.start + (sc.start === 0 ? -0.3 : 0.1);
-        const maxH = LAND ? 150 : 190;
+        const maxH = LAND ? 150 : SQ ? 120 : 190;
         return t => {
           if (kicker) style(kicker, rise(t, t0, { dy: 40, s0: 0.8, d: 0.6, ease: E.outBack }));
           animWords(hl.list, t, t0 + 0.15, 0.12);
@@ -407,8 +579,8 @@
             const o = clamp((t - ti) / 0.15);
             const active = clamp((t - ti) / 0.15) * (1 - clamp((t - (times[i + 1] ?? sc.speech_end) + 0.05) / 0.3));
             style(c, { s: lerp(0.4, 1, p), r: lerp(i % 2 ? 8 : -8, 0, p), y: lerp(60, 0, p), o });
-            c.style.borderColor = active > 0.01 ? mix("#2a3150", B.accent, active) : "rgba(255,255,255,.09)";
-            c.style.boxShadow = `0 20px 50px rgba(0,0,0,.35), 0 0 ${(50 * active).toFixed(1)}px ${rgba(B.accent, (0.45 * active).toFixed(3))}`;
+            c.style.borderColor = active > 0.01 ? mix(B.lineMix || "#2a3150", B.accent, active) : (B.line || "rgba(255,255,255,.09)");
+            c.style.boxShadow = `${B.shadowCard === "none" ? "" : B.shadowCard + ", "}0 0 ${(50 * active).toFixed(1)}px ${rgba(B.accent, (0.45 * active).toFixed(3))}`;
             const tp = prog(t, ti + 0.25, 0.4, E.outBackBig);
             style(tick, { s: tp, o: clamp((t - ti - 0.25) / 0.1) });
           });
@@ -428,7 +600,7 @@
         svg.appendChild(defs);
         const outer = document.createElementNS(NS, "circle");
         outer.setAttribute("cx", 280); outer.setAttribute("cy", 280); outer.setAttribute("r", 274);
-        outer.setAttribute("fill", "none"); outer.setAttribute("stroke", "rgba(255,255,255,.14)");
+        outer.setAttribute("fill", "none"); outer.setAttribute("stroke", B.light ? "rgba(0,0,0,.16)" : "rgba(255,255,255,.14)");
         outer.setAttribute("stroke-width", 2); outer.setAttribute("stroke-dasharray", "2 14");
         svg.appendChild(outer);
         const R = 240, segs = [];
@@ -464,7 +636,7 @@
           num.style.filter = `drop-shadow(0 0 ${(30 + 50 * punch / 0.12).toFixed(1)}px ${rgba(B.primary, 0.45)})`;
           segs.forEach((s, i) => {
             const lit = clamp((val * n / (Number.isFinite(target) ? target : n)) - i);
-            s.setAttribute("stroke", lit > 0.02 ? `url(#${gid})` : "rgba(255,255,255,.08)");
+            s.setAttribute("stroke", lit > 0.02 ? `url(#${gid})` : (B.track || "rgba(255,255,255,.08)"));
             s.setAttribute("opacity", lit > 0.02 ? (0.35 + 0.65 * lit).toFixed(3) : "1");
           });
           outer.setAttribute("transform", `rotate(${(t * 12).toFixed(2)} 280 280)`);
@@ -497,7 +669,7 @@
             const end = i + 1 < times.length ? times[i + 1] - 0.15 : sc.speech_end + 0.1;
             const active = clamp((t - ti) / 0.15) * (1 - clamp((t - end) / 0.3));
             style(row, { x: 140 * (1 - p), o: clamp((t - ti) / 0.25), s: 1 + 0.025 * active, blur: 8 * (1 - clamp((t - ti) / 0.3)) });
-            row.style.borderColor = active > 0.01 ? mix("#252b45", B.accent, active) : "rgba(255,255,255,.08)";
+            row.style.borderColor = active > 0.01 ? mix(B.lineMix || "#252b45", B.accent, active) : (B.line || "rgba(255,255,255,.08)");
             row.style.background = active > 0.01 ? `color-mix(in srgb, ${mix(B.surface, mixHex(B.surface, B.accent, 0.25), active)} 92%, transparent)` : "";
             const ep = prog(t, ti + 0.1, 0.6, E.outBackBig);
             const wob = active * Math.sin((t - ti) * 9) * 6;
@@ -569,22 +741,51 @@
 
         let G = null;  // geometry, computed on first update (needs fonts for text height)
         const RV = reserveFor(sc);
+        // 1:1: phones (tall shots) sit next to the text, browsers / wide shots below it
+        const sqSide = SQ && hasText && (kind === "phone" || (kind === "none" && m.aspect > 1.15));
+        if (sqSide) txt.classList.add("side");
         const layout = () => {
           let box;
           const th = hasText ? txt.offsetHeight : 0;
+          let side = false;
           if (LAND) {
+            // device box ends at y 900: the caption pill (top ≈ 923) stays clear even with the slow camera drift
             if (hasText) {
-              txt.style.top = px(140 + Math.max(0, (760 - th) / 2));
-              box = { x: 770, y: 130, w: 1060, h: 790 };
-            } else box = { x: 160, y: 130, w: 1600, h: 790 };
-            if (RV) box.w = Math.min(box.w, RV.x - 30 - box.x);   // keep the device left of the bubble
+              // right-to-left puts the text column on the right, next to the presenter bubble: keep it above
+              const tb = RTL && RV ? RV.y - 24 : 900;
+              txt.style.top = px(140 + Math.max(0, (tb - 140 - th) / 2));
+              box = mir({ x: 770, y: 130, w: 1060, h: 770 });
+              side = true;
+            } else box = { x: 160, y: 130, w: 1600, h: 770 };
+            if (RV && box.x < RV.x + RV.w && box.x + box.w > RV.x) box.w = Math.min(box.w, RV.x - 30 - box.x);   // keep the device left of the bubble
+          } else if (SQ) {
+            if (sqSide) {
+              // the presenter bubble (bottom-left) stays clear of the text column
+              const tb = RV ? RV.y - 24 : 880;
+              txt.style.top = px(100 + Math.max(0, (tb - 100 - th) / 2));
+              box = mir({ x: 560, y: 100, w: 450, h: 785 });
+              side = true;
+            } else {
+              const top = 100 + (hasText ? th + 26 : 10);
+              box = { x: 70, y: top, w: 940, h: 885 - top };
+              if (RV && box.y + box.h > RV.y) {
+                // presenter bubble: either end the device above it or keep it right of it — whichever is bigger
+                const a = { ...box, h: RV.y - 20 - box.y };
+                const b = RV.x < W / 2 ? { ...box, x: RV.x + RV.w + 24, w: box.x + box.w - (RV.x + RV.w + 24) } : { ...box, w: RV.x - 24 - box.x };
+                const ga = deviceGeom(kind, m.aspect, a, Infinity), gb = deviceGeom(kind, m.aspect, b, Infinity);
+                box = ga.w * ga.h >= gb.w * gb.h ? a : b;
+              }
+            }
           } else {
+            // 9:16: the device ends at y 1325 and this scene's caption pill moves down to y≈1410, so the
+            // caption sits below the phone instead of covering the bottom of its screen
             const top = 330 + (hasText ? th + 40 : 20);
-            box = { x: 70, y: top, w: 940, h: 1400 - top };
+            box = { x: 70, y: top, w: 940, h: 1325 - top };
           }
-          const g = deviceGeom(kind, m.aspect, box, kind === "phone" ? (LAND ? 520 : 600) : Infinity);
+          const g = deviceGeom(kind, m.aspect, box, kind === "phone" ? (LAND ? 520 : SQ ? 420 : 600) : Infinity);
           if (hasText) {
-            const mask = LAND ? `linear-gradient(to right, transparent ${px(box.x - 110)}, #000 ${px(box.x - 20)})`
+            const mask = side ? (RTL ? `linear-gradient(to left, transparent ${px(W - box.x - box.w - 110)}, #000 ${px(W - box.x - box.w - 20)})`
+                                     : `linear-gradient(to right, transparent ${px(box.x - 110)}, #000 ${px(box.x - 20)})`)
                               : `linear-gradient(to bottom, transparent ${px(box.y - 90)}, #000 ${px(box.y - 12)})`;
             camwrap.style.webkitMaskImage = camwrap.style.maskImage = mask;
           }
@@ -677,7 +878,8 @@
             const rx = s * sx0 + tx, ry = s * sy0 + ty, rw = s * zk * G.R.w, rh = s * zk * G.R.h;
             // never above the device area (= below the headline), never into the captions
             const lim = LAND ? { x0: G.box.x, x1: G.box.x + G.box.w, y0: 120, y1: 900 }
-                             : { x0: 50, x1: W - 50, y0: hasText ? G.box.y - 8 : 330, y1: RV ? RV.y - 14 : 1270 };
+                      : SQ ? { x0: 40, x1: W - 40, y0: sqSide ? 100 : (hasText ? G.box.y - 8 : 100), y1: RV ? RV.y - 14 : 890 }
+                      : { x0: 50, x1: W - 50, y0: hasText ? G.box.y - 8 : 330, y1: RV ? RV.y - 14 : 1330 };
             let below = ry + rh + 34 + G.ch <= lim.y1;
             let cy = below ? ry + rh + 34 : ry - 34 - G.ch;
             cy = clamp(cy, lim.y0, lim.y1 - G.ch);
@@ -691,7 +893,8 @@
           } else if (callout) {
             // no focus: callout sits under the device
             const cp = prog(t, sc.start + 1.0, 0.55, E.outBack);
-            place(callout, W / 2 - G.cw / 2, Math.min(G.g.y + G.g.h * s - G.ch * 1.6, LAND ? 860 : (RV ? RV.y - 14 - G.ch : 1240)));
+            const cxn = (LAND || sqSide) ? G.g.x + G.g.w / 2 - G.cw / 2 : W / 2 - G.cw / 2;
+            place(callout, clamp(cxn, 40, W - 40 - G.cw), Math.min(G.g.y + G.g.h * s - G.ch * 1.6, LAND ? 860 : SQ ? 830 : (RV ? RV.y - 14 - G.ch : 1240)));
             callout.style.opacity = clamp((t - sc.start - 1.0) / 0.15).toFixed(3);
             callout.style.transform = `scale(${lerp(0.6, 1, cp).toFixed(4)})`;
             calloutArrow.style.display = "none";
@@ -718,31 +921,35 @@
         let G = null;
         const layout = () => {
           const th = (hl || sub) ? txt.offsetHeight : 0;
-          const top = (LAND ? 140 : 330) + (th ? th + (LAND ? 30 : 50) : 10);
-          const bottom = LAND ? 930 : 1380;
+          const top = (LAND ? 140 : SQ ? 100 : 330) + (th ? th + (LAND ? 30 : SQ ? 24 : 50) : 10);
+          // 9:16 ends at 1325 (the caption pill of screen scenes sits below, at y≈1410); 1:1 above its caption
+          const bottom = LAND ? 930 : SQ ? 885 : 1325;
           const n = Math.max(1, ms.length);
           const boxes = [];
+          const PORT = !LAND && !SQ;
           if (kind === "phone" || kind === "none") {
             const areaW = LAND ? 1640 : 980;
-            const gap = LAND ? 70 : (n === 3 ? -40 : 40);
-            const wEach = n === 3 && !LAND ? 380 : (areaW - gap * (n - 1)) / n;
+            const gap = LAND ? 70 : SQ ? (n === 3 ? 30 : 50) : (n === 3 ? -40 : 40);
+            const wEach = n === 3 && PORT ? 380 : (areaW - gap * (n - 1)) / n;
             const hh = bottom - top - (labels.some(Boolean) ? 70 : 0);
-            const geoms = ms.map(m => deviceGeom(kind, m.aspect, { x: 0, y: 0, w: wEach, h: n === 3 && !LAND ? hh * 0.9 : hh }, LAND ? 420 : 480));
+            const geoms = ms.map(m => deviceGeom(kind, m.aspect, { x: 0, y: 0, w: wEach, h: n === 3 && PORT ? hh * 0.9 : hh }, LAND ? 420 : SQ ? 360 : 480));
             const total = geoms.reduce((a, g) => a + g.w, 0) + gap * (n - 1);
             let x = (W - total) / 2;
             geoms.forEach((g, i) => {
-              const stag = !LAND && n === 2 ? (i ? 50 : -10) : (n === 3 && !LAND ? (i === 1 ? -40 : 30) : 0);
-              boxes.push({ g, x, y: top + (hh - g.h) / 2 + stag, z: n === 3 && i === 1 ? 3 : 1, r: n === 3 ? (i - 1) * (LAND ? 0 : 5) : 0 });
+              const stag = PORT && n === 2 ? (i ? 50 : -10) : (n === 3 && PORT ? (i === 1 ? -40 : 30) : 0);
+              boxes.push({ g, x, y: top + (hh - g.h) / 2 + stag, z: n === 3 && i === 1 ? 3 : 1, r: n === 3 ? (i - 1) * (PORT ? 5 : 0) : 0 });
               x += g.w + gap;
             });
           } else {
             // browser windows cascade diagonally, the last one in front
-            const ww = LAND ? 1100 : 900;
-            const dx = LAND ? 170 : 60, dy = LAND ? 70 : 150;
+            const ww = LAND ? 1100 : SQ ? 800 : 900;
+            const dx = LAND ? 170 : SQ ? 80 : 60, dy = LAND ? 70 : SQ ? 50 : 150;
             const geoms = ms.map(m => deviceGeom(kind, Math.min(m.aspect, 0.62), { x: 0, y: 0, w: ww, h: bottom - top - dy * (n - 1) }));
             const totalW = geoms[0] ? geoms[0].w + dx * (n - 1) : 0;
             geoms.forEach((g, i) => boxes.push({ g, x: (W - totalW) / 2 + dx * i, y: top + dy * i, z: i + 1, r: 0 }));
           }
+          // right-to-left: the first screen is on the right (cascade grows to the left)
+          if (RTL) boxes.forEach(b => { b.x = W - b.x - b.g.w; b.r = -b.r; });
           const devs = boxes.map((b, i) => {
             const { dev, screen } = deviceDom(b.g, items[i].url || sc.url);
             place(dev, b.x, b.y);
@@ -836,6 +1043,73 @@
     const pEl = document.getElementById("particles");
     scenesEl.innerHTML = ""; capsEl.innerHTML = ""; progEl.innerHTML = ""; pEl.innerHTML = "";
 
+    // ---------- template layers + background assets ----------
+    for (const id of ["tpl-bg", "tpl-fg", "tpl-bgimg", "tx-flash"]) { const old = document.getElementById(id); if (old) old.remove(); }
+    const bgRoot = document.getElementById("bg");
+    let tplBgImg = null, tplBg = null, tplFg = null;
+    const BGT = TK.background || {};
+    if (TT && BGT.image) {
+      // theme background picture (cover), under the brand glow; b-roll clips still go on top of it
+      tplBgImg = h("div");
+      tplBgImg.id = "tpl-bgimg";
+      tplBgImg.style.backgroundImage = `url("${tplUrl(TT, BGT.image)}")`;
+      tplBgImg.style.backgroundSize = BGT.fit || "cover";
+      tplBgImg.style.backgroundPosition = BGT.position || "center";
+      if (BGT.opacity != null) tplBgImg.style.opacity = String(BGT.opacity);
+      bgRoot.insertBefore(tplBgImg, bgRoot.firstChild);
+    }
+    if (TT) {
+      for (const k of ["blobs", "grid", "particles", "vignette"]) if (BGT[k] === false) stage.classList.add(`bgx-no-${k}`);
+    }
+    if (TT && (M.setup || M.frame || M.layouts)) {
+      tplBg = bgRoot.appendChild(h("div", "tpl-layer"));
+      tplBg.id = "tpl-bg";
+      tplFg = h("div", "tpl-layer");
+      tplFg.id = "tpl-fg";
+      stage.insertBefore(tplFg, document.getElementById("captions"));
+    }
+
+    // ---------- context handed to template.js (documented in video/templates/TEMPLATES.md) ----------
+    const noise = (a, b = 0) => { let x = Math.imul((a | 0) ^ 0x9E3779B9, 0x85EBCA6B) ^ Math.imul((b | 0) + 0x632BE5AB, 0xC2B2AE35); x ^= x >>> 15; x = Math.imul(x, 0x27D4EB2F); x ^= x >>> 13; return (x >>> 0) / 4294967296; };
+    const CTX = {
+      W, H, format: FMT, land: LAND, square: SQ, portrait: !LAND && !SQ, rtl: RTL, lang: TL.language || "en", fps: FPS,
+      duration: TL.duration || 0, brand: B, tokens: TK, options: (TT && TT.options) || {}, template: TT,
+      safe: SAFE, area: AREA, scenes: TL.scenes, stage, layers: { bg: tplBg, fg: tplFg },
+      h, words: (text, cls) => words(text, cls), animWords, rise, style, prog, ease: E, clamp, lerp, mix, mixHex, rgba, place, px,
+      isArabic, noise, audioAt: t => audioAt(t), fit: (box, lines) => fitHeadline(box, lines),
+      itemTimes: (scene, items) => itemTimes(scene, items),
+      media: (name, scene, trim) => media(name, scene ? scene.start : 0, trim),
+      device: (kind, aspect, box, maxW, url) => { const g = deviceGeom(kind, aspect, box, maxW); return { g, ...deviceDom(g, url) }; },
+      logo: (box, nbars) => logoInto(box, nbars), assetUrl, asset: name => assetMeta(name),
+      fileUrl: name => (TT ? tplUrl(TT, name) : name),
+      base: (layout, scene, el) => (builders[layout] || builders.hero)(scene, el),
+    };
+    const LAYOUTS_T = (TT && M.layouts) || {};
+    if (M.setup) {
+      try { deterministic(7, 0, () => M.setup(CTX)); } catch (e) { console.error(e); window.__tplErrors.push(`setup(): ${e.message}`); }
+    }
+
+    // ---------- transitions (between scenes; video/html/transitions.js + template.js `transitions`) ----------
+    const TXS = window.VS_TRANSITIONS || { lift: { lead: 0.3, tail: 0.1, out: p => { p = E.inCubic(p); return { y: -70 * p, s: 1 - 0.05 * p, o: 1 - p, blur: 14 * p }; }, in: () => ({}) } };
+    const combineTx = TXS.combine || ((a, b) => ({ x: (a.x || 0) + (b.x || 0), y: (a.y || 0) + (b.y || 0), s: (a.s ?? 1) * (b.s ?? 1),
+      r: (a.r || 0) + (b.r || 0), o: (a.o ?? 1) * (b.o ?? 1), blur: Math.max(a.blur || 0, b.blur || 0), flash: Math.max(a.flash || 0, b.flash || 0) }));
+    const TPL_TX = (TT && M.transitions) || {};
+    function txOf(spec) {
+      if (!spec) return null;
+      const name = typeof spec === "object" ? spec.type : spec;
+      const own = TPL_TX[name];
+      const T0 = own || (name !== "order" && name !== "combine" && name !== "E" ? TXS[name] : null);
+      if (!T0 || typeof T0.out !== "function" || typeof T0.in !== "function") return null;
+      let lead = +T0.lead || 0, tail = +T0.tail || 0;
+      const d = typeof spec === "object" ? +spec.duration : NaN;
+      if (d > 0 && lead + tail > 0) { const k = d / (lead + tail); lead *= k; tail *= k; }
+      if (!own) return lead === T0.lead && tail === T0.tail ? T0 : { ...T0, lead, tail };
+      // template transitions run like layouts: frozen clock, seeded random
+      return { name, lead, tail, out: (p, c) => deterministic(11, p, () => T0.out(p, c) || {}), in: (p, c) => deterministic(13, p, () => T0.in(p, c) || {}) };
+    }
+    const DEF_TX = txOf(TL.transition) || txOf(TT && TT.default_transition) || TXS.lift;
+    const TXC = { W, H, rtl: RTL, format: FMT, brand: B };
+
     // ---------- build scenes ----------
     const scenes = TL.scenes.map((sc0, idx) => {
       const sc = { ...sc0 };
@@ -846,9 +1120,25 @@
       scenesEl.appendChild(el);
       let update, fit = null;
       try {
-        update = builders[layout](sc, el);
+        const TLY = LAYOUTS_T[layout];
+        if (TLY && typeof TLY.build === "function") {
+          // template layout: build(scene, ctx) -> Element (or null after ctx.base / filling ctx.el), seek(el, localT, ctx)
+          el.classList.add("tpl-layout");
+          const sctx = Object.assign(Object.create(CTX), { scene: sc, el, index: idx, last: idx === TL.scenes.length - 1 });
+          const node = deterministic(101 + idx, 0, () => TLY.build(sc, sctx));
+          if (node && node.nodeType) el.appendChild(node);
+          const target = node && node.nodeType ? node : el;
+          update = t => (TLY.seek ? deterministic(1009 * (idx + 1), t, () => TLY.seek(target, t - sc.start, sctx)) : undefined);
+        } else update = builders[layout](sc, el);
         const lines = { hero: 3, chips: 2, stat: 2, list: 2, cta: 3, screen: 2, screens: 2, presenter: 2 }[layout] || 2;
-        el.querySelectorAll(".headline").forEach(hb => fitHeadline(hb, lines));
+        el.querySelectorAll(".headline").forEach(hb => { if (hb.dataset.fit !== "off") fitHeadline(hb, +hb.dataset.lines || lines); });
+        // chips: one line each, shrink long labels (e.g. long translations) instead of wrapping
+        el.querySelectorAll(".chip > span").forEach(sp => {
+          const chip = sp.parentElement;
+          sp.style.whiteSpace = "nowrap";
+          let fs = parseFloat(getComputedStyle(sp).fontSize);
+          for (let i = 0; i < 12 && sp.offsetWidth > chip.clientWidth - 40 && fs > 22; i++) { fs *= 0.92; sp.style.fontSize = `${fs.toFixed(1)}px`; }
+        });
         const RV = reserveFor(sc);
         if (RV && !["screen", "screens", "presenter"].includes(layout)) {
           // centred layouts: scale/move the whole content box so the presenter bubble never covers it
@@ -867,10 +1157,16 @@
           }
         }
       }
-      catch (e) { console.error(e); el.textContent = `scene ${sc.id}: ${e.message}`; update = () => {}; }
+      catch (e) { console.error(e); window.__tplErrors.push(`scene ${sc.id} (${layout}): ${e.message}`); el.textContent = `scene ${sc.id}: ${e.message}`; update = () => {}; }
       return { sc, el, update, fit, last: idx === TL.scenes.length - 1 };
     });
-    const OUT_LEAD = 0.3, OUT_TAIL = 0.1;    // exit transition window around scene end
+    // the transition INTO scene i plays at its start (scene i-1 leaves with it); default: project, then template
+    scenes.forEach((S, i) => {
+      S.inTx = i > 0 ? (txOf(S.sc.transition) || DEF_TX) : null;
+      if (i > 0) scenes[i - 1].outTx = S.inTx;
+      S.el.dataset.start = S.sc.start;
+    });
+    let flashEl = null;
 
     // ---------- brand header ----------
     const brand = document.getElementById("brand");
@@ -915,6 +1211,8 @@
     }
 
     // ---------- captions ----------
+    // "box" captions put the spoken word on a highlight box: its text takes the box's contrast colour
+    const CAP_HI = (TK.caption || {}).style === "box" ? toHex((TK.caption || {}).highlight_text, B.background) : B.capHi;
     const caps = TL.captions.map((c, i) => {
       const el = h("div", "cap");
       const eq = el.appendChild(h("div", "eq"));
@@ -924,15 +1222,30 @@
       const total = ws.reduce((a, w) => a + w.length, 0) || 1;
       let acc = 0;
       if (isArabic(c.text)) txt.dir = "rtl";
+      const timed = c.words && c.words.length === ws.length;   // aligned (faster-whisper) word times
       const wl = ws.map((w, k) => {
         const s = h("span", "w", w + (k < ws.length - 1 ? " " : ""));
         if (isArabic(w)) { s.lang = "ar"; s.dir = "rtl"; }
         txt.appendChild(s);
+        if (timed) return { s, t0: c.words[k][0], t1: k + 1 < ws.length ? c.words[k + 1][0] : c.words[k][1] };
         const t0 = c.start + (acc / total) * (c.end - c.start);
         acc += w.length;
         return { s, t0, t1: c.start + (acc / total) * (c.end - c.start) };
       });
+      // 9:16 screen/screens scenes: the pill moves below the device (y≈1410) instead of covering its screen
+      const own = TL.scenes.find(sc => c.start >= sc.start - 0.01 && c.start < sc.end);
+      if (!LAND && !SQ && own && (own.layout === "screen" || own.layout === "screens")) el.style.top = "1410px";
+      if (own && TT) el.dataset.layout = own.layout;
       capsEl.appendChild(el);
+      if (TT && TT.id !== "aurora") {
+        // template captions: shrink a long line (up to ~30 %) before it is allowed to wrap
+        el.style.display = "flex"; el.style.whiteSpace = "nowrap"; txt.style.flexWrap = "nowrap"; el.style.maxWidth = "none";
+        const maxW = LAND ? 1500 : SQ ? 960 : 920;
+        let fs = parseFloat(getComputedStyle(el).fontSize);
+        const fs0 = fs;
+        for (let k = 0; k < 10 && el.offsetWidth > maxW && fs > fs0 * 0.7; k++) { fs *= 0.95; el.style.fontSize = `${fs.toFixed(1)}px`; }
+        el.style.whiteSpace = ""; txt.style.flexWrap = ""; el.style.maxWidth = ""; el.style.display = "none";
+      }
       const prev = TL.captions[i - 1], next = TL.captions[i + 1];
       return {
         c, el, eqb, wl,
@@ -949,7 +1262,7 @@
     // ---------- recordings ----------
     function syncVideos(t) {
       const waits = [];
-      for (const S of scenes) S.visible = t >= S.sc.start - 0.3 && (S.last ? true : t < S.sc.end + OUT_TAIL);
+      for (const S of scenes) S.visible = t >= S.sc.start - (S.inTx ? S.inTx.lead : 0.3) && (S.last || !S.outTx ? true : t < S.sc.end + S.outTx.tail);
       for (const v of videos) {
         const S = scenes.find(S => S.sc.start === v.start);
         const vis = S ? S.visible : false;
@@ -994,7 +1307,7 @@
       const holder = h("div");
       holder.id = "bgvideo";
       const bgEl = document.getElementById("bg");
-      bgEl.insertBefore(holder, bgEl.firstChild);
+      bgEl.insertBefore(holder, tplBgImg ? tplBgImg.nextSibling : bgEl.firstChild);
       const base = TL.broll_base || "";
       for (const S of bgSegs) {
         S.first = S.start <= 0.001;
@@ -1187,21 +1500,32 @@
       const bwait = bgSegs.length ? syncBg(t) : null;
       const pwait = pvids.length ? syncPresenter(t) : null;
 
-      // scenes
+      // scenes (+ the transition at each cut)
+      const twaits = [];
+      let flash = 0;
+      const txp = (T0, cut) => (T0.lead + T0.tail > 0 ? clamp((t - (cut - T0.lead)) / (T0.lead + T0.tail)) : (t >= cut ? 1 : 0));
       for (const S of scenes) {
         const { sc, el } = S;
         if (!S.visible) { el.style.display = "none"; if (S.update.hide) S.update.hide(); continue; }
         el.style.display = "";
         const F = S.fit;
-        if (!S.last) {
-          const p = prog(t, sc.end - OUT_LEAD, OUT_LEAD + OUT_TAIL, E.inCubic);
-          style(el, F ? { x: F.dx, y: F.dy - 70 * p, s: F.k * (1 - 0.05 * p), o: 1 - p, blur: 14 * p }
-                      : { y: -70 * p, s: 1 - 0.05 * p, o: 1 - p, blur: 14 * p });
-        } else {
-          style(el, F ? { x: F.dx, y: F.dy, s: F.k } : {});
-        }
-        try { S.update(t); } catch (e) { console.error(e); }
+        let st = S.outTx && !S.last ? S.outTx.out(txp(S.outTx, sc.end), TXC) : {};
+        st = combineTx(st, S.inTx ? S.inTx.in(txp(S.inTx, sc.start), TXC) : {});
+        style(el, { x: (F ? F.dx : 0) + st.x, y: (F ? F.dy : 0) + st.y, s: (F ? F.k : 1) * st.s, r: st.r, o: st.o, blur: st.blur });
+        if (st.clip) { el.style.clipPath = `inset(${st.clip.map(v => `${(100 * clamp(v)).toFixed(3)}%`).join(" ")})`; S.clipped = true; }
+        else if (S.clipped) { el.style.clipPath = ""; S.clipped = false; }
+        if (st.flash > flash) flash = st.flash;
+        try { const r = S.update(t); if (r && typeof r.then === "function") twaits.push(r); } catch (e) { console.error(e); }
       }
+      if (flash > 0.001 || flashEl) {
+        if (!flashEl) { flashEl = h("div"); flashEl.id = "tx-flash"; stage.insertBefore(flashEl, document.getElementById("captions")); }
+        flashEl.style.opacity = flash.toFixed(4);
+        flashEl.style.display = flash > 0.001 ? "" : "none";
+      }
+      if (M.frame && TT) {
+        try { deterministic(5, t, () => M.frame(t, CTX)); } catch (e) { console.error(e); }
+      }
+      if (TT) driveCssAnimations(t);
       bubbleAt(t, a);
 
       // captions
@@ -1224,7 +1548,8 @@
         for (const Wd of C.wl) {
           const sp = clamp((t - Wd.t0) / 0.08);
           const speaking = t >= Wd.t0 && t < Wd.t1 + 0.02;
-          Wd.s.style.color = speaking ? B.accent : B.text;
+          Wd.s.style.color = speaking ? CAP_HI : B.capText;
+          if (TT) { Wd.s.classList.toggle("on", speaking); Wd.s.classList.toggle("said", t >= Wd.t1 + 0.02); }
           Wd.s.style.opacity = (0.42 + 0.58 * sp).toFixed(3);
         }
       }
@@ -1233,8 +1558,24 @@
       TL.scenes.forEach((sc, i) => {
         segs[i].style.width = `${(100 * clamp((t - sc.start) / Math.max(0.01, sc.end - sc.start))).toFixed(2)}%`;
       });
+      if (twaits.length) return Promise.all([vwait, bwait, pwait, ...twaits]);
       if (bwait || pwait) return Promise.all([vwait, bwait, pwait]);
       return vwait || undefined;
+    }
+
+    // CSS animations / transitions in template.css are paused and seeked to the scene's local time
+    // (the stage's own time outside scenes), so they are deterministic like everything else.
+    function driveCssAnimations(t) {
+      if (!document.getAnimations) return;
+      for (const an of document.getAnimations()) {
+        const tg = an.effect && an.effect.target;
+        if (!tg || !stage.contains(tg)) continue;
+        if (an.playState !== "paused") an.pause();
+        const sEl = tg.closest && tg.closest(".scene");
+        const t0 = sEl && sEl.dataset.start ? parseFloat(sEl.dataset.start) : 0;
+        const ms = Math.max(0, (t - t0) * 1000);
+        if (an.currentTime !== ms) an.currentTime = ms;
+      }
     }
 
     function ready() {
@@ -1244,7 +1585,8 @@
       const vids = allv.map(el => el.readyState >= 2 ? Promise.resolve() : new Promise(r => {
         el.addEventListener("loadeddata", r, { once: true }); el.addEventListener("error", r, { once: true });
       }));
-      const all = Promise.all([...imgs, ...vids]);
+      // template.css may declare its own @font-face: wait for those too
+      const all = Promise.all([...imgs, ...vids, TT && TT.css && document.fonts ? document.fonts.ready : null]);
       return Promise.race([all, new Promise(r => setTimeout(r, 20000))]);
     }
 
@@ -1269,14 +1611,17 @@
 
   window.seek = t => (CUR ? CUR.seek(t) : undefined);
   window.setPlaying = p => { playing = !!p; };
+  let loadSeq = 0;
   window.loadTimeline = (tl, aud) => {
     window.__ready = false;
-    return fontsReady.then(() => {
-      CUR = mount(tl, aud || null);
+    const my = ++loadSeq;
+    return fontsReady.then(() => loadTemplate(tl && tl.template)).then(mod => {
+      if (my !== loadSeq) return null;            // a newer timeline arrived while the template loaded
+      CUR = mount(tl, aud || null, mod);
       fit();
       CUR.seek(lastT);
       return CUR.ready();
-    }).then(() => { CUR.seek(lastT); window.__ready = true; });
+    }).then(() => { if (my !== loadSeq) return; CUR.seek(lastT); window.__ready = true; });
   };
 
   if (window.TIMELINE) window.loadTimeline(window.TIMELINE, window.AUDIO);

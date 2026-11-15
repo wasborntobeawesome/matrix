@@ -1,11 +1,11 @@
 /* Video Studio UI — plain JS, no build step.
- * Routes: #/ (projects)   #/p/<id> (editor)
+ * Routes: #/ (projects)   #/p/<id> (editor)   #/ai (AI page, ai.js)   #/monitor (system monitor, monitor.js)
  */
 (() => {
   "use strict";
-  const STR = window.STRINGS;
+  // UI language (EN / OʻZ): strings.js builds window.STRINGS for the language remembered in this browser
   const t = (key, vars) => {
-    let s = key.split(".").reduce((o, k) => (o == null ? o : o[k]), STR);
+    let s = key.split(".").reduce((o, k) => (o == null ? o : o[k]), window.STRINGS);
     if (s == null) s = key;
     if (vars) s = String(s).replace(/\{(\w+)\}/g, (_, k) => (vars[k] ?? ""));
     return s;
@@ -28,19 +28,43 @@
     return e;
   }
   const LANGS = ["uz", "ru", "en", "ar"];
-  const FORMATS = ["9:16", "16:9"];
+  const FORMATS = ["9:16", "1:1", "16:9"];
+  const DEFAULT_VOICE = { uz: "uz-UZ-MadinaNeural", ru: "ru-RU-SvetlanaNeural", en: "en-US-AvaNeural", ar: "ar-SA-ZariyahNeural" };
+  const TEXT_FIELDS = ["say", "kicker", "headline", "sub", "callout", "button", "url", "stat"];
+  // a translation map {"uz": "...", "ru": "..."} (not a screens item {asset, label})
+  const isMap = v => !!v && typeof v === "object" && !Array.isArray(v) && !("asset" in v);
+  const fmtSlug = f => String(f || "").replace(":", "x");
   const LAYOUTS = ["hero", "screen", "screens", "chips", "stat", "list", "cta", "presenter"];
   const DEVICES = ["phone", "browser", "none"];
   const fmtBytes = n => (n > 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1e3))} KB`);
   const fmtTime = s => { s = Math.max(0, s || 0); return `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, "0")}`; };
   const ago = ts => {
     const d = Date.now() / 1000 - ts;
-    if (d < 60) return "just now";
-    if (d < 3600) return `${Math.round(d / 60)} min ago`;
-    if (d < 86400) return `${Math.round(d / 3600)} h ago`;
-    return new Date(ts * 1000).toLocaleDateString();
+    if (d < 60) return t("justNow");
+    if (d < 3600) return t("minAgo", { n: Math.round(d / 60) });
+    if (d < 86400) return t("hAgo", { n: Math.round(d / 3600) });
+    return fmtDate(ts, false);
   };
-  document.querySelectorAll("[data-t]").forEach(n => { n.textContent = t(n.dataset.t); });
+  // dates: the browser's Uzbek locale data is incomplete ("M11"), so Uzbek uses its own month names
+  const UZ_MONTHS = ["yan", "fev", "mar", "apr", "may", "iyn", "iyl", "avg", "sen", "okt", "noy", "dek"];
+  function fmtDate(ts, withTime = true) {
+    const d = new Date(ts * 1000);
+    if (uiLang() !== "uz") return withTime ? d.toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", second: "2-digit" })
+      : d.toLocaleDateString();
+    const p2 = n => String(n).padStart(2, "0");
+    return `${d.getDate()}-${UZ_MONTHS[d.getMonth()]}` + (withTime ? `, ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}` : ` ${d.getFullYear()}`);
+  }
+  const uiLang = () => window.UI_LANG || "en";
+  // a manifest label may be a string or {"en": "...", "uz": "..."}
+  const lbl = v => (v && typeof v === "object" ? (v[uiLang()] || v.en || Object.values(v)[0] || "") : (v == null ? "" : String(v)));
+  function applyStatic() {
+    document.documentElement.lang = uiLang();
+    document.querySelectorAll("[data-t]").forEach(n => { n.textContent = t(n.dataset.t); });
+    const seg = document.getElementById("ui-lang");
+    if (seg) seg.replaceChildren(...["en", "uz"].map(l => el("button", { type: "button", class: `seg-btn ${uiLang() === l ? "on" : ""}`,
+      "aria-pressed": uiLang() === l ? "true" : "false", title: l === "en" ? "English interface" : "Oʻzbekcha interfeys",
+      onclick: () => { if (l !== uiLang()) { window.setUiLang(l); applyStatic(); route(); } } }, l === "en" ? "EN" : "OʻZ")));
+  }
 
   // ---------------------------------------------------------------- API
   async function api(method, url, body, isForm) {
@@ -94,7 +118,7 @@
     toast(t("copied"), "ok");
   }
 
-  window.SUI = { el, t, api, toast, modal, confirmBox, fmtBytes, ago, $, $$ };
+  window.SUI = { el, t, api, toast, modal, confirmBox, fmtBytes, ago, $, $$, lbl, uiLang };
 
   // ---------------------------------------------------------------- Ovoz status
   const OV = { ok: null, models: [], error: "" };
@@ -107,10 +131,10 @@
         try { OV.models = await api("GET", "/api/voices"); } catch { OV.models = []; }
       }
       if (was !== OV.ok) document.dispatchEvent(new Event("ovoz"));
-    } catch { OV.ok = false; OV.error = "studio server not reachable"; }
+    } catch { OV.ok = false; OV.error = t("serverDown"); }
     const p = $("#ovoz");
     p.className = `pill ${OV.ok ? "ok" : "bad"}`;
-    p.textContent = OV.ok ? t("ovozOk") : "Ovoz TTS offline";
+    p.textContent = OV.ok ? t("ovozOk") : t("ovozOffline");
     p.title = OV.ok ? OV.url : OV.error;
     const b = $("#banner");
     if (!OV.ok && location.hash.startsWith("#/p/")) { b.hidden = false; b.textContent = t("ovozDown", { url: OV.url || "localhost:8000" }); }
@@ -128,8 +152,13 @@
     $("#crumb").innerHTML = "";
     $("#savestate").textContent = "";
     $("#ai-link").classList.toggle("on", location.hash.startsWith("#/ai"));
+    const sm = $("#sysmon");
+    if (sm) sm.classList.toggle("on", location.hash.startsWith("#/monitor"));
+    if (window.MonUI) window.MonUI.initWidget();
+    if (window.AIUI && window.AIUI.initHeader) window.AIUI.initHeader();
     if (m) cleanup = Editor(view, m[1]);
     else if (location.hash.startsWith("#/ai")) cleanup = window.AIUI.page(view);
+    else if (location.hash.startsWith("#/monitor")) cleanup = window.MonUI.page(view);
     else cleanup = ProjectsPage(view);
     checkOvoz();
   }
@@ -169,7 +198,7 @@
             el("div", { class: "card-thumb" }, thumb),
             el("div", { class: "card-body" },
               el("h3", {}, p.title || p.id),
-              el("div", { class: "muted small" }, `${p.product} · ${t("langs." + p.language)} · ${p.format}`),
+              el("div", { class: "muted small" }, `${p.product} · ${(p.languages || [p.language]).map(l => l.toUpperCase()).join(" ")} · ${(p.formats || [p.format]).join(" ")}`),
               el("div", { class: "muted small" }, [t("scenesCount", { n: p.scenes }), t("assetsCount", { n: p.assets }), t("rendersCount", { n: p.renders })].join(" · ")),
               el("div", { class: "muted small" }, t("updated", { when: ago(p.updated) }) + (p.source !== "ui" ? ` · ${p.source}` : "")))),
           el("button", { class: "icon-btn danger card-del", "aria-label": `${t("delete")} ${p.title}`, title: t("delete"),
@@ -218,14 +247,21 @@
   function newProjectDialog() {
     const name = el("input", { type: "text", value: "", placeholder: "Acme Notes", id: "np-name" });
     const lang = el("select", { id: "np-lang" }, LANGS.map(l => el("option", { value: l, selected: l === "en" }, t("langs." + l))));
-    const fmt = el("select", { id: "np-fmt" }, FORMATS.map(f => el("option", { value: f }, t("formats." + f))));
+    const more = el("div", { class: "row gap wrap", role: "group", "aria-label": t("moreLanguages") }, LANGS.map(l =>
+      el("label", { class: "row gap small chk" }, el("input", { type: "checkbox", value: l, "data-lang": l }), t("langs." + l))));
+    const fmts = el("div", { class: "row gap wrap", role: "group", "aria-label": t("formats_") }, FORMATS.map(f =>
+      el("label", { class: "row gap small chk" }, el("input", { type: "checkbox", value: f, checked: f === "9:16" }), t("formats." + f))));
     modal(t("newProject"), el("div", { class: "form" },
       el("label", { for: "np-name" }, t("productName")), name,
-      el("label", { for: "np-lang" }, t("language")), lang,
-      el("label", { for: "np-fmt" }, t("format")), fmt), [
+      el("label", { for: "np-lang" }, t("mainLanguage")), lang,
+      el("span", { class: "lbl small muted" }, t("moreLanguages")), more,
+      el("span", { class: "lbl small muted" }, t("formats_")), fmts), [
       { label: t("cancel"), onClick: () => {} },
       { label: t("create"), primary: true, onClick: () => {
-        api("POST", "/api/projects?source=ui", { blank: true, product: name.value.trim() || "My product", language: lang.value, format: fmt.value })
+        const languages = [lang.value, ...$$("input:checked", more).map(i => i.value).filter(l => l !== lang.value)];
+        const formats = $$("input:checked", fmts).map(i => i.value);
+        api("POST", "/api/projects?source=ui", { blank: true, product: name.value.trim() || "My product", language: lang.value,
+          languages, formats: formats.length ? formats : ["9:16"] })
           .then(r => { location.hash = `#/p/${r.id}`; }).catch(e => toast(e.message, "error"));
       } }]);
   }
@@ -246,7 +282,52 @@
     const S = {
       pid, project: null, brief: null, assets: {}, renders: [], warnings: [], tl: null,
       sel: 0, tab: "scene", version: 0, savedVersion: 0, saving: false, jobs: {}, alive: true,
+      lang: null, fmt: null, formLang: null, alignPolls: 0,
+      templates: [], tplPreview: null,
     };
+    // undo / redo: snapshots of the brief (JSON) at the start of each burst of edits
+    const UN = { undo: [], redo: [], stable: null, burst: false, timer: null };
+    // ---------- languages / translations ----------
+    const main = () => S.brief.language;
+    const langs = () => (S.brief.languages && S.brief.languages.length ? S.brief.languages : [S.brief.language]);
+    const fmts = () => (S.brief.formats && S.brief.formats.length ? S.brief.formats : [S.brief.format]);
+    const multi = () => langs().length > 1;
+    const getT = (v, lg) => (isMap(v) ? (v[lg] || "") : v == null ? "" : String(v));
+    // a plain string in a non-main language tab: the same text is used for every language
+    const shared = (v, lg) => multi() && !isMap(v) && lg !== main() && v != null && v !== "";
+    function setT(v, lg, val) {
+      if (!multi()) return val;
+      if (isMap(v)) { const m = { ...v }; if (val) m[lg] = val; else delete m[lg]; return Object.keys(m).length ? m : ""; }
+      if (lg === main()) return val;                  // a plain string stays plain in the main language
+      const m = {};
+      if (v) m[main()] = v;
+      if (val) m[lg] = val;
+      return Object.keys(m).length ? m : "";
+    }
+    function missingFor(sc) {           // {lang: [fields]} (same rules as brief.missing_translations)
+      const out = {};
+      if (!multi()) return out;
+      for (const lg of langs()) {
+        const f = [];
+        for (const k of TEXT_FIELDS) {
+          const v = sc[k];
+          if (isMap(v) && !String(v[lg] || "").trim()) f.push(k);
+          else if (k === "say" && typeof v === "string" && v.trim() && lg !== main()) f.push(k);
+        }
+        (sc.items || []).forEach((it, i) => {
+          if (isMap(it) && !it[lg]) f.push(`items[${i + 1}]`);
+          else if (it && typeof it === "object" && it.asset && isMap(it.label) && !it.label[lg]) f.push(`items[${i + 1}].label`);
+        });
+        if (f.length) out[lg] = f;
+      }
+      return out;
+    }
+    function syncLangState() {
+      if (!S.brief.voices) S.brief.voices = { [main()]: S.brief.voice };
+      if (!langs().includes(S.lang)) S.lang = main();
+      if (!fmts().includes(S.fmt)) S.fmt = fmts()[0];
+      if (S.formLang !== "all" || !multi()) S.formLang = S.lang;
+    }
     const timers = [];
     let saveTimer = null;
 
@@ -256,23 +337,53 @@
     const left = el("aside", { class: "col col-scenes" },
       el("div", { class: "col-head" }, el("h2", {}, t("scenes")), el("span", { class: "muted small", id: "total-len" })),
       sceneList,
-      el("div", { class: "add-scene" }, addSel, el("button", { class: "btn", onclick: () => addScene(addSel.value) }, "+ " + t("addScene"))));
+      el("div", { class: "add-scene" }, addSel, el("button", { class: "btn", onclick: () => addScene(addSel.value) }, "+ " + t("addScene"))),
+      el("button", { class: "btn followup-btn", title: t("fu.help"), onclick: () => followupDialog() }, "✦ " + t("fu.button")));
     const tabs = el("div", { class: "tabs", role: "tablist" });
     const panel = el("div", { class: "tab-panel", role: "tabpanel" });
     const mid = el("section", { class: "col col-form" }, tabs, panel);
     const settings = el("div", { class: "settings" });
     const previewBox = el("div", { class: "preview-box" });
+    const pvBar = el("div", { class: "pv-bar" });
+    const coverBox = el("div", { class: "cover-box muted small" });
     const transport = el("div", { class: "transport" });
     const actions = el("div", { class: "actions" });
     const jobBox = el("div", { class: "jobs", "aria-live": "polite" });
     const makeBox = el("div", { class: "make", "aria-live": "polite" });
     const rendersBox = el("div", { class: "renders" });
-    const right = el("section", { class: "col col-preview", "aria-label": t("preview") }, previewBox, transport, actions, makeBox, jobBox, rendersBox);
+    const right = el("section", { class: "col col-preview", "aria-label": t("preview") }, pvBar, previewBox, transport, coverBox, actions, makeBox, jobBox, rendersBox);
+    // language + format of the live preview (and of the scene form's language tab)
+    function renderPreviewBar() {
+      const kids = [];
+      if (multi()) kids.push(el("div", { class: "seg small-seg", role: "radiogroup", "aria-label": t("previewLanguage") },
+        langs().map(l => el("button", { type: "button", class: `seg-btn ${l === S.lang ? "on" : ""}`, role: "radio",
+          "aria-checked": l === S.lang ? "true" : "false", title: t("langs." + l), onclick: () => setLang(l) }, l.toUpperCase()))));
+      if (fmts().length > 1) kids.push(el("div", { class: "seg small-seg", role: "radiogroup", "aria-label": t("previewFormat") },
+        fmts().map(f2 => el("button", { type: "button", class: `seg-btn ${f2 === S.fmt ? "on" : ""}`, role: "radio",
+          "aria-checked": f2 === S.fmt ? "true" : "false", onclick: () => { S.fmt = f2; renderPreviewBar(); refreshTimeline(); } }, f2))));
+      const reload = el("button", { type: "button", class: "icon-btn pv-reload", title: t("tpl.reloadHelp"), "aria-label": t("tpl.reload"),
+        onclick: async () => { await loadTemplates(); renderSettings(); refreshTimeline(); } }, "↻");
+      pvBar.hidden = false;
+      pvBar.replaceChildren(...(kids.length ? [el("span", { class: "muted small" }, t("previewIn")), ...kids] : []), el("span", { class: "grow" }), reload);
+    }
+    function renderCover() {
+      const c = S.brief.cover;
+      const at = c && c.scene ? t("coverAt", { scene: c.scene, t: (c.t ?? 0).toFixed(1) }) : t("coverDefault");
+      coverBox.replaceChildren(el("span", {}, "🖼 " + at),
+        el("button", { class: "btn small", title: t("coverSetHelp"), onclick: () => {
+          const tt = preview.t, sc2 = S.tl && S.tl.scenes.find(x => tt >= x.start && tt < x.end);
+          if (!sc2) return;
+          S.brief.cover = { scene: sc2.id, t: Math.round((tt - sc2.start) * 100) / 100 };
+          changed({ now: true }); renderCover(); toast(t("coverSet"), "ok");
+        } }, t("coverSet")),
+        c ? el("button", { class: "btn small", onclick: () => { delete S.brief.cover; changed({ now: true }); renderCover(); } }, t("coverReset")) : "");
+    }
     view.append(el("div", { class: "editor" }, settings, el("div", { class: "editor-grid" }, left, mid, right)));
 
     // ---------- save ----------
     function setSave(state) { $("#savestate").textContent = state ? t(state) : ""; $("#savestate").className = `savestate ${state || ""}`; }
     function changed(opts = {}) {
+      noteChange();
       S.version++;
       setSave("saving");
       clearTimeout(saveTimer);
@@ -297,20 +408,76 @@
       } finally { S.saving = false; }
     }
 
+    // ---------- undo / redo ----------
+    function noteChange() {
+      if (!UN.burst) {
+        if (UN.stable != null) { UN.undo.push(UN.stable); if (UN.undo.length > 200) UN.undo.shift(); }
+        UN.redo = [];
+        UN.burst = true;
+      }
+      clearTimeout(UN.timer);
+      UN.timer = setTimeout(settle, 700);
+      renderUndo();
+    }
+    function settle() { clearTimeout(UN.timer); UN.burst = false; UN.stable = JSON.stringify(S.brief); renderUndo(); }
+    function applyState(json, { saved = false } = {}) {
+      UN.stable = json;
+      adoptBrief(JSON.parse(json));
+      renderPreviewBar(); renderCover(); renderActions();
+      S.version++;
+      if (saved) { S.savedVersion = S.version; refreshTimeline(); }
+      else { setSave("saving"); clearTimeout(saveTimer); saveTimer = setTimeout(save, 0); }
+      renderUndo();
+    }
+    function undo() {
+      if (UN.burst) settle();
+      if (!UN.undo.length) return;
+      UN.redo.push(UN.stable);
+      applyState(UN.undo.pop());
+      toast(t("undone"), "info", 1600);
+    }
+    function redo() {
+      if (UN.burst) settle();
+      if (!UN.redo.length) return;
+      UN.undo.push(UN.stable);
+      applyState(UN.redo.pop());
+      toast(t("redone"), "info", 1600);
+    }
+    const undoBtns = { u: null, r: null };
+    function renderUndo() {
+      if (!undoBtns.u) return;
+      undoBtns.u.disabled = !(UN.undo.length || (UN.burst && UN.stable != null));
+      undoBtns.r.disabled = !UN.redo.length || UN.burst;
+    }
+
     // ---------- data ----------
     async function loadProject() {
       const d = await api("GET", `/api/projects/${pid}`);
       S.project = d; S.brief = d.brief; S.assets = d.assets; S.renders = d.renders; S.warnings = d.warnings;
+      S.lang = S.brief.language; S.fmt = S.brief.format;
+      syncLangState();
       document.title = `${S.brief.title} — ${t("appName")}`;
       for (const j of d.jobs || []) if (j.status === "queued" || j.status === "running") trackJob(j);
       S.aiJobs = d.ai_jobs || [];
       S.make = d.make && d.make.id ? d.make : null;
       for (const j of S.aiJobs) S.aiPrev[j.id] = j.status;
     }
+    let alignTimer = null;
     async function refreshTimeline() {
       try {
-        S.tl = await api("GET", `/api/projects/${pid}/timeline`);
+        syncLangState();
+        const tq = S.tplPreview ? `&template=${encodeURIComponent(S.tplPreview)}` : "";
+        S.tl = await api("GET", `/api/projects/${pid}/timeline?lang=${S.lang}&format=${encodeURIComponent(S.fmt)}${tq}`);
         preview.load(S.tl);
+        if (S.tab === "scene" && S.formSig != null && !panel.contains(document.activeElement)) {
+          const sc0 = S.brief.scenes[S.sel], st0 = sc0 && sceneTl(sc0.id);
+          if (`${st0 && st0.voiced}|${st0 && st0.timing}` !== S.formSig) renderSceneForm();
+        }
+        // word timing runs in the background (faster-whisper); pick it up when it is ready
+        clearTimeout(alignTimer);
+        const tm = S.tl.timing;
+        if (tm && tm.aligned < tm.voiced && S.alignPolls < 12) { S.alignPolls++; alignTimer = setTimeout(() => { if (S.alive) refreshTimeline(); }, 2500); }
+        else if (tm && tm.aligned >= tm.voiced) S.alignPolls = 0;
         renderSceneList();
         renderActions();
         if (S.tab === "ai") updatePresenterStatus();
@@ -325,17 +492,22 @@
     function adoptBrief(nb) {
       const selId = S.brief.scenes[S.sel] && S.brief.scenes[S.sel].id;
       S.brief = nb;
+      syncLangState();
       const i = S.brief.scenes.findIndex(x => x.id === selId);
       S.sel = i >= 0 ? i : Math.min(S.sel, S.brief.scenes.length - 1);
       renderCrumb(); renderSettings(); renderSceneList(); renderPanel();
-      preview.setFormat(S.brief.format);
+      preview.setFormat(S.fmt);
     }
 
     // ---------- crumb + settings bar ----------
     function renderCrumb() {
       const title = el("input", { class: "title-input", value: S.brief.title, "aria-label": t("title"),
         oninput: e => { S.brief.title = e.target.value; document.title = `${e.target.value} — ${t("appName")}`; changed(); } });
-      $("#crumb").replaceChildren(el("a", { href: "#/", class: "back" }, "← " + t("back")), title);
+      undoBtns.u = el("button", { class: "icon-btn undo-btn", title: t("undoTip"), "aria-label": t("undo"), onclick: undo }, "↶");
+      undoBtns.r = el("button", { class: "icon-btn undo-btn", title: t("redoTip"), "aria-label": t("redo"), onclick: redo }, "↷");
+      $("#crumb").replaceChildren(el("a", { href: "#/", class: "back" }, "← " + t("back")), title,
+        el("div", { class: "row undo-row", role: "group", "aria-label": t("undo") }, undoBtns.u, undoBtns.r));
+      renderUndo();
     }
     function field(label, input, cls = "") {
       const id = `f-${Math.random().toString(36).slice(2, 8)}`;
@@ -344,9 +516,7 @@
     }
     function modelsFor(lang) { return OV.models.filter(m => (m.languages || []).includes(lang)); }
     function voicesFor(m, lang) { return (m && m.voices || []).filter(v => !v.lang || v.lang === lang || v.cross_lingual); }
-    function fixVoice() {
-      const v = S.brief.voice, lang = S.brief.language;
-      if (!OV.models.length) return false;
+    function fixVoiceOf(v, lang) {
       let m = OV.models.find(x => x.id === v.model);
       let changedAny = false;
       if (!m || !(m.languages || []).includes(lang) || !m.available) {
@@ -356,40 +526,110 @@
       }
       const vs = voicesFor(m, lang);
       if (m && !vs.find(x => x.id === v.voice)) {
-        const pick = vs.find(x => x.lang === lang) || vs[0];
+        const pick = vs.find(x => x.id === DEFAULT_VOICE[lang]) || vs.find(x => x.lang === lang) || vs[0];
         if (pick) { v.voice = pick.id; changedAny = true; }
       }
       if (m && v.style && !(m.styles || []).find(s => s.id === v.style)) { delete v.style; changedAny = true; }
       return changedAny;
     }
+    function fixVoice() {
+      const b = S.brief;
+      if (!OV.models.length) return false;
+      if (!b.voices) b.voices = {};
+      let any = false;
+      for (const lg of langs()) {
+        if (!b.voices[lg]) { b.voices[lg] = lg === main() && b.voice ? b.voice : { model: "edge", voice: DEFAULT_VOICE[lg], rate: 0 }; any = true; }
+        if (fixVoiceOf(b.voices[lg], lg)) any = true;
+      }
+      b.voice = b.voices[main()];
+      return any;
+    }
+    function toggleLang(l) {
+      const b = S.brief;
+      let ls = [...langs()];
+      if (ls.includes(l)) { if (ls.length === 1) return; ls = ls.filter(x => x !== l); }
+      else ls.push(l);
+      b.languages = ls;
+      if (!ls.includes(b.language)) b.language = ls[0];
+      if (!b.voices) b.voices = {};
+      if (!b.voices[l]) b.voices[l] = { model: "edge", voice: DEFAULT_VOICE[l], rate: 0 };
+      b.voice = b.voices[b.language];
+      fixVoice(); syncLangState();
+      renderSettings(); renderSceneList(); renderPanel(); renderActions();
+      changed({ now: true });
+    }
+    function setMainLang(l) {
+      const b = S.brief;
+      b.language = l;
+      b.languages = [l, ...langs().filter(x => x !== l)];
+      if (!b.voices) b.voices = {};
+      if (!b.voices[l]) b.voices[l] = { model: "edge", voice: DEFAULT_VOICE[l], rate: 0 };
+      b.voice = b.voices[l];
+      fixVoice(); syncLangState();
+      renderSettings(); renderSceneList(); renderPanel();
+      changed({ now: true });
+    }
+    function toggleFmt(f) {
+      const b = S.brief;
+      let fs = [...fmts()];
+      if (fs.includes(f)) { if (fs.length === 1) return; fs = fs.filter(x => x !== f); }
+      else fs.push(f);
+      b.formats = FORMATS.filter(x => fs.includes(x));
+      if (!b.formats.includes(b.format)) b.format = b.formats[0];
+      b.formats = [b.format, ...b.formats.filter(x => x !== b.format)];
+      syncLangState();
+      renderSettings(); renderPreviewBar(); renderActions();
+      changed({ now: true });
+    }
+    function setLang(l) {          // the language being edited + previewed
+      if (l === S.lang && S.formLang !== "all") return;
+      S.lang = l;
+      if (S.formLang !== "all") S.formLang = l;
+      renderSettings(); renderPreviewBar(); renderSceneList(); renderPanel();
+      refreshTimeline();
+    }
     function renderSettings() {
       const b = S.brief;
+      fixVoice();
       const product = el("input", { type: "text", value: b.product, oninput: e => { b.product = e.target.value; changed(); } });
-      const lang = el("select", { onchange: e => { b.language = e.target.value; fixVoice(); renderSettings(); changed(); } },
-        LANGS.map(l => el("option", { value: l, selected: l === b.language }, t("langs." + l))));
-      const fmt = el("select", { onchange: e => { b.format = e.target.value; preview.setFormat(b.format); changed(); } },
-        FORMATS.map(f => el("option", { value: f, selected: f === b.format }, t("formats." + f))));
-      const ms = modelsFor(b.language);
-      const model = el("select", { onchange: e => { b.voice.model = e.target.value; fixVoice(); renderSettings(); changed(); } },
-        OV.models.length ? ms.map(m => el("option", { value: m.id, selected: m.id === b.voice.model, disabled: !m.available },
-          m.name + (m.available ? "" : " (unavailable)"))) : el("option", { value: b.voice.model }, b.voice.model));
-      const cur = OV.models.find(m => m.id === b.voice.model);
-      const voice = el("select", { onchange: e => { b.voice.voice = e.target.value; changed(); } },
-        cur ? voicesFor(cur, b.language).map(v => el("option", { value: v.id, selected: v.id === b.voice.voice }, v.name))
-          : el("option", { value: b.voice.voice }, b.voice.voice));
-      const rate = el("input", { type: "number", min: -50, max: 100, step: 5, value: b.voice.rate || 0, class: "narrow",
-        onchange: e => { b.voice.rate = Math.max(-50, Math.min(100, parseInt(e.target.value, 10) || 0)); changed(); } });
-      const styles = cur && cur.styles && cur.styles.length ? el("select", { onchange: e => { if (e.target.value) b.voice.style = e.target.value; else delete b.voice.style; changed(); } },
-        el("option", { value: "" }, t("none")), cur.styles.map(s => el("option", { value: s.id, selected: s.id === b.voice.style }, s.name))) : null;
+      const langSeg = el("div", { class: "seg toggles", role: "group", "aria-label": t("languages") }, LANGS.map(l => el("button", {
+        type: "button", class: `seg-btn ${langs().includes(l) ? "on" : ""}`, "aria-pressed": langs().includes(l) ? "true" : "false",
+        title: t("langs." + l), onclick: () => toggleLang(l) }, l.toUpperCase() + (l === main() && multi() ? " ★" : ""))));
+      const mainSel = multi() ? el("select", { onchange: e => setMainLang(e.target.value) },
+        langs().map(l => el("option", { value: l, selected: l === main() }, t("langs." + l)))) : null;
+      const fmtSeg = el("div", { class: "seg toggles", role: "group", "aria-label": t("formats_") }, FORMATS.map(f => el("button", {
+        type: "button", class: `seg-btn ${fmts().includes(f) ? "on" : ""}`, "aria-pressed": fmts().includes(f) ? "true" : "false",
+        title: t("formats." + f), onclick: () => toggleFmt(f) }, f)));
+      const lg = S.lang;
+      const v = b.voices[lg] || (b.voices[lg] = { model: "edge", voice: DEFAULT_VOICE[lg], rate: 0 });
+      const syncMain = () => { b.voice = b.voices[main()]; };
+      const ms = modelsFor(lg);
+      const model = el("select", { onchange: e => { v.model = e.target.value; fixVoiceOf(v, lg); syncMain(); renderSettings(); changed(); } },
+        OV.models.length ? ms.map(m => el("option", { value: m.id, selected: m.id === v.model, disabled: !m.available },
+          m.name + (m.available ? "" : ` (${t("unavailable")})`))) : el("option", { value: v.model }, v.model));
+      const cur = OV.models.find(m => m.id === v.model);
+      const voice = el("select", { onchange: e => { v.voice = e.target.value; syncMain(); changed(); } },
+        cur ? voicesFor(cur, lg).map(x => el("option", { value: x.id, selected: x.id === v.voice }, x.name))
+          : el("option", { value: v.voice }, v.voice));
+      const rate = el("input", { type: "number", min: -50, max: 100, step: 5, value: v.rate || 0, class: "narrow",
+        onchange: e => { v.rate = Math.max(-50, Math.min(100, parseInt(e.target.value, 10) || 0)); syncMain(); changed(); } });
+      const styles = cur && cur.styles && cur.styles.length ? el("select", { onchange: e => { if (e.target.value) v.style = e.target.value; else delete v.style; syncMain(); changed(); } },
+        el("option", { value: "" }, t("none")), cur.styles.map(s2 => el("option", { value: s2.id, selected: s2.id === v.style }, s2.name))) : null;
       const color = k => el("input", { type: "color", value: b.brand[k], "aria-label": t(k), title: t(k),
         oninput: e => { b.brand[k] = e.target.value; changed(); } });
       const imgs = Object.entries(S.assets).filter(([, m]) => m.type === "image").map(([n]) => n);
       const logo = el("select", { onchange: e => { if (e.target.value) b.brand.logo = e.target.value; else delete b.brand.logo; changed(); } },
         el("option", { value: "" }, t("none")), imgs.map(n => el("option", { value: n, selected: n === b.brand.logo }, n)));
       const caps = el("input", { type: "checkbox", checked: b.captions !== false, onchange: e => { b.captions = e.target.checked; changed(); } });
+      const vl = multi() ? ` (${lg.toUpperCase()})` : "";
       settings.replaceChildren(...[
-        field(t("product"), product), field(t("language"), lang), field(t("format"), fmt),
-        field(t("voiceModel"), model), field(t("voice"), voice), field(t("rate"), rate, "narrow"),
+        el("div", { class: "field auto" }, el("span", { class: "lbl" }, t("tpl.template")), templateButton()),
+        el("div", { class: "field auto" }, el("span", { class: "lbl" }, t("tx.transition")), transitionButton()),
+        field(t("product"), product),
+        el("div", { class: "field auto" }, el("span", { class: "lbl" }, t("languages")), langSeg),
+        mainSel ? field(t("mainLanguage"), mainSel, "narrow2") : null,
+        el("div", { class: "field auto" }, el("span", { class: "lbl" }, t("formats_")), fmtSeg),
+        field(t("voiceModel") + vl, model), field(t("voice") + vl, voice), field(t("rate"), rate, "narrow"),
         styles ? field(t("style"), styles) : null,
         el("div", { class: "field colours" }, el("span", { class: "lbl" }, t("colours")), el("div", { class: "row" }, color("primary"), color("accent"), color("background"))),
         field(t("logo"), logo), field(t("captions"), caps, "check")].filter(Boolean));
@@ -405,13 +645,15 @@
 
     // ---------- scene list ----------
     function sceneTl(id) { return S.tl && S.tl.scenes.find(s => s.id === id); }
+    let listTimer = null;
+    function renderSceneListSoon() { clearTimeout(listTimer); listTimer = setTimeout(() => { if (S.alive) renderSceneList(); }, 250); }
     function renderSceneList() {
       sceneList.replaceChildren();
       const scenes = S.brief.scenes;
       scenes.forEach((sc, i) => {
         const st = sceneTl(sc.id);
         const voiced = st && st.voiced;
-        const hasSay = !!(sc.say || "").trim();
+        const hasSay = !!(getT(sc.say, S.lang).trim() || getT(sc.say, main()).trim());
         const li = el("li", { class: `scene-item ${i === S.sel ? "sel" : ""}`, draggable: "true", "data-i": i },
           el("button", { class: "scene-main", "aria-current": i === S.sel ? "true" : null,
             onclick: () => select(i),
@@ -424,7 +666,12 @@
                 sc.background && sc.background.type === "broll" ? el("span", { class: "lay lay-ai", title: t("ai.bgBroll") }, "✦ bg") : null,
                 el("span", { class: "sid" }, sc.id),
                 st ? el("span", { class: "dur muted" }, `${(st.end - st.start).toFixed(1)}s`) : null),
-              el("span", { class: "scene-say" }, sc.say || sc.headline || "—"))),
+              el("span", { class: "scene-badges" },
+                st && hasSay ? el("span", { class: `tbadge ${st.timing === "aligned" ? "al" : "es"}`,
+                  title: st.timing === "aligned" ? t("timingAlignedHelp") : t("timingEstimatedHelp") },
+                  st.timing === "aligned" ? t("timingAligned") : t("timingEstimated")) : null,
+                ...Object.keys(missingFor(sc)).map(lg => el("span", { class: "mbadge", title: t("missingIn", { lang: t("langs." + lg), list: missingFor(sc)[lg].join(", ") }) }, `⚠ ${lg.toUpperCase()}`))),
+              el("span", { class: "scene-say", dir: S.lang === "ar" ? "rtl" : "auto" }, getT(sc.say, S.lang) || getT(sc.say, main()) || getT(sc.headline, S.lang) || "—"))),
           el("div", { class: "scene-tools" },
             hasSay ? el("button", { class: `icon-btn voice-dot ${voiced ? "on" : ""}`, title: voiced ? `${t("listen")} (${t("voiced")})` : t("generateThis"),
               "aria-label": voiced ? `${t("listen")} ${sc.id}` : `${t("generateThis")} ${sc.id}`, onclick: () => listen(sc.id, voiced) }, voiced ? "▶" : "◌") : null,
@@ -493,12 +740,11 @@
     function addScene(layout) {
       const firstImg = Object.entries(S.assets).find(([, m]) => m.type === "image");
       const sc = { id: uniqueId(layout), layout, say: "" };
-      if (layout === "hero" || layout === "cta") sc.headline = S.brief.product;
+      if (layout === "hero" || layout === "cta" || layout === "presenter") sc.headline = S.brief.product;
       if (layout === "screen") { sc.device = "phone"; sc.asset = firstImg ? firstImg[0] : ""; sc.headline = "New feature"; }
       if (layout === "screens") { sc.device = "phone"; sc.items = Object.entries(S.assets).filter(([, m]) => m.type === "image").slice(0, 2).map(([n]) => ({ asset: n })); sc.headline = "Feature tour"; }
       if (layout === "chips" || layout === "list") { sc.headline = "Highlights"; sc.items = ["One", "Two", "Three"]; }
       if (layout === "stat") { sc.stat = "3x"; sc.headline = "faster"; }
-      if (layout === "presenter") { sc.headline = S.brief.product; }
       const at = S.sel + 1;
       S.brief.scenes.splice(at, 0, sc);
       S.sel = at;
@@ -509,17 +755,20 @@
     // ---------- tabs ----------
     function setTab(name) {
       S.tab = name;
-      tabs.replaceChildren(...["scene", "assets", "ai", "json"].map(k => el("button", {
+      tabs.replaceChildren(...["scene", "assets", "music", "ai", "history", "json"].map(k => el("button", {
         class: `tab ${k === name ? "on" : ""}`, role: "tab", "aria-selected": k === name ? "true" : "false",
-        onclick: () => setTab(k) }, t({ scene: "tabScene", assets: "tabAssets", ai: "tabAi", json: "tabJson" }[k]) +
-        (k === "assets" ? ` (${Object.keys(S.assets).length})` : ""))));
+        onclick: () => setTab(k) }, t({ scene: "tabScene", assets: "tabAssets", music: "tabMusic", ai: "tabAi", history: "tabHistory", json: "tabJson" }[k]) +
+        (k === "assets" ? ` (${Object.keys(S.assets).length})` : "") +
+        (k === "music" && S.brief.music && S.brief.music.track ? " ♪" : ""))));
       renderPanel();
       if (name === "ai") pollAi();
     }
     function renderPanel() {
       if (S.tab === "scene") renderSceneForm();
       else if (S.tab === "assets") renderAssets();
+      else if (S.tab === "music") renderMusic();
       else if (S.tab === "ai") renderAiTab();
+      else if (S.tab === "history") renderHistory();
       else renderJson();
     }
 
@@ -528,13 +777,45 @@
       const sc = S.brief.scenes[S.sel];
       if (!sc) { panel.replaceChildren(el("p", { class: "empty" }, t("noScene"))); return; }
       const f = el("div", { class: "form scene-form" });
-      const upd = (k, v, opts) => { if (v === "" || v == null) delete sc[k]; else sc[k] = v; changed(opts); };
-      const text = (k, label, opts = {}) => {
-        const inp = el(opts.area ? "textarea" : "input", { type: "text", rows: opts.rows || 2, placeholder: opts.ph || "",
-          oninput: e => upd(k, e.target.value, { list: opts.list }) });
-        inp.value = sc[k] || "";
-        return field(label, inp, opts.cls);
+      const upd = (k, v, opts) => { if (v === "" || v == null) delete sc[k]; else sc[k] = v; changed(opts); refreshMissing(); };
+      const FL = S.formLang;
+      const ALL = FL === "all" && multi();
+      const dirOf = lg => (lg === "ar" ? "rtl" : "auto");
+      // one input bound to the translation of field k in language lg
+      const tInput = (k, lg, opts = {}) => {
+        const sh = shared(sc[k], lg);
+        const inp = el(opts.area ? "textarea" : "input", { type: "text", rows: opts.rows || 2, dir: dirOf(lg),
+          placeholder: sh ? `${sc[k]} — ${t("sameAllLangs")}` : (opts.ph || ""), "aria-label": ALL ? `${opts.label || k} (${lg})` : null,
+          oninput: e => upd(k, setT(sc[k], lg, e.target.value), { list: opts.list }) });
+        inp.value = sh ? "" : getT(sc[k], lg);
+        return inp;
       };
+      const text = (k, label, opts = {}) => {
+        if (!ALL) return field(label, tInput(k, FL, opts), opts.cls);
+        return el("div", { class: "field" }, el("span", { class: "lbl" }, label),
+          el("div", { class: "tr-grid", style: { gridTemplateColumns: `repeat(${langs().length}, minmax(0, 1fr))` } },
+            langs().map(lg => el("div", { class: `tr-cell ${(missingFor(sc)[lg] || []).includes(k) ? "miss" : ""}`, "data-k": k, "data-lg": lg },
+              el("span", { class: "tr-lang" }, lg.toUpperCase()), tInput(k, lg, { ...opts, label })))));
+      };
+      // translation tabs
+      const missBox = el("div", { class: "warn small miss-box", role: "status" });
+      const refreshMissing = () => {
+        const m = missingFor(sc);
+        const ks = Object.keys(m);
+        missBox.hidden = !ks.length;
+        missBox.replaceChildren(...(ks.length ? ["⚠ ", t("missingTitle"), " ", ...ks.map(lg => el("span", { class: "miss-l" }, `${lg.toUpperCase()}: ${m[lg].join(", ")}`))] : []));
+        $$(".ltab", f).forEach(b2 => { const lg = b2.dataset.lg; b2.classList.toggle("miss", !!m[lg]); });
+        $$(".tr-cell", f).forEach(c => c.classList.toggle("miss", (m[c.dataset.lg] || []).includes(c.dataset.k)));
+        renderSceneListSoon();
+      };
+      if (multi()) {
+        f.append(el("div", { class: "ltabs", role: "tablist", "aria-label": t("translations") },
+          ...langs().map(lg => el("button", { type: "button", role: "tab", class: `ltab ${FL === lg ? "on" : ""}`, "data-lg": lg,
+            "aria-selected": FL === lg ? "true" : "false", onclick: () => { S.formLang = lg; setLang(lg); } },
+            lg.toUpperCase() + (lg === main() ? " ★" : ""))),
+          el("button", { type: "button", role: "tab", class: `ltab all ${ALL ? "on" : ""}`, "aria-selected": ALL ? "true" : "false",
+            onclick: () => { S.formLang = "all"; renderSceneForm(); } }, "⇆ " + t("sideBySide"))), missBox);
+      }
       const num = (k, label, min, max, step, ph) => {
         const inp = el("input", { type: "number", min, max, step, placeholder: ph || "", class: "narrow",
           onchange: e => upd(k, e.target.value === "" ? null : Math.max(min, Math.min(max, parseFloat(e.target.value)))) });
@@ -555,30 +836,61 @@
       f.append(el("div", { class: "row gap wrap" }, field(t("layout"), lay), field(t("sceneId"), idIn)),
         el("p", { class: "muted small help" }, t("layoutHelp." + sc.layout)));
       // say
-      const sayIn = el("textarea", { rows: 3, class: "say", dir: S.brief.language === "ar" ? "rtl" : "auto" });
-      sayIn.value = sc.say || "";
-      const counter = el("div", { class: "muted small counter" });
-      const count = () => {
-        const n = (sayIn.value.trim().match(/\S+/g) || []).length;
-        const est = n ? Math.max(1, sayIn.value.trim().length / 14 + 0.25) : 0;
-        counter.textContent = (n > 18 ? t("tooManyWords", { n }) : t("words", { n })) + (n ? ` · ${t("estSeconds", { s: est.toFixed(1) })}` : "");
-        counter.classList.toggle("warn", n > 18);
-      };
-      sayIn.addEventListener("input", () => { sc.say = sayIn.value; count(); changed({ list: true }); });
-      count();
       const st = sceneTl(sc.id);
-      const vbtn = (sc.say || "").trim() ? el("button", { class: "btn small", onclick: () => listen(sc.id, st && st.voiced) },
-        st && st.voiced ? "▶ " + t("listen") : "◌ " + t("generateThis")) : null;
-      f.append(el("div", { class: "field" }, el("label", { for: "say-in" }, t("say")), Object.assign(sayIn, { id: "say-in" }),
-        el("div", { class: "row between" }, counter, vbtn)));
+      S.formSig = `${st && st.voiced}|${st && st.timing}`;
+      if (ALL) f.append(text("say", t("say"), { area: true, rows: 3, list: true }));
+      else {
+        const sh = shared(sc.say, FL);
+        const sayIn = el("textarea", { rows: 3, class: "say", dir: dirOf(FL), placeholder: sh ? `${sc.say} — ${t("sayNotTranslated")}` : "" });
+        sayIn.value = sh ? "" : getT(sc.say, FL);
+        const counter = el("div", { class: "muted small counter" });
+        const count = () => {
+          const n = (sayIn.value.trim().match(/\S+/g) || []).length;
+          const est = n ? Math.max(1, sayIn.value.trim().length / 14 + 0.25) : 0;
+          counter.textContent = (n > 18 ? t("tooManyWords", { n }) : t("words", { n })) + (n ? ` · ${t("estSeconds", { s: est.toFixed(1) })}` : "");
+          counter.classList.toggle("warn", n > 18);
+        };
+        sayIn.addEventListener("input", () => { upd("say", setT(sc.say, FL, sayIn.value), { list: true }); if (sc.say == null) sc.say = ""; count(); });
+        count();
+        const vbtn = getT(sc.say, FL).trim() ? el("button", { class: "btn small", onclick: () => listen(sc.id, st && st.voiced) },
+          st && st.voiced ? "▶ " + t("listen") : "◌ " + t("generateThis")) : null;
+        const timing = st && st.voiced ? el("span", { class: `tbadge ${st.timing === "aligned" ? "al" : "es"}`,
+          title: st.timing === "aligned" ? t("timingAlignedHelp") : t("timingEstimatedHelp") },
+          `${t("timing")}: ${st.timing === "aligned" ? t("timingAligned") : t("timingEstimated")}`) : null;
+        f.append(el("div", { class: "field" }, el("label", { for: "say-in" }, t("say") + (multi() ? ` · ${FL.toUpperCase()}` : "")),
+          Object.assign(sayIn, { id: "say-in" }), el("div", { class: "row between" }, counter, el("div", { class: "row gap" }, timing, vbtn))));
+      }
       // layout fields
       const L = sc.layout;
       if (L === "hero") f.append(text("kicker", t("kicker")), text("headline", t("headline")), text("sub", t("sub")));
       if (L === "chips" || L === "list") {
         f.append(text("headline", t("headline")));
-        const items = el("textarea", { rows: 5, oninput: e => { sc.items = e.target.value.split("\n").map(s => s.trim()).filter(Boolean); changed(); } });
-        items.value = (sc.items || []).map(x => (typeof x === "string" ? x : x.label || x.asset || "")).join("\n");
-        f.append(field(t("items"), items));
+        // items: one per line; other languages translate the main language's items line by line
+        const itemsFor = lg => {
+          const ta = el("textarea", { rows: 5, dir: dirOf(lg), "aria-label": `${t("items")} (${lg})`, oninput: e => {
+            const raw = e.target.value.split("\n");
+            const old = sc.items || [];
+            if (!multi()) sc.items = raw.map(x => x.trim()).filter(Boolean);
+            else if (lg === main()) {
+              sc.items = raw.map(x => x.trim()).filter(Boolean).map((ln, i) => (isMap(old[i]) ? { ...old[i], [lg]: ln } : ln));
+            } else {
+              sc.items = old.map((o, i) => {
+                const ln = (raw[i] || "").trim();
+                if (isMap(o)) { const m = { ...o }; if (ln) m[lg] = ln; else delete m[lg]; return m; }
+                if (typeof o === "string") return !ln || ln === o ? o : { [main()]: o, [lg]: ln };
+                return o;
+              });
+            }
+            changed(); refreshMissing();
+          } });
+          ta.value = (sc.items || []).map(x => (isMap(x) ? (x[lg] || "") : typeof x === "string" ? x : x.label || x.asset || "")).join("\n");
+          return ta;
+        };
+        if (ALL) f.append(el("div", { class: "field" }, el("span", { class: "lbl" }, t("items")),
+          el("div", { class: "tr-grid", style: { gridTemplateColumns: `repeat(${langs().length}, minmax(0, 1fr))` } },
+            langs().map(lg => el("div", { class: "tr-cell" }, el("span", { class: "tr-lang" }, lg.toUpperCase()), itemsFor(lg))))));
+        else f.append(field(t("items"), itemsFor(FL)));
+        if (multi()) f.append(el("p", { class: "muted small help" }, t("itemsTranslateHelp", { main: main().toUpperCase() })));
       }
       if (L === "stat") f.append(text("stat", t("stat"), { cls: "narrow" }), text("headline", t("headline")), text("sub", t("sub")));
       if (L === "cta") f.append(text("headline", t("headline")), text("sub", t("sub")), text("button", t("button"), { ph: S.brief.product }), text("url", t("url")));
@@ -600,7 +912,7 @@
         if (sc.asset && S.assets[sc.asset]) f.append(focusPicker(sc));
         f.append(text("callout", t("callout")), text("headline", t("headline")), text("kicker", t("kicker")), text("sub", t("sub")));
         if (sc.device === "browser") f.append(text("url", t("urlBar"), { ph: "app.example.com" }));
-        const adv = el("div", { class: "row gap wrap" }, num("zoom", t("zoom"), 1, 4, 0.1, "auto"));
+        const adv = el("div", { class: "row gap wrap" }, num("zoom", t("zoom"), 1, 4, 0.1, t("auto")));
         if (S.assets[sc.asset] && S.assets[sc.asset].type === "video") adv.append(num("trim_start", t("trimStart"), 0, 600, 0.1, "0"));
         f.append(adv);
       }
@@ -608,8 +920,15 @@
         f.append(text("headline", t("headline")), text("sub", t("sub")));
         const box = el("div", { class: "screens-items" });
         (sc.items || []).forEach((it, k) => {
-          const lab = el("input", { type: "text", value: it.label || "", placeholder: t("label"), "aria-label": `${t("label")} ${k + 1}`,
-            oninput: e => { if (e.target.value) it.label = e.target.value; else delete it.label; changed(); } });
+          const labIn = lg => {
+            const sh = shared(it.label, lg);
+            const inp = el("input", { type: "text", dir: dirOf(lg), placeholder: sh ? `${it.label} — ${t("sameAllLangs")}` : t("label"),
+              "aria-label": `${t("label")} ${k + 1}${multi() ? ` (${lg})` : ""}`,
+              oninput: e => { const v2 = setT(it.label, lg, e.target.value); if (v2) it.label = v2; else delete it.label; changed(); refreshMissing(); } });
+            inp.value = sh ? "" : getT(it.label, lg);
+            return inp;
+          };
+          const lab = ALL ? el("div", { class: "row gap" }, langs().map(lg => labIn(lg))) : labIn(FL);
           box.append(el("div", { class: "screens-item" },
             el("div", { class: "row between" }, el("b", {}, `#${k + 1}`), lab,
               el("button", { class: "icon-btn danger", "aria-label": `${t("remove")} ${k + 1}`, onclick: () => { sc.items.splice(k, 1); changed(); renderSceneForm(); } }, "✕")),
@@ -622,11 +941,13 @@
           changed(); renderSceneForm(); } }, "+ " + t("addScreen")));
         f.append(el("div", { class: "field" }, el("span", { class: "lbl" }, t("screensItems")), box));
       }
+      if (S.sel > 0) f.append(sceneTransition(sc));
       f.append(backgroundSection(sc));
       f.append(el("div", { class: "row gap wrap" }, num("pad", t("pad"), 0, 5, 0.1, S.sel === S.brief.scenes.length - 1 ? "1.0" : "0.4"),
-        num("duration", t("minDuration"), 1, 30, 0.5, "auto")));
+        num("duration", t("minDuration"), 1, 30, 0.5, t("auto"))));
       panel.replaceChildren(warnBox, f);
       renderWarnings();
+      refreshMissing();
     }
 
     function assetPicker(current, types, onPick) {
@@ -705,7 +1026,7 @@
           el("img", { src: `/api/projects/${pid}/thumbs/${encodeURIComponent(n)}`, alt: n, loading: "lazy" }),
           el("figcaption", {},
             el("b", { class: "asset-name", title: n }, n),
-            el("span", { class: "muted small" }, `${m.type} · ${m.w}×${m.h}${m.duration ? ` · ${m.duration.toFixed(1)} s` : ""} · ${fmtBytes(m.size)}`),
+            el("span", { class: "muted small" }, `${t("assetTypes." + m.type)} · ${m.w}×${m.h}${m.duration ? ` · ${m.duration.toFixed(1)} s` : ""} · ${fmtBytes(m.size)}`),
             el("span", { class: `small ${used.length ? "ok-t" : "muted"}` }, used.length ? t("usedIn", { list: used.join(", ") }) : t("unused")),
             el("button", { class: "btn small danger", onclick: async () => {
               if (!confirmBox(t("confirmDeleteAsset", { name: n }))) return;
@@ -729,9 +1050,110 @@
       } catch (e) { toast(e.message, "error", 9000); }
     }
 
+    // ---------- music tab ----------
+    S.music = null;
+    const musPrev = new Audio();
+    let musPrevId = null;
+    async function loadMusic() { S.music = await api("GET", "/api/library/music"); return S.music; }
+    function renderMusic() {
+      if (!S.music) { loadMusic().then(() => { if (S.tab === "music") renderMusic(); }).catch(e => toast(e.message, "error")); }
+      const b = S.brief;
+      const cur = b.music || null;
+      const tracks = S.music || [];
+      const pick = id => {
+        if (!id) { delete b.music; }
+        else b.music = { volume_db: -20, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0, ...(b.music || {}), track: id };
+        changed({ now: true }); renderMusic(); setTab("music");
+      };
+      const playBtn = m => el("button", { class: "icon-btn", "aria-label": `${t("musicPreview")} ${m.title}`, title: t("musicPreview"),
+        onclick: () => {
+          if (musPrevId === m.id && !musPrev.paused) { musPrev.pause(); musPrevId = null; renderMusic(); return; }
+          preview.pause(); musPrev.src = m.url; musPrev.currentTime = 0; musPrev.volume = 0.6; musPrev.play().catch(() => {}); musPrevId = m.id; renderMusic();
+        } }, musPrevId === m.id && !musPrev.paused ? "❚❚" : "▶");
+      const row = m => el("li", { class: `mtrack ${cur && cur.track === m.id ? "on" : ""}` },
+        el("label", { class: "row gap mt-pick" }, el("input", { type: "radio", name: "music-track", checked: !!(cur && cur.track === m.id), onchange: () => pick(m.id) }),
+          el("span", { class: "mt-txt" }, el("b", {}, m.title),
+            el("span", { class: "muted small" }, [m.artist, `${Math.round(m.duration)} s`, m.bpm ? `${m.bpm} bpm` : "", m.mood].filter(Boolean).join(" · ")),
+            el("span", { class: "muted small" }, `${t("licence")}: ${m.licence}`))),
+        el("span", { class: `src-badge ${m.source}` }, t("musicSources." + m.source)),
+        playBtn(m),
+        m.source !== "builtin" ? el("button", { class: "icon-btn danger", "aria-label": `${t("delete")} ${m.title}`, title: t("delete"), onclick: async () => {
+          const n = (m.used_in || []).length;
+          if (!confirmBox(t("confirmDeleteTrack", { name: m.title, n }))) return;
+          try { await api("DELETE", `/api/library/music/${m.id}`); await loadMusic(); if (cur && cur.track === m.id) pick(null); else renderMusic(); }
+          catch (e) { toast(e.message, "error"); } } }, "✕") : null);
+      const list = el("ul", { class: "mtracks" },
+        el("li", { class: `mtrack ${!cur || !cur.track ? "on" : ""}` }, el("label", { class: "row gap mt-pick" },
+          el("input", { type: "radio", name: "music-track", checked: !cur || !cur.track, onchange: () => pick(null) }), el("b", {}, t("noMusic")))),
+        tracks.map(row));
+      const kids = [el("p", { class: "muted small" }, t("musicHelp")), list];
+      if (cur && cur.track) {
+        const missing = S.music && !tracks.find(x => x.id === cur.track);
+        if (missing) kids.push(el("p", { class: "warn small" }, t("musicMissing", { id: cur.track })));
+        const meta = tracks.find(x => x.id === cur.track);
+        const slider = (k, min, max, step, fmt2, label) => {
+          const out = el("span", { class: "mono small" }, fmt2(cur[k] ?? 0));
+          const r = el("input", { type: "range", min, max, step, value: cur[k] ?? 0, "aria-label": label,
+            oninput: e => { cur[k] = parseFloat(e.target.value); out.textContent = fmt2(cur[k]); changed(); } });
+          return el("div", { class: "field slider" }, el("span", { class: "lbl" }, label), el("div", { class: "row gap" }, r, out));
+        };
+        const db = v => `${v > 0 ? "+" : ""}${Number(v).toFixed(0)} dB`, sec = v => `${Number(v).toFixed(1)} s`;
+        const duck = el("input", { type: "checkbox", id: "mu-duck", checked: cur.duck !== false, onchange: e => { cur.duck = e.target.checked; changed({ now: true }); renderMusic(); } });
+        kids.push(el("div", { class: "form mt" },
+          el("h3", {}, t("musicSettings")),
+          el("div", { class: "row gap wrap" }, slider("volume_db", -40, 0, 1, db, t("musicVolume")),
+            el("label", { class: "row gap", for: "mu-duck" }, duck, el("span", {}, t("musicDuck")))),
+          cur.duck !== false ? slider("duck_db", -30, 0, 1, db, t("musicDuckDb")) : null,
+          el("div", { class: "row gap wrap" }, slider("fade_in", 0, 10, 0.5, sec, t("musicFadeIn")), slider("fade_out", 0, 15, 0.5, sec, t("musicFadeOut"))),
+          slider("start", 0, Math.max(1, Math.floor(meta ? meta.duration : 60)), 0.5, sec, t("musicStart")),
+          el("p", { class: "muted small" }, t("musicMixHelp"))));
+      }
+      // generate (ACE-Step)
+      const gen = b.music && b.music.generate;
+      const pendMusic = (S.aiJobs || []).filter(j => j.kind === "music" && isActive(j) && j.params && j.params.assign_project === pid);
+      kids.push(el("details", { class: "mt gen-music", open: !!gen || pendMusic.length > 0 },
+        el("summary", {}, "✦ " + t("ai.musicTitle")),
+        gen ? el("p", { class: "ok-t small" }, t("ai.musicPlanned", { p: [gen.genre, gen.mood, gen.prompt].filter(Boolean).join(", ") }),
+          " ", el("button", { class: "btn small", onclick: () => { delete b.music.generate; changed({ now: true }); renderMusic(); } }, t("ai.musicUnplan"))) : null,
+        pendMusic.length ? el("div", { class: "jobs" }, pendMusic.map(j => AI.jobRow(j, pollAi))) : null,
+        AI.musicForm({ project: pid, duration: S.tl ? Math.ceil(S.tl.duration + 3) : 30,
+          onQueued: j => { onAiJob(j); renderMusic(); },
+          onSpec: sp => { b.music = { volume_db: -20, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0, ...(b.music || {}), generate: sp };
+            changed({ now: true }); toast(t("ai.musicPlannedToast"), "ok"); renderMusic(); } })));
+      if (!AI.status) AI.loadStatus().then(() => { if (S.tab === "music") renderMusic(); }).catch(() => {});
+      // upload
+      const file = el("input", { type: "file", accept: ".mp3,.wav,.ogg,.m4a,audio/*", id: "mu-file" });
+      const title = el("input", { type: "text", id: "mu-title", placeholder: t("musicTitlePh") });
+      const artist = el("input", { type: "text", id: "mu-artist" });
+      const lic = el("input", { type: "text", id: "mu-lic", placeholder: t("licencePh"), required: true });
+      const mood = el("input", { type: "text", id: "mu-mood", placeholder: t("moodPh") });
+      const err = el("div", { class: "error small", role: "alert" });
+      kids.push(el("details", { class: "mt upload-music" }, el("summary", {}, "⇪ " + t("musicUpload")),
+        el("div", { class: "form" }, field(t("musicFile"), file), field(t("musicTitle"), title), field(t("musicArtist"), artist),
+          field(t("licence") + " *", lic), field(t("musicMood"), mood), err,
+          el("button", { class: "btn primary", onclick: async () => {
+            err.textContent = "";
+            if (!file.files.length) { err.textContent = t("musicNoFile"); return; }
+            if (!lic.value.trim()) { err.textContent = t("licenceRequired"); lic.focus(); return; }
+            const fd = new FormData();
+            fd.append("file", file.files[0], file.files[0].name);
+            fd.append("licence", lic.value.trim()); fd.append("title", title.value.trim()); fd.append("artist", artist.value.trim());
+            fd.append("mood", mood.value.trim()); fd.append("project", pid);
+            toast(t("uploading", { n: 1 }));
+            try {
+              const m = await api("POST", "/api/library/music", fd, true);
+              await flush(); await loadMusic(); await refreshAssets(true);
+              b.music = { volume_db: -20, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0, ...(b.music || {}), track: m.id };
+              changed({ now: true }); toast(t("musicAdded", { name: m.title }), "ok"); setTab("music");
+            } catch (e) { err.textContent = e.message; }
+          } }, t("musicAddBtn")))));
+      panel.replaceChildren(warnBox, el("div", { class: "form" }, el("h3", {}, "♪ " + t("music")), ...kids));
+      renderWarnings();
+    }
+
     // ---------- JSON tab ----------
     function renderJson() {
-      const ta = el("textarea", { class: "mono json", spellcheck: "false", "aria-label": t("tabJson") });
+      const ta = el("textarea", { class: "mono json", spellcheck: "false", "aria-label": t("tabJson"), "data-native-undo": "1" });
       ta.value = JSON.stringify(S.brief, null, 2);
       const err = el("div", { class: "error small", role: "alert" });
       panel.replaceChildren(warnBox, el("div", { class: "row gap wrap" },
@@ -740,9 +1162,12 @@
           try { raw = JSON.parse(ta.value); } catch (e) { err.textContent = t("jsonInvalid", { msg: e.message }); return; }
           try {
             const r = await api("PUT", `/api/projects/${pid}`, { brief: raw });
+            if (UN.burst) settle();
+            if (UN.stable != null) UN.undo.push(UN.stable);
+            UN.redo = []; UN.stable = JSON.stringify(r.brief);
             S.warnings = r.warnings; S.version++; S.savedVersion = S.version;
             err.textContent = ""; toast(t("jsonApplied"), "ok"); showWarnings(r.warnings);
-            adoptBrief(r.brief); refreshTimeline();
+            adoptBrief(r.brief); refreshTimeline(); renderUndo();
           } catch (e) { err.textContent = e.message; }
         } }, t("applyJson")),
         el("button", { class: "btn", onclick: () => copyText(ta.value) }, t("copy")),
@@ -810,6 +1235,14 @@
         await loadPortraits().catch(() => {});
         if (j.params.assign_project === pid) { ensurePres().portrait = r.portrait; changed({ now: true }); }
         if (S.tab === "ai") renderAiTab();
+      } else if (j.kind === "music" && r.track) {
+        toast(t("ai.musicReady", { name: r.title || r.track }), "ok");
+        await loadMusic().catch(() => {});
+        if (j.params && j.params.assign_project === pid) {
+          S.brief.music = { volume_db: -20, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0, ...(S.brief.music || {}), track: r.track };
+          changed({ now: true }); refreshTimeline();
+        }
+        if (S.tab === "music") renderMusic();
       } else if (j.kind === "presenter" && j.project === pid) {
         toast(t("ai.presenterReady"), "ok");
         await refreshTimeline();
@@ -850,10 +1283,16 @@
       const clips = S.lib || [];
       const cur = clips.find(c => c.id === bg.clip);
       if (bg.prompt) box.append(el("p", { class: "muted small" }, t("ai.bgSuggested", { p: bg.prompt })));
+      const provs = (AI.status && AI.status.providers) || [];
+      const provName = id => (provs.find(x => x.id === id) || {}).name || id;
+      const projProv = S.brief.broll_provider || "wan22-5b";
+      box.append(el("p", { class: "muted small" }, t("ai.bgProvider", { p: provName(bg.provider || projProv) }) +
+        (bg.provider ? "" : ` (${t("ai.projectDefault")})`) + (bg.image ? ` · ${t("ai.bgAnimates", { a: bg.image })}` : "")));
+      if (cur && cur.provider) box.append(el("p", { class: "muted tiny" }, t("ai.clipFrom", { p: provName(cur.provider), l: cur.licence || "" })));
       if (bg.clip && S.lib && !cur) box.append(el("p", { class: "warn small" }, t("ai.bgMissing", { id: bg.clip })));
       if (!bg.clip) box.append(el("p", { class: "muted small" }, t("ai.bgNone")));
       if (cur && ((cur.w > cur.h) !== (S.brief.format === "16:9"))) {
-        box.append(el("p", { class: "warn small" }, t("ai.bgOrientWarn", { o: cur.w > cur.h ? "horizontal" : "vertical", f: S.brief.format })));
+        box.append(el("p", { class: "warn small" }, t("ai.bgOrientWarn", { o: cur.w > cur.h ? t("horizontal") : t("vertical"), f: S.brief.format })));
       }
       const slider = (k, min, max, step, fmt) => {
         const out = el("span", { class: "mono small" }, fmt(bg[k] ?? 0));
@@ -870,7 +1309,19 @@
       box.append(el("details", { class: "gen", open: !!(bg.prompt && !bg.clip) },
         el("summary", {}, "✦ " + t("ai.generateClip")),
         AI.brollForm({ prompt: bg.prompt || "", orientation: S.brief.format === "16:9" ? "landscape" : "portrait",
-          assign: { project: pid, scene: sc.id, dim: bg.dim, blur: bg.blur }, onQueued: j => onAiJob(j) })));
+          provider: bg.provider || projProv, image: bg.image || "",
+          images: Object.entries(S.assets).filter(([, m]) => m.type === "image").map(([n]) => ({ value: n, label: n, ref: { project: pid, asset: n } }))
+            .concat((S.portraits || []).map(m => ({ value: m.id, label: `${t("ai.kinds.portrait")}: ${m.name || m.id}`, ref: { portrait: m.id } }))),
+          assign: { project: pid, scene: sc.id, dim: bg.dim, blur: bg.blur },
+          onQueued: (j, o) => {
+            if (o) {    // remember the choice in the brief, so "Make video" regenerates it the same way
+              if (o.provider && o.provider !== projProv) bg.provider = o.provider; else delete bg.provider;
+              if (o.image) bg.image = o.image; else delete bg.image;
+              changed({ now: true });
+            }
+            onAiJob(j);
+          } })));
+      if (!S.portraits) loadPortraits().catch(() => {});
       refreshAiViews();
       return box;
     }
@@ -929,7 +1380,13 @@
         }
         f.append(boxes.status);
       }
-      panel.replaceChildren(warnBox, f,
+      const provs = (AI.status && AI.status.providers) || [];
+      const provSel = el("select", { id: "proj-prov", onchange: e => {
+        if (e.target.value === "wan22-5b") delete b.broll_provider; else b.broll_provider = e.target.value; changed({ now: true }); } },
+        provs.map(p2 => el("option", { value: p2.id, selected: (b.broll_provider || "wan22-5b") === p2.id }, `${p2.name} — ${p2.licence}`)));
+      const provField = el("div", { class: "form mt" }, el("h3", {}, t("ai.projectProvider")),
+        el("p", { class: "muted small" }, t("ai.projectProviderHelp")), provs.length ? provSel : el("p", { class: "muted small" }, "…"));
+      panel.replaceChildren(warnBox, f, provField,
         el("h3", { class: "mt" }, t("ai.projectJobs")), boxes.jobs,
         boxes.gpu,
         el("p", {}, el("a", { href: "#/ai" }, t("ai.openAiPage") + " →")),
@@ -972,6 +1429,296 @@
       box.replaceChildren(...kids);
     }
 
+    // ---------- templates: picker drawer (thumbnails + live preview), options, import ----------
+    const curTplId = () => S.brief.template || "aurora";
+    const tplOf = id => S.templates.find(m => m.id === id) || null;
+    async function loadTemplates() {
+      try { S.templates = await api("GET", "/api/templates"); } catch { S.templates = []; }
+      return S.templates;
+    }
+    const previewFor = (m, fmt) => {
+      const pv = (m && m.previews) || [];
+      const want = `preview-${fmtSlug(fmt || S.fmt)}`;
+      return pv.find(u => u.includes(want)) || pv[0] || null;
+    };
+    function templateButton() {
+      const m = tplOf(curTplId());
+      const src = previewFor(m);
+      return el("button", { type: "button", class: "btn tpl-btn", "aria-haspopup": "dialog", title: t("tpl.pick"), onclick: () => templateDrawer() },
+        src ? el("img", { src, alt: "", class: `tpl-thumb fmt-${fmtSlug(S.fmt)}` }) : el("span", { class: "tpl-thumb ph" }),
+        el("span", { class: "tpl-name" }, m ? lbl(m.name) : curTplId()), el("span", { class: "muted" }, "▾"));
+    }
+    let drawerEl = null;
+    function closeDrawer() {
+      if (!drawerEl) return;
+      drawerEl.remove(); drawerEl = null;
+      if (S.tplPreview) { S.tplPreview = null; refreshTimeline(); }
+    }
+    let hoverTimer = null;
+    function hoverPreview(id) {
+      clearTimeout(hoverTimer);
+      hoverTimer = setTimeout(() => {
+        const want = id && id !== curTplId() ? id : null;
+        if (want === S.tplPreview) return;
+        S.tplPreview = want;
+        refreshTimeline();
+      }, 140);
+    }
+    function templateDrawer(focusId) {
+      if (drawerEl) { closeDrawer(); }
+      const list = el("div", { class: "tpl-grid", role: "listbox", "aria-label": t("tpl.template") });
+      const optsBox = el("div", { class: "tpl-opts" });
+      const importBox = el("div", { class: "tpl-import" });
+      const draw = () => {
+        list.replaceChildren(...S.templates.map(m => {
+          const on = m.id === curTplId();
+          const src = previewFor(m);
+          const card = el("div", { class: `tpl-card ${on ? "on" : ""} ${m.error ? "broken" : ""}`, role: "option", "aria-selected": on ? "true" : "false",
+            tabindex: "0", "data-id": m.id,
+            onmouseenter: () => { if (!m.error) hoverPreview(m.id); }, onfocus: () => { if (!m.error) hoverPreview(m.id); },
+            onclick: e => { if (!e.target.closest(".tpl-del") && !m.error) pickTemplate(m.id); },
+            onkeydown: e => { if ((e.key === "Enter" || e.key === " ") && !m.error) { e.preventDefault(); pickTemplate(m.id); } } },
+            el("div", { class: `tpl-shot fmt-${fmtSlug(S.fmt)}` }, src ? el("img", { src, alt: "", loading: "lazy" }) : el("span", { class: "muted small" }, m.error ? "⚠" : "—")),
+            el("div", { class: "tpl-body" },
+              el("div", { class: "row between" }, el("b", {}, lbl(m.name) || m.id),
+                el("span", { class: `kbadge ${m.kind || ""}` }, m.kind ? t("tpl.kinds." + m.kind) : "")),
+              m.error ? el("div", { class: "error small" }, m.error) : el("div", { class: "muted small tpl-desc" }, lbl(m.description) || ""),
+              el("div", { class: "muted tiny-l" }, [m.author, m.version ? `v${m.version}` : "", m.licence].filter(Boolean).join(" · ")),
+              on ? el("div", { class: "ok-t small" }, "✓ " + t("tpl.inUse")) : null),
+            !m.builtin ? el("button", { class: "icon-btn danger tpl-del", title: t("delete"), "aria-label": `${t("delete")} ${lbl(m.name)}`, onclick: async () => {
+              if (!confirmBox(t("tpl.confirmDelete", { name: lbl(m.name) }))) return;
+              try { await api("DELETE", `/api/templates/${m.id}`); await loadTemplates();
+                if (curTplId() === m.id) { delete S.brief.template; delete S.brief.template_options; changed({ now: true }); renderSettings(); }
+                draw(); } catch (e) { toast(e.message, "error"); } } }, "✕") : null);
+          return card;
+        }));
+        drawOptions();
+      };
+      const drawOptions = () => {
+        const m = tplOf(curTplId());
+        const opts = (m && m.options) || [];
+        if (!opts.length) { optsBox.replaceChildren(el("p", { class: "muted small" }, t("tpl.noOptions", { name: m ? lbl(m.name) : curTplId() }))); return; }
+        const cur = S.brief.template_options || {};
+        const setOpt = (k, v) => { S.brief.template_options = { ...(S.brief.template_options || {}), [k]: v }; changed({ now: true }); };
+        optsBox.replaceChildren(el("h3", {}, t("tpl.options", { name: lbl(m.name) })), ...opts.map(o => {
+          const v = cur[o.key] ?? o.default;
+          const id = `to-${o.key}`;
+          let inp;
+          if (o.type === "boolean") {
+            inp = el("input", { type: "checkbox", id, checked: !!v, onchange: e => setOpt(o.key, e.target.checked) });
+            return el("label", { class: "row gap", for: id }, inp, el("span", {}, lbl(o.label) || o.key));
+          }
+          if (o.type === "select") inp = el("select", { id, onchange: e => setOpt(o.key, e.target.value) },
+            (o.choices || []).map(c => el("option", { value: c.value, selected: c.value === v }, lbl(c.label) || c.value)));
+          else if (o.type === "color") inp = el("input", { type: "color", id, value: v || "#000000", oninput: e => setOpt(o.key, e.target.value) });
+          else if (o.type === "number") inp = el("input", { type: "number", id, value: v ?? "", min: o.min, max: o.max, step: o.step || "any", class: "narrow",
+            onchange: e => setOpt(o.key, parseFloat(e.target.value)) });
+          else inp = el("input", { type: "text", id, value: v ?? "", oninput: e => setOpt(o.key, e.target.value) });
+          return el("div", { class: "field" }, el("label", { for: id }, lbl(o.label) || o.key), inp, o.help ? el("span", { class: "muted small" }, lbl(o.help)) : null);
+        }));
+      };
+      const pickTemplate = id => {
+        if (id === curTplId()) return;
+        if (id === "aurora") delete S.brief.template; else S.brief.template = id;
+        // options belong to one template; transitions it added are dropped when the new one lacks them
+        delete S.brief.template_options;
+        S.tplPreview = null;
+        changed({ now: true });
+        renderSettings(); renderPanel(); draw();
+        toast(t("tpl.applied", { name: lbl((tplOf(id) || {}).name) || id }), "ok", 2200);
+      };
+      // import (.zip)
+      const file = el("input", { type: "file", accept: ".zip,application/zip", id: "tpl-zip" });
+      const repl = el("input", { type: "checkbox", id: "tpl-replace" });
+      const out = el("div", { class: "tpl-result", "aria-live": "polite" });
+      importBox.replaceChildren(el("h3", {}, "⇪ " + t("tpl.import")), el("p", { class: "muted small" }, t("tpl.importHelp")),
+        el("div", { class: "row gap wrap" }, file,
+          el("label", { class: "row gap small", for: "tpl-replace" }, repl, el("span", {}, t("tpl.replace"))),
+          el("button", { class: "btn primary", onclick: async () => {
+            out.replaceChildren();
+            if (!file.files.length) { out.append(el("p", { class: "error small" }, t("tpl.chooseZip"))); return; }
+            const fd = new FormData();
+            fd.append("file", file.files[0], file.files[0].name);
+            try {
+              const m = await api("POST", `/api/templates${repl.checked ? "?replace=1" : ""}`, fd, true);
+              await loadTemplates(); draw();
+              out.append(el("p", { class: "ok-t small" }, "✓ " + t("tpl.imported", { name: lbl(m.name) })),
+                ...(m.warnings && m.warnings.length ? [el("ul", { class: "warn small" }, m.warnings.map(w => el("li", {}, w)))] : []));
+              file.value = "";
+              const c = list.querySelector(`[data-id="${m.id}"]`); if (c) c.scrollIntoView({ block: "nearest" });
+            } catch (e) {
+              const errs = (e.data && e.data.errors) || [e.message];
+              out.append(el("div", { class: "errbox" }, el("b", {}, t("tpl.importFailed")), el("ul", {}, errs.map(x => el("li", {}, x)))));
+            }
+          } }, t("tpl.importBtn"))), out,
+        el("p", { class: "muted small" }, t("tpl.docs"), " ", el("code", {}, "video/templates/TEMPLATES.md"), " · ", el("code", {}, "validate.py")));
+      drawerEl = el("aside", { class: "drawer", role: "dialog", "aria-label": t("tpl.template"),
+        onmouseleave: () => hoverPreview(null), onkeydown: e => { if (e.key === "Escape") closeDrawer(); } },
+        el("div", { class: "drawer-head" }, el("h2", {}, t("tpl.template")),
+          el("div", { class: "row gap" },
+            el("button", { class: "btn small", title: t("tpl.reloadHelp"), onclick: async () => { await loadTemplates(); draw(); refreshTimeline(); } }, "↻ " + t("tpl.reload")),
+            el("button", { class: "icon-btn", "aria-label": t("close"), onclick: closeDrawer }, "✕"))),
+        el("div", { class: "drawer-body" }, el("p", { class: "muted small" }, t("tpl.help")), list, optsBox, importBox));
+      document.body.append(drawerEl);
+      draw();
+      (list.querySelector(".tpl-card.on") || list.querySelector(".tpl-card") || drawerEl).focus();
+    }
+
+    // ---------- transitions: tiny animated previews ----------
+    const TXB = window.VS_TRANSITIONS || {};
+    S.txMods = {};
+    async function tplTransitions() {
+      const m = tplOf(curTplId());
+      if (!m || !m.has_js || !(m.transitions || []).length) return {};
+      const key = `${m.id}@${m.hash}`;
+      if (!S.txMods[key]) S.txMods[key] = import(`/templates/${m.id}/template.js?v=${m.hash}`).then(x => x.transitions || {}).catch(() => ({}));
+      return S.txMods[key];
+    }
+    const txName = id => {
+      const m = tplOf(curTplId());
+      const own = m && (m.transitions || []).find(x => x.id === id);
+      return own ? lbl(own.name) : t("tx.names." + id) !== "tx.names." + id ? t("tx.names." + id) : id;
+    };
+    const txIds = () => [...(TXB.order || []), ...(((tplOf(curTplId()) || {}).transitions || []).map(x => x.id))];
+    const txDefault = () => ((tplOf(curTplId()) || {}).default_transition) || "lift";
+    const txIdOf = v => (v && typeof v === "object" ? v.type : v) || null;
+    // a 64x40 mini stage: scene A (brand primary) hands over to scene B (accent) with transition `id`
+    function txTile(id, { on = false, label = null, onPick = null, sub = null } = {}) {
+      const box = el("span", { class: "tx-mini", "aria-hidden": "true" });
+      const a = box.appendChild(el("i", { class: "tx-a" }, "A")), b = box.appendChild(el("i", { class: "tx-b" }, "B"));
+      const flash = box.appendChild(el("i", { class: "tx-flash" }));
+      let raf = 0, t0 = 0, fn = null;
+      const W = 64, H = 40, rtl = S.lang === "ar";
+      const apply = (node, st) => {
+        st = st || {};
+        node.style.opacity = String(st.o ?? 1);
+        node.style.transform = `translate(${((st.x || 0) * W / 1080).toFixed(2)}px, ${((st.y || 0) * H / 1920).toFixed(2)}px) scale(${st.s ?? 1}) rotate(${st.r || 0}deg)`;
+        node.style.filter = st.blur ? `blur(${(st.blur * W / 1080).toFixed(2)}px)` : "none";
+        node.style.clipPath = st.clip ? `inset(${st.clip.map(v => `${(v * 100).toFixed(1)}%`).join(" ")})` : "";
+        return st.flash || 0;
+      };
+      const frame = p => {
+        if (!fn) return;
+        const c = { W: 1080, H: 1920, rtl };
+        apply(a, p >= 1 ? { o: 0 } : fn.out(p, c));
+        const f = apply(b, p <= 0 ? { o: 0 } : fn.in(p, c));
+        flash.style.opacity = String(Math.min(1, f));
+        if (p <= 0) b.style.opacity = "0";
+      };
+      const resolve = async () => { const own = await tplTransitions(); fn = own[id] || TXB[id] || null; frame(0.5); };
+      resolve();
+      const loop = now => {
+        const cyc = 1.6, k = ((now - t0) / 1000) % cyc;
+        // hold A, play the transition over its own window (scaled to 0.9 s), hold B
+        frame(Math.max(0, Math.min(1, (k - 0.3) / 0.9)));
+        raf = requestAnimationFrame(loop);
+      };
+      const start = () => { cancelAnimationFrame(raf); t0 = performance.now(); raf = requestAnimationFrame(loop); };
+      const stop = () => { cancelAnimationFrame(raf); frame(0.5); };
+      const btn = el(onPick ? "button" : "span", { type: onPick ? "button" : null, class: `tx-tile ${on ? "on" : ""}`, title: label || txName(id),
+        role: onPick ? "radio" : null, "aria-checked": onPick ? (on ? "true" : "false") : null,
+        onmouseenter: start, onmouseleave: stop, onfocus: start, onblur: stop, onclick: onPick ? () => onPick(id) : null },
+        box, el("span", { class: "tx-label" }, label || txName(id)), sub ? el("span", { class: "tx-sub muted" }, sub) : null);
+      return btn;
+    }
+    function transitionButton() {
+      const cur = txIdOf(S.brief.transition);
+      const id = cur || txDefault();
+      const tile = txTile(id, { label: cur ? txName(cur) : `${t("tx.templateDefault")} · ${txName(txDefault())}` });
+      return el("button", { type: "button", class: "btn tx-btn", "aria-haspopup": "dialog", title: t("tx.pickProject"),
+        onclick: e => txPopover(e.currentTarget, cur, v => {
+          if (v) S.brief.transition = v; else delete S.brief.transition;
+          changed({ now: true }); renderSettings();
+        }, t("tx.projectHelp")) }, tile, el("span", { class: "muted" }, "▾"));
+    }
+    let popEl = null;
+    function txPopover(anchor, cur, onPick, help) {
+      if (popEl) { popEl.remove(); popEl = null; }
+      const r = anchor.getBoundingClientRect();
+      const close = () => { if (popEl) { popEl.remove(); popEl = null; document.removeEventListener("mousedown", outside, true); } };
+      const outside = e => { if (popEl && !popEl.contains(e.target) && !anchor.contains(e.target)) close(); };
+      popEl = el("div", { class: "popover", role: "dialog", "aria-label": t("tx.transition"), onkeydown: e => { if (e.key === "Escape") { close(); anchor.focus(); } } },
+        el("p", { class: "muted small" }, help),
+        txGrid(cur, v => { onPick(v); close(); }));
+      popEl.style.left = `${Math.max(8, Math.min(r.left, innerWidth - 470))}px`;
+      popEl.style.top = `${r.bottom + 6 + scrollY}px`;
+      document.body.append(popEl);
+      document.addEventListener("mousedown", outside, true);
+      const f = popEl.querySelector(".tx-tile.on") || popEl.querySelector(".tx-tile"); f && f.focus();
+    }
+    function txGrid(cur, onPick, { defaultLabel = null } = {}) {
+      const grid = el("div", { class: "tx-grid", role: "radiogroup", "aria-label": t("tx.transition") });
+      grid.append(txTile(txDefault(), { on: !cur, label: defaultLabel || t("tx.templateDefault"), sub: txName(txDefault()), onPick: () => onPick(null) }));
+      for (const id of txIds()) grid.append(txTile(id, { on: cur === id, onPick: () => onPick(id) }));
+      if (cur && !txIds().includes(cur)) grid.append(el("p", { class: "warn small" }, t("tx.notInTemplate", { name: cur })));
+      return grid;
+    }
+    function sceneTransition(sc) {
+      const cur = txIdOf(sc.transition);
+      const proj = txIdOf(S.brief.transition) || txDefault();
+      const box = el("div", { class: "field tx-section" });
+      box.append(el("div", { class: "row between" }, el("span", { class: "lbl" }, t("tx.intoScene")),
+        el("span", { class: "muted small" }, cur ? txName(cur) : `${t("tx.projectDefault")} (${txName(proj)})`)),
+        txGrid(cur, v => { if (v) sc.transition = v; else delete sc.transition; changed({ now: true }); renderSceneForm(); },
+          { defaultLabel: t("tx.projectDefault") }));
+      return box;
+    }
+
+    // ---------- version history ----------
+    async function renderHistory() {
+      const box = el("div", { class: "form history" },
+        el("div", { class: "row between" }, el("h3", {}, "🕘 " + t("hist.title")),
+          el("span", { class: "muted small" }, t("hist.shortcut"))),
+        el("p", { class: "muted small" }, t("hist.help")));
+      const listEl = el("ol", { class: "hist-list" }, el("li", { class: "muted small" }, "…"));
+      box.append(listEl);
+      panel.replaceChildren(warnBox, box);
+      renderWarnings();
+      await flush();
+      let items = [];
+      try { items = await api("GET", `/api/projects/${pid}/history`); } catch (e) { listEl.replaceChildren(el("li", { class: "error small" }, e.message)); return; }
+      if (S.tab !== "history") return;
+      if (!items.length) { listEl.replaceChildren(el("li", { class: "muted small" }, t("hist.empty"))); return; }
+      const fmtD = ts => fmtDate(ts, true);
+      listEl.replaceChildren(...items.map((h, i) => el("li", { class: `hist-item ${i === 0 ? "cur" : ""}` },
+        el("div", { class: "hist-main" },
+          el("div", { class: "row gap wrap" }, el("b", {}, fmtD(h.updated || h.created)),
+            el("span", { class: "muted small" }, ago(h.updated || h.created)),
+            el("span", { class: `kbadge k-${h.kind}` }, t("hist.kinds." + h.kind) !== "hist.kinds." + h.kind ? t("hist.kinds." + h.kind) : h.kind),
+            h.scenes != null ? el("span", { class: "muted small" }, t("scenesCount", { n: h.scenes })) : null),
+          el("div", { class: "small hist-sum" }, h.summary || "")),
+        i === 0 ? el("span", { class: "ok-t small nowrap" }, t("hist.current"))
+          : el("button", { class: "btn small", onclick: async () => {
+            await flush();
+            try {
+              const r = await api("POST", `/api/projects/${pid}/history/${h.id}/restore`);
+              if (UN.burst) settle();
+              if (UN.stable != null) UN.undo.push(UN.stable);
+              UN.redo = [];
+              applyState(JSON.stringify(r.brief), { saved: true });
+              S.warnings = r.warnings || [];
+              toast(t("hist.restored", { when: fmtD(h.updated || h.created) }), "ok");
+              if (S.tab === "history") renderHistory();
+            } catch (e) { toast(e.message, "error"); }
+          } }, "↺ " + t("hist.restore")))));
+    }
+
+    // ---------- "Ask the AI for missing material" ----------
+    async function followupDialog() {
+      await flush();
+      let r;
+      try { r = await api("GET", `/api/projects/${pid}/followup`); } catch (e) { toast(e.message, "error"); return; }
+      const ta = el("textarea", { class: "mono tall", spellcheck: "false", "aria-label": t("fu.title"), "data-native-undo": "1" });
+      ta.value = r.message;
+      const kinds = Object.entries(r.counts || {});
+      modal(t("fu.title"), el("div", { class: "form" },
+        el("p", { class: "muted small" }, t("fu.intro")),
+        el("div", { class: "row gap wrap" }, r.ok ? el("span", { class: "chipx ok" }, "✓ " + t("fu.allGood")) : null,
+          ...kinds.map(([k, n]) => el("span", { class: `chipx ${k === "suggestion" ? "" : "bad"}` }, `${t("fu.kinds." + k) !== "fu.kinds." + k ? t("fu.kinds." + k) : k}: ${n}`))),
+        ta, el("p", { class: "muted small" }, t("fu.api"), " ", el("code", {}, `GET /api/projects/${pid}/followup`))),
+        [{ label: t("close"), onClick: () => {} }, { label: "⧉ " + t("copy"), primary: true, onClick: () => { copyText(ta.value); } }]);
+    }
+
     // ---------- preview ----------
     const preview = (() => {
       const frame = el("iframe", { class: "pv-frame", src: "/renderer/index.html?embed", title: t("preview"), tabindex: "-1" });
@@ -980,7 +1727,7 @@
       audio.preload = "auto";
       let tl = null, loaded = false, playing = false, cur = 0, t0Perf = 0, t0 = 0, audioKey = null, raf = 0;
       const playBtn = el("button", { class: "btn round", "aria-label": t("play"), onclick: () => toggle() }, "▶");
-      const scrub = el("input", { type: "range", min: 0, max: 10, step: 0.01, value: 0, "aria-label": "Time",
+      const scrub = el("input", { type: "range", min: 0, max: 10, step: 0.01, value: 0, "aria-label": t("time"),
         oninput: e => { seek(parseFloat(e.target.value)); } });
       const time = el("span", { class: "mono small time" }, "0:00.0");
       const marks = el("div", { class: "marks", "aria-hidden": "true" });
@@ -995,7 +1742,33 @@
         if (!loaded || !win() || !win().loadTimeline) return;
         win().loadTimeline(tl).then(() => draw()).catch(() => {});
       }
-      function setFormat(fmt) { frameBox.classList.toggle("land", fmt === "16:9"); }
+      function setFormat(fmt) { frameBox.classList.toggle("land", fmt === "16:9"); frameBox.classList.toggle("square", fmt === "1:1"); }
+      // background music: plays along with the voice-over, approximate ducking from the server's envelope
+      const mus = new Audio();
+      mus.preload = "auto"; mus.loop = true;
+      let M = null;
+      function musicAt(t1) {
+        if (!M) return 0;
+        let db = M.gain_db;
+        if (M.duck && M.duck.length) {
+          const x = t1 / (M.duck_step || 0.1), i = Math.floor(x), f = x - i;
+          const a = M.duck[Math.min(i, M.duck.length - 1)] || 0, b = M.duck[Math.min(i + 1, M.duck.length - 1)] || 0;
+          db += a + (b - a) * f;
+        }
+        let g = Math.pow(10, db / 20);
+        if (M.fade_in > 0) g *= Math.sin(Math.min(1, Math.max(0, t1 / M.fade_in)) * Math.PI / 2);
+        const D = tl ? tl.duration : 0;
+        if (M.fade_out > 0 && t1 > D - M.fade_out) g *= Math.cos(Math.min(1, (t1 - (D - M.fade_out)) / M.fade_out) * Math.PI / 2);
+        return Math.max(0, Math.min(1, g));
+      }
+      function syncMusic(force) {
+        if (!M || !mus.src) return;
+        if (!playing) { if (!mus.paused) mus.pause(); return; }
+        const want = ((M.start || 0) + cur) % Math.max(0.1, M.duration || mus.duration || 1);
+        if (mus.paused) { mus.currentTime = want; mus.play().catch(() => {}); }
+        else if (force || Math.abs(mus.currentTime - want) > 0.35) mus.currentTime = want;
+        mus.volume = musicAt(cur);
+      }
       function load(newTl) {
         tl = newTl;
         setFormat(tl.format);
@@ -1003,8 +1776,13 @@
         if (cur > tl.duration) cur = 0;
         marks.replaceChildren(...tl.scenes.map((s, i) => el("i", { style: { left: `${(s.start / tl.duration) * 100}%`, width: `${((s.end - s.start) / tl.duration) * 100}%` },
           class: s.voiced ? "v" : "", title: s.id }, String(i + 1))));
-        info.textContent = `${tl.duration.toFixed(1)} s · ${tl.width}×${tl.height} · ` + t("voicedCount", { v: tl.voiced, n: tl.voice_needed }) +
-          (tl.voiced < tl.voice_needed ? ` · ${t("estimatedTiming")}` : "");
+        info.textContent = `${tl.language.toUpperCase()} · ${tl.duration.toFixed(1)} s · ${tl.width}×${tl.height} · ` + t("voicedCount", { v: tl.voiced, n: tl.voice_needed }) +
+          (tl.timing && tl.timing.voiced ? ` · ${t("timingCount", { a: tl.timing.aligned, n: tl.timing.voiced })}` : "") +
+          (tl.voiced < tl.voice_needed ? ` · ${t("estimatedTiming")}` : "") +
+          (tl.music ? ` · ♪ ${tl.music.title}` : "");
+        const nm = tl.music || null;
+        if (!nm) { M = null; mus.pause(); mus.removeAttribute("src"); }
+        else { const was = M && M.url; M = nm; if (was !== nm.url) { mus.src = nm.url; mus.load(); } if (playing) syncMusic(true); }
         if (tl.audio_key !== audioKey) {
           audioKey = tl.audio_key;
           const wasPlaying = playing;
@@ -1035,6 +1813,7 @@
         cur = now();
         if (tl && cur >= tl.duration) { cur = tl.duration; pause(); draw(); return; }
         draw();
+        syncMusic(false);
         raf = requestAnimationFrame(loop);
       }
       function play() {
@@ -1045,6 +1824,7 @@
         if (audio.src && audio.duration && cur < audio.duration) { audio.currentTime = cur; audio.play().catch(() => {}); }
         else if (audio.src) { audio.currentTime = cur; audio.play().catch(() => {}); }
         win() && win().setPlaying && win().setPlaying(true);
+        syncMusic(true);
         playBtn.textContent = "❚❚"; playBtn.setAttribute("aria-label", t("pause"));
         cancelAnimationFrame(raf); raf = requestAnimationFrame(loop);
       }
@@ -1052,6 +1832,7 @@
         cur = now();
         playing = false;
         audio.pause();
+        mus.pause();
         win() && win().setPlaying && win().setPlaying(false);
         playBtn.textContent = "▶"; playBtn.setAttribute("aria-label", t("play"));
         cancelAnimationFrame(raf);
@@ -1060,23 +1841,26 @@
       function toggle() { playing ? pause() : play(); }
       function seek(x) {
         cur = Math.max(0, Math.min(x, tl ? tl.duration : x));
-        if (playing) { t0 = cur; t0Perf = performance.now(); if (audio.src) audio.currentTime = cur; }
+        if (playing) { t0 = cur; t0Perf = performance.now(); if (audio.src) audio.currentTime = cur; syncMusic(true); }
         draw();
       }
-      return { load, seek, toggle, pause, setFormat, get t() { return cur; }, stop: () => { pause(); audio.src = ""; } };
+      return { load, seek, toggle, pause, setFormat, get t() { return cur; }, get musicVolume() { return M ? musicAt(cur) : null; },
+        stop: () => { pause(); audio.src = ""; mus.removeAttribute("src"); } };
     })();
+
+    window.SUI.preview = preview;   // read-only handle for UI tests (time, music volume)
 
     // ---------- voice / render / jobs ----------
     const clip = new Audio();
     async function listen(sceneId, voiced) {
       if (voiced) {
         preview.pause();
-        clip.src = `/api/projects/${pid}/voice/${encodeURIComponent(sceneId)}.wav?ts=${Date.now()}`;
+        clip.src = `/api/projects/${pid}/voice/${encodeURIComponent(sceneId)}.wav?lang=${S.lang}&ts=${Date.now()}`;
         clip.play().catch(e => toast(e.message, "error"));
         return;
       }
       await flush();
-      startJob("voice", { scene: sceneId }, () => listen(sceneId, true));
+      startJob("voice", { scene: sceneId, lang: S.lang }, () => listen(sceneId, true));
     }
     async function flush() { if (S.version !== S.savedVersion) { clearTimeout(saveTimer); await save(); } }
     async function startJob(kind, body, after) {
@@ -1135,14 +1919,14 @@
       actions.replaceChildren(
         el("button", { class: "btn", disabled: busy("voice") || !OV.ok, title: OV.ok ? "" : t("ovozDown", { url: OV.url || "" }),
           onclick: async () => { await flush(); startJob("voice", allVoiced ? { force: true } : {}); } },
-          "🎙 " + (allVoiced ? t("regenerate") : t("generateVoice"))),
-        el("button", { class: "btn primary", disabled: busy("render"), onclick: async () => {
+          "🎙 " + (allVoiced ? t("regenerate") : t("generateVoice")) + (multi() ? ` (${langs().length})` : "")),
+        el("button", { class: "btn primary", disabled: busy("render"), title: `${langs().join(", ")} × ${fmts().join(", ")}`, onclick: async () => {
           await flush();
           if (!OV.ok && !(tl && tl.voiced >= tl.voice_needed)) {
             if (!confirmBox(t("renderSilentConfirm"))) return;
             startJob("render", { allow_silent: true });
           } else startJob("render", {});
-        } }, "⬇ " + t("render")),
+        } }, "⬇ " + t("render") + (langs().length * fmts().length > 1 ? ` (${langs().length * fmts().length})` : "")),
         ...[presenterBadge()].filter(Boolean));
     }
     function presenterBadge() {
@@ -1156,23 +1940,42 @@
     }
     function renderRenders() {
       const list = S.renders || [];
-      rendersBox.replaceChildren(el("h3", {}, t("renders")),
-        list.length ? el("ul", { class: "render-list" }, list.map(r => el("li", {},
-          el("div", {}, el("b", { class: "mono small" }, r.name),
-            el("div", { class: "muted small" }, [r.format, r.duration ? `${r.duration.toFixed(1)} s` : "", fmtBytes(r.size),
-              r.voice_needed && r.voiced < r.voice_needed ? "⚠ partly silent" : ""].filter(Boolean).join(" · "))),
+      const fileUrl = (n, dl) => `/api/projects/${pid}/renders/${encodeURIComponent(n)}${dl ? "?download=1" : ""}`;
+      // one batch = one render job (every language x format); older batches fold away
+      const batchOf = r => r.batch || (r.name.match(/(\d{8}-\d{6})/) || [r.name])[0];
+      const batches = [];
+      for (const r of list) { const k = batchOf(r); let g = batches.find(x => x.k === k); if (!g) batches.push(g = { k, items: [] }); g.items.push(r); }
+      const item = r => el("li", {},
+          r.cover ? el("a", { class: "r-cover", href: fileUrl(r.cover), target: "_blank", title: t("cover") },
+            el("img", { src: fileUrl(r.cover), alt: t("cover"), loading: "lazy", class: `fmt-${fmtSlug(r.format)}` })) : null,
+          el("div", { class: "r-main" }, el("b", { class: "mono small" }, r.name),
+            el("div", { class: "muted small" }, [r.language ? r.language.toUpperCase() : "", r.format, r.duration ? `${r.duration.toFixed(1)} s` : "", fmtBytes(r.size),
+              r.timing && r.timing.voiced ? t("timingCount", { a: r.timing.aligned, n: r.timing.voiced }) : "",
+              r.music && r.music.lufs != null ? `♪ ${r.music.lufs.toFixed(1)} LUFS` : "",
+              r.voice_needed && r.voiced < r.voice_needed ? "⚠ " + t("partlySilent") : ""].filter(Boolean).join(" · ")),
+            el("div", { class: "row gap wrap r-links" },
+              r.srt ? el("a", { class: "small", href: fileUrl(r.srt, 1) }, ".srt") : null,
+              r.vtt ? el("a", { class: "small", href: fileUrl(r.vtt, 1) }, ".vtt") : null,
+              r.cover ? el("a", { class: "small", href: fileUrl(r.cover, 1) }, t("coverPng")) : null)),
           el("div", { class: "row gap" },
             el("button", { class: "btn small", onclick: () => watch(r) }, "▶ " + t("watch")),
-            el("a", { class: "btn small", href: `/api/projects/${pid}/renders/${encodeURIComponent(r.name)}?download=1` }, t("download")),
+            el("a", { class: "btn small", href: fileUrl(r.name, 1) }, t("download")),
             el("button", { class: "icon-btn danger", "aria-label": `${t("delete")} ${r.name}`, onclick: async () => {
               if (!confirmBox(t("confirmDeleteRender", { name: r.name }))) return;
               await api("DELETE", `/api/projects/${pid}/renders/${encodeURIComponent(r.name)}`);
-              await refreshAssets(); renderRenders(); } }, "✕"))))) : el("p", { class: "muted small" }, t("noRenders")));
+              await refreshAssets(); renderRenders(); } }, "✕")));
+      const older = batches.slice(1);
+      rendersBox.replaceChildren(el("h3", {}, t("renders")),
+        ...(list.length ? [el("ul", { class: "render-list" }, batches[0].items.map(item)),
+          older.length ? el("details", { class: "older-renders" }, el("summary", { class: "muted small" }, t("olderRenders", { n: older.reduce((a, g) => a + g.items.length, 0) })),
+            el("ul", { class: "render-list" }, older.flatMap(g => g.items).map(item))) : ""] : [el("p", { class: "muted small" }, t("noRenders"))]));
     }
     function watch(r) {
       preview.pause();
       const v = el("video", { src: `/api/projects/${pid}/renders/${encodeURIComponent(r.name)}`, controls: true, autoplay: true,
-        class: `render-video ${r.format === "16:9" ? "land" : ""}` });
+        class: `render-video ${r.format === "16:9" ? "land" : ""}`, crossorigin: "anonymous" });
+      if (r.vtt) v.append(el("track", { kind: "subtitles", src: `/api/projects/${pid}/renders/${encodeURIComponent(r.vtt)}`,
+        srclang: r.language || "en", label: (r.language || "").toUpperCase() || t("subtitles") }));
       const close = modal(r.name, v, [{ label: t("close"), onClick: () => {} }]);
       v.addEventListener("ended", () => {});
       return close;
@@ -1202,7 +2005,10 @@
       if (S.make.current !== wasStage || S.make.status !== was) {
         // the server changed the brief (b-roll / portrait / presenter quality) or made a render
         await refreshAssets(true); renderRenders(); await refreshTimeline();
-        if (S.make.status === "done" && was !== "done") toast(t("make.done", { name: (S.make.result || {}).render || "" }), "ok", 8000);
+        if (S.make.status === "done" && was !== "done") {
+          const rs = (S.make.result || {}).renders || [(S.make.result || {}).render];
+          toast(rs.length > 1 ? t("make.doneMany", { n: rs.length }) : t("make.done", { name: rs[0] || "" }), "ok", 8000);
+        }
         if (S.make.status === "error" && was !== "error") toast(t("jobFailed", { msg: S.make.error }), "error", 12000);
       }
       if (makeActive()) makeTimer = setTimeout(pollMake, 1500);
@@ -1252,6 +2058,14 @@
     // ---------- keyboard ----------
     const onKey = e => {
       const tag = (e.target.tagName || "").toLowerCase();
+      // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y: project undo/redo everywhere except the raw JSON editor
+      const k = (e.key || "").toLowerCase();
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && (k === "z" || k === "y") && !$(".modal-wrap") &&
+          !(e.target.dataset && e.target.dataset.nativeUndo)) {
+        e.preventDefault();
+        if (k === "y" || e.shiftKey) redo(); else undo();
+        return;
+      }
       if (["input", "textarea", "select"].includes(tag) || e.target.isContentEditable || $(".modal-wrap")) return;
       if (e.code === "Space" && !(tag === "button" && e.target.closest(".scene-list, .actions, .renders, .picker, .seg"))) { e.preventDefault(); preview.toggle(); }
       else if (e.key === "ArrowLeft" && !e.altKey) { preview.seek(preview.t - 1); }
@@ -1266,7 +2080,8 @@
     // ---------- boot ----------
     (async () => {
       try { await loadProject(); }
-      catch (e) { view.replaceChildren(el("section", { class: "page" }, el("h1", {}, "Not found"), el("p", {}, e.message), el("a", { href: "#/" }, "← " + t("back")))); return; }
+      catch (e) { view.replaceChildren(el("section", { class: "page" }, el("h1", {}, t("notFound")), el("p", {}, e.message), el("a", { href: "#/" }, "← " + t("back")))); return; }
+      await loadTemplates();
       renderCrumb();
       await checkOvoz();
       if (fixVoice()) changed();
@@ -1275,7 +2090,9 @@
       setTab("scene");
       renderRenders();
       renderActions();
-      preview.setFormat(S.brief.format);
+      renderPreviewBar();
+      renderCover();
+      preview.setFormat(S.fmt);
       transport.parentElement.querySelector(".pv-info").after(el("p", { class: "muted small shortcuts" }, t("shortcuts")));
       await refreshTimeline();
       AI.loadStatus().catch(() => {});
@@ -1284,6 +2101,7 @@
       if (makeActive()) pollMake();
       const st = S.tl && S.tl.scenes[0];
       if (st) preview.seek(Math.min(1.6, st.end - 0.3));
+      settle();
     })();
 
     return () => {
@@ -1295,11 +2113,16 @@
       if (S.version !== S.savedVersion) save();
       preview.stop();
       clip.pause();
+      musPrev.pause();
+      clearTimeout(alignTimer);
+      clearTimeout(UN.timer);
+      closeDrawer();
       document.removeEventListener("keydown", onKey);
       document.removeEventListener("ovoz", onOvoz);
       removeEventListener("beforeunload", onUnload);
     };
   }
 
+  applyStatic();
   route();
 })();

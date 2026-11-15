@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 
 import build
+import exports
+from brief import FORMATS
 from store import Project, now
 
 VIDEO = Path(__file__).resolve().parent.parent
@@ -125,59 +127,116 @@ class Jobs:
         p = Project.get(job["project"])
         prm = job["params"]
         ids = [prm["scene"]] if prm.get("scene") else None
+        langs = _langs(p, prm)
         self._wait_gate(job)
 
         def prog(f, msg):
             if job.get("cancel"):
                 raise Cancelled()
-            job.update(progress=round(f, 3), stage="voice", message=msg)
+            job.update(progress=round(0.85 * f, 3), stage="voice", message=msg)
 
-        res = build.generate(p, ids, force=bool(prm.get("force")), progress=prog)
-        tl = build.timeline(p)
-        build.voiceover(p, tl)
-        return {**res, "voiced": tl["voiced"], "voice_needed": tl["voice_needed"]}
+        res = build.generate(p, ids, force=bool(prm.get("force")), progress=prog, langs=langs)
+
+        def aprog(f, msg):
+            job.update(progress=round(0.85 + 0.15 * f, 3), stage="timing", message=msg)
+        res["timing"] = build.align_all(p, langs, progress=aprog)
+        voiced = needed = 0
+        for lg in langs:
+            tl = build.timeline(p, lang=lg)
+            build.voiceover(p, tl)
+            voiced += tl["voiced"]
+            needed += tl["voice_needed"]
+        return {**res, "voiced": voiced, "voice_needed": needed, "languages": langs}
 
     def _render(self, job: dict) -> dict:
+        """One MP4 (+ .srt, .vtt, cover .png) per language x format: <lang>-<fmt>-<timestamp>.mp4."""
         p = Project.get(job["project"])
         prm = job["params"]
+        brief = p.brief
+        langs = _langs(p, prm)
+        fmts = [f for f in (prm.get("formats") or []) if f in FORMATS] or build.formats_of(brief)
         warnings = []
-        # 1. voice-over (only what is missing)
+        # 1. voice-over (only what is missing) + word timing
         if not prm.get("skip_voice"):
             job.update(stage="voice", message="voice-over", progress=0.0)
-            tl0 = build.timeline(p)
-            if tl0["voiced"] < tl0["voice_needed"]:
+            if build.todo_lines(p, langs):
                 self._wait_gate(job)
 
             def prog(f, msg):
                 if job.get("cancel"):
                     raise Cancelled()
-                job.update(progress=round(0.15 * f, 3), message=msg)
+                job.update(progress=round(0.12 * f, 3), message=msg)
             try:
-                build.generate(p, progress=prog)
+                build.generate(p, progress=prog, langs=langs)
             except build.V.TTSError as e:
                 if not prm.get("allow_silent"):
                     raise RuntimeError(f"{e}. Fix the voice settings, or render without voice-over.") from None
                 warnings.append(f"voice-over skipped: {e}")
-        # 2. timeline + voiceover.wav
-        job.update(stage="timeline", message="timeline", progress=0.15)
-        tl = build.write_render_timeline(p)
-        if tl["voice_needed"] and tl["voiced"] < tl["voice_needed"]:
-            warnings.append(f"{tl['voice_needed'] - tl['voiced']} scene(s) without voice-over (silence)")
-        # 3. frames + encode in a subprocess (isolated, cancellable)
+        job.update(stage="timing", message="word timing", progress=0.12)
+        build.align_all(p, langs, progress=lambda f, m: job.update(progress=round(0.12 + 0.03 * f, 3), message=m))
+        # 2. timelines (+ voice-over joins and music mixes, shared by the formats of a language)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        final = p.renders_dir / f"{stamp}-{tl['format'].replace(':', 'x')}.mp4"
-        out = p.build_dir / f"render-{job['id']}.mp4"   # moved into renders/ only when complete
         p.renders_dir.mkdir(parents=True, exist_ok=True)
-        cmd = [PY, str(RENDER), "--project", str(p.dir), "--out", str(out), "--progress",
-               "--workers", str(prm.get("workers") or 8)]
+        outputs = [(lg, f) for lg in langs for f in fmts]
+        tls = {}
+        for lg, f in outputs:
+            job.update(stage="timeline", message=f"timeline + audio mix: {lg} {f}")
+            tls[(lg, f)] = build.write_render_timeline(p, lg, f)
+            if job.get("cancel"):
+                raise Cancelled()
+        # 3. frames + encode per output in a subprocess (isolated, cancellable)
+        total_frames = sum(t["frames"] for t in tls.values()) or 1
+        done_frames, results = 0, []
+        t_all = time.time()
+        for k, (lg, f) in enumerate(outputs):
+            tl = tls[(lg, f)]
+            tag = f"{lg} {f}" + (f" ({k + 1}/{len(outputs)})" if len(outputs) > 1 else "")
+            if tl["voice_needed"] and tl["voiced"] < tl["voice_needed"]:
+                warnings.append(f"{lg}: {tl['voice_needed'] - tl['voiced']} scene(s) without voice-over (silence)")
+            base = f"{lg}-{build.fmt_slug(f)}-{stamp}"
+            out = p.build_dir / f"render-{job['id']}-{k}.mp4"   # moved into renders/ only when complete
+            cover_png = p.build_dir / f"render-{job['id']}-{k}.png"
+            cover_t = exports.cover_time(tl, brief.get("cover"))
+            cmd = [PY, str(RENDER), "--project", str(p.dir), "--timeline", str(p.build_dir / tl["_file"]),
+                   "--out", str(out), "--progress", "--workers", str(prm.get("workers") or 8),
+                   "--cover", str(cover_t), "--cover-out", str(cover_png)]
+            t0 = time.time()
+            rc, tail = self._run_render(job, cmd, tag, done_frames, total_frames, t_all)
+            if job.get("cancel"):
+                out.unlink(missing_ok=True)
+                cover_png.unlink(missing_ok=True)
+                raise Cancelled()
+            if rc != 0 or not out.exists():
+                out.unlink(missing_ok=True)
+                raise RuntimeError(f"render {lg} {f} failed: " + " | ".join(tail[-5:]))
+            done_frames += tl["frames"]
+            final = p.renders_dir / f"{base}.mp4"
+            (p.renders_dir / f"{base}.srt").write_text(exports.srt(tl), encoding="utf-8")
+            (p.renders_dir / f"{base}.vtt").write_text(exports.vtt(tl), encoding="utf-8")
+            if cover_png.exists():
+                cover_png.replace(p.renders_dir / f"{base}.png")
+            meta = {"language": lg, "format": f, "duration": tl["duration"], "width": tl["width"], "height": tl["height"],
+                    "voiced": tl["voiced"], "voice_needed": tl["voice_needed"], "warnings": warnings,
+                    "seconds": round(time.time() - t0, 1), "cover_t": cover_t, "timing": tl.get("timing"),
+                    "music": tl.get("music"), "srt": f"{base}.srt", "vtt": f"{base}.vtt",
+                    "cover": f"{base}.png" if (p.renders_dir / f"{base}.png").exists() else None, "batch": stamp}
+            final.with_suffix(".json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
+            out.replace(final)
+            results.append({"render": final.name, **meta})
+        p.touch()
+        first = results[0]
+        return {"render": first["render"], "renders": [r["render"] for r in results], "outputs": results,
+                "duration": first["duration"], "format": first["format"], "warnings": warnings,
+                "seconds": round(time.time() - t_all, 1)}
+
+    def _run_render(self, job, cmd, tag, done_frames, total_frames, t_all):
         env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
-        job.update(stage="frames", message="starting browser", progress=0.16)
+        job.update(stage="frames", message=f"{tag}: starting browser")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                 encoding="utf-8", errors="replace", env=env,
                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.procs[job["id"]] = proc
         tail: list[str] = []
-        t0 = time.time()
         try:
             for line in proc.stdout:
                 line = line.rstrip()
@@ -187,30 +246,27 @@ class Jobs:
                     except ValueError:
                         continue
                     if ev["stage"] == "frames" and ev["total"]:
-                        f = ev["done"] / ev["total"]
-                        el = time.time() - t0
+                        f = (done_frames + ev["done"]) / total_frames
+                        el = time.time() - t_all
                         eta = el / f * (1 - f) if f > 0.02 else None
-                        job.update(stage="frames", progress=round(0.17 + 0.78 * f, 3),
-                                   message=f"frame {ev['done']}/{ev['total']}" + (f" · ~{eta:.0f}s left" if eta else ""))
+                        job.update(stage="frames", progress=round(0.16 + 0.82 * f, 3),
+                                   message=f"{tag}: frame {ev['done']}/{ev['total']}" + (f" · ~{eta:.0f}s left" if eta else ""))
                     elif ev["stage"] == "encoding":
-                        job.update(stage="encoding", progress=0.96, message="finishing MP4")
+                        job.update(stage="encoding", message=f"{tag}: finishing MP4")
                     elif ev["stage"] == "audio":
-                        job.update(stage="audio", message="analysing audio")
+                        job.update(stage="audio", message=f"{tag}: analysing audio")
                 elif line:
                     tail = (tail + [line])[-15:]
             rc = proc.wait()
         finally:
             self.procs.pop(job["id"], None)
-        if job.get("cancel"):
-            out.unlink(missing_ok=True)
-            raise Cancelled()
-        if rc != 0 or not out.exists():
-            out.unlink(missing_ok=True)
-            raise RuntimeError("render failed: " + " | ".join(tail[-5:]))
-        meta = {"format": tl["format"], "duration": tl["duration"], "width": tl["width"], "height": tl["height"],
-                "voiced": tl["voiced"], "voice_needed": tl["voice_needed"], "warnings": warnings,
-                "seconds": round(time.time() - t0, 1)}
-        final.with_suffix(".json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
-        out.replace(final)
-        p.touch()
-        return {"render": final.name, **meta}
+        return rc, tail
+
+
+def _langs(p: Project, prm: dict) -> list[str]:
+    """The languages a job works on: params lang / langs (filtered to the project's), default all."""
+    all_l = build.langs_of(p.brief)
+    want = prm.get("langs") or ([prm["lang"]] if prm.get("lang") else None)
+    if not want:
+        return all_l
+    return [lg for lg in want if lg in all_l] or all_l

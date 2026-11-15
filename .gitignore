@@ -30,3 +30,9 @@ voices/uz/
 voices/ru/
 voices/en/
 voices/ar/
+
+# local ComfyUI install (video/comfyui/setup.py); only the script, model-path config and README are tracked
+video/comfyui/*
+!video/comfyui/setup.py
+!video/comfyui/extra_model_paths.yaml
+!video/comfyui/README.md

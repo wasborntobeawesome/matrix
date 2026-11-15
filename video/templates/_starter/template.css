@@ -1,0 +1,22 @@
+/* Starter template CSS. Scope every rule to #stage.tpl-<your id> (here: tpl-starter) so it never
+   leaks into other templates in the studio preview. Colours: use the variables the renderer sets
+   from your manifest tokens + the project's brand colours: --bg --surface --primary --accent --text --muted. */
+
+#stage.tpl-starter #blobC { background: radial-gradient(closest-side, rgba(255, 181, 71, .22), transparent); }
+
+/* the custom hero (built by template.js): a centred column inside the content area */
+#stage.tpl-starter .st-hero { position: absolute; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; text-align: center; }
+#stage.tpl-starter .st-ring { position: absolute; left: 50%; top: 50%; width: 760px; height: 760px; margin: -380px 0 0 -380px;
+  border-radius: 50%; border: 3px dashed color-mix(in srgb, var(--accent) 45%, transparent); }
+#stage.tpl-starter:not(.opt-ring) .st-ring { display: none; }
+#stage.tpl-starter .st-kicker { font-size: 34px; font-weight: 700; color: var(--accent); letter-spacing: .14em; margin-bottom: 30px; }
+#stage.tpl-starter .st-hero .headline { font-size: 140px; color: var(--text); }
+#stage.tpl-starter .st-sub { margin-top: 30px; font-size: 46px; color: var(--muted); }
+#stage.tpl-starter.square .st-ring { width: 600px; height: 600px; margin: -300px 0 0 -300px; }
+#stage.tpl-starter.square .st-hero .headline { font-size: 112px; }
+#stage.tpl-starter.square .st-sub { font-size: 38px; }
+
+/* restyle built-in layouts with plain CSS */
+#stage.tpl-starter .chip, #stage.tpl-starter .item { background: var(--surface); }
+#stage.tpl-starter .pill { background: var(--accent); color: #1A1410; }

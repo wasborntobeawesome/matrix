@@ -1,0 +1,29 @@
+{
+  "id": "aurora",
+  "name": "Aurora",
+  "description": "The original Video Studio look: dark, glowing brand gradients, a soft grid and particles, glassy caption pill.",
+  "author": "Video Studio",
+  "version": "1.0.0",
+  "licence": "MIT",
+  "kind": "theme",
+  "formats": ["9:16", "1:1", "16:9"],
+  "layouts": ["hero", "chips", "stat", "list", "cta", "screen", "screens", "presenter"],
+  "default_transition": "lift",
+  "previews": ["preview-9x16.png", "preview-1x1.png", "preview-16x9.png"],
+  "tokens": {
+    "tone": "dark",
+    "colors": {
+      "background": "brand.background",
+      "primary": "brand.primary",
+      "accent": "brand.accent",
+      "surface": "auto",
+      "text": "#F5F7FF",
+      "muted": "#9AA3C0"
+    },
+    "fonts": { "display": "Inter", "body": "Inter", "display_weight": 800, "body_weight": 500 },
+    "caption": { "style": "pill", "highlight": "brand.accent" },
+    "progress": { "style": "segments" },
+    "logo": { "placement": "auto" },
+    "background": { "blobs": true, "grid": true, "particles": true, "vignette": true }
+  }
+}

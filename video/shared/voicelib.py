@@ -81,30 +81,97 @@ def duration(path: Path) -> float:
         return w.getnframes() / w.getframerate()
 
 
-def display_text(text: str, lang: str = "uz") -> str:
-    """Typewriter apostrophes -> proper Uzbek letters for on-screen captions (oʻ gʻ ʼ)."""
-    if lang != "uz":
+# Uzbek Latin: o' / g' are the letters oʻ gʻ (U+02BB); any other apostrophe inside a word is the
+# tutuq belgisi ʼ (U+02BC). A product name followed by an apostrophe and a suffix ("Nimbo'ni",
+# "Nimbo'da") is also the tutuq belgisi, not the letter oʻ.
+_APOS = "'‘’`ʻʼ"
+_UZ_SUFFIX = re.compile(r"^(?:lar)?(?:im|ing|i|si|imiz|ingiz|miz|ngiz)?"
+                        r"(?:ni|ning|ga|ka|qa|da|dan|dagi|dek|day|cha|chi|mi|siz|li|lik|ligi)?$", re.I)
+
+
+def _uz_word(w: str, product: str = "") -> str:
+    def fix(m: re.Match) -> str:
+        pre, rest = w[:m.start() + 1], w[m.end():]
+        letter = m.group(1)
+        prod = re.sub(r"\W", "", product.lower())
+        tutuq = bool(prod) and re.sub(r"\W", "", pre.lower()) == prod and rest[:1].isalpha()
+        # capitalised name ending in o + apostrophe + case suffix: "Nimbo'ni", "Payme'ga" stays below
+        if not tutuq and letter in "oO" and len(pre) >= 4 and pre[:1].isupper() and rest and _UZ_SUFFIX.match(rest):
+            tutuq = True
+        return letter + ("ʼ" if tutuq else "ʻ")
+    w = re.sub(r"([oOgG])['‘’`ʻ]", fix, w)
+    return re.sub(r"(?<=\w)['’`](?=\w)", "ʼ", w)
+
+
+def display_text(text: str, lang: str = "uz", product: str = "") -> str:
+    """Typewriter apostrophes -> proper Uzbek letters for on-screen text (oʻ gʻ ʼ). Other languages unchanged."""
+    if lang != "uz" or not text:
         return text
-    text = re.sub(r"([oOgG])['‘’`]", r"\1ʻ", text)
-    return re.sub(r"(?<=\w)['’`](?=\w)", "ʼ", text)
+    return re.sub(r"\S+", lambda m: _uz_word(m.group(0), product), text)
 
 
-def caption_chunks(text: str, start: float, length: float, max_words: int = 3, lang: str = "uz") -> list[dict]:
-    """Split a line into short chunks timed by character weight (punctuation adds a pause)."""
-    words = display_text(text, lang).split()
-    if not words:
-        return []
-    weight = [len(re.sub(r"\W", "", w)) + 1 + (3 if re.search(r"[.,!?:;،؟]$", w) else 0) for w in words]
-    total = sum(weight)
-    chunks, cur, t = [], [], start
+_PUNCT_END = re.compile(r"[.,!?:;،؟…]$")
+
+
+def _chunk_groups(words: list[str], max_words: int) -> list[list[int]]:
+    groups, cur = [], []
     for i, w in enumerate(words):
         cur.append(i)
-        end_of_phrase = re.search(r"[.,!?:;،؟]$", w)
-        if len(cur) == max_words or end_of_phrase or i == len(words) - 1:
-            dt = length * sum(weight[j] for j in cur) / total
-            chunks.append({"text": " ".join(words[j] for j in cur), "start": round(t, 3), "end": round(t + dt, 3)})
-            t += dt
+        if len(cur) == max_words or _PUNCT_END.search(w) or i == len(words) - 1:
+            groups.append(cur)
             cur = []
+    return groups
+
+
+def word_times(text: str, start: float, length: float, lang: str = "uz", product: str = "") -> list[dict]:
+    """Estimated per-word times (character weight, punctuation adds a pause)."""
+    words = display_text(text, lang, product).split()
+    if not words:
+        return []
+    weight = [len(re.sub(r"\W", "", w)) + 1 + (3 if _PUNCT_END.search(w) else 0) for w in words]
+    total = sum(weight)
+    out, t = [], start
+    for w, wt in zip(words, weight):
+        dt = length * wt / total
+        # the pause weight of a trailing comma/period is silence after the word, not the word itself
+        speak = dt * (len(re.sub(r"\W", "", w)) + 1) / wt
+        out.append({"w": w, "start": round(t, 3), "end": round(t + speak, 3)})
+        t += dt
+    return out
+
+
+def chunks_from_words(words: list[dict], max_words: int = 3, end: float | None = None) -> list[dict]:
+    """Caption chunks from timed words [{w, start, end}]. Each chunk keeps its word times."""
+    if not words:
+        return []
+    groups = _chunk_groups([w["w"] for w in words], max_words)
+    out = []
+    for gi, g in enumerate(groups):
+        a = words[g[0]]["start"]
+        if gi + 1 < len(groups):
+            nxt = words[groups[gi + 1][0]]["start"]
+            last = words[g[-1]]["end"]
+            b = nxt if nxt - last < 0.35 else last + 0.15   # bridge short gaps, keep real pauses
+        else:
+            b = max(words[g[-1]]["end"], end if end is not None else 0)
+        out.append({"text": " ".join(words[i]["w"] for i in g), "start": round(a, 3), "end": round(b, 3),
+                    "words": [[round(words[i]["start"], 3), round(words[i]["end"], 3)] for i in g]})
+    return out
+
+
+def caption_chunks(text: str, start: float, length: float, max_words: int = 3, lang: str = "uz",
+                   product: str = "") -> list[dict]:
+    """Split a line into short chunks timed by character weight (punctuation adds a pause)."""
+    words = display_text(text, lang, product).split()
+    if not words:
+        return []
+    weight = [len(re.sub(r"\W", "", w)) + 1 + (3 if _PUNCT_END.search(w) else 0) for w in words]
+    total = sum(weight)
+    chunks, t = [], start
+    for g in _chunk_groups(words, max_words):
+        dt = length * sum(weight[j] for j in g) / total
+        chunks.append({"text": " ".join(words[j] for j in g), "start": round(t, 3), "end": round(t + dt, 3)})
+        t += dt
     return chunks
 
 

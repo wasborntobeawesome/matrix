@@ -13,6 +13,7 @@ from pathlib import Path
 from PIL import Image
 
 import brief as B
+import history
 
 STUDIO = Path(__file__).resolve().parent
 VIDEO = STUDIO.parent
@@ -128,12 +129,19 @@ class Project:
     def brief(self) -> dict:
         return self.read()["brief"]
 
-    def save_brief(self, brief: dict) -> None:
+    def save_brief(self, brief: dict, kind: str = "edit", label: str | None = None) -> dict | None:
+        """Write the brief and snapshot it in the version history (rapid edits are coalesced).
+        Returns the snapshot meta (None when nothing changed)."""
         with _lock:
             d = self.read()
+            old = d.get("brief")
             d["brief"] = brief
             d["updated"] = now()
             self._write(d)
+            try:
+                return history.record(self, old, brief, kind, label)
+            except OSError:          # history is a convenience; never fail a save because of it
+                return None
 
     def touch(self) -> None:
         with _lock:
@@ -286,7 +294,7 @@ class Project:
     def renders(self) -> list[dict]:
         out = []
         if self.renders_dir.exists():
-            for f in sorted(self.renders_dir.glob("*.mp4"), reverse=True):
+            for f in sorted(self.renders_dir.glob("*.mp4"), key=lambda f: (f.stat().st_mtime, f.name), reverse=True):
                 meta = {}
                 mj = f.with_suffix(".json")
                 if mj.exists():
@@ -294,11 +302,14 @@ class Project:
                         meta = json.loads(mj.read_text(encoding="utf-8"))
                     except ValueError:
                         pass
+                for k, ext in (("srt", ".srt"), ("vtt", ".vtt"), ("cover", ".png")):
+                    meta[k] = f.with_suffix(ext).name if f.with_suffix(ext).exists() else None
                 out.append({"name": f.name, "size": f.stat().st_size, "created": f.stat().st_mtime, **meta})
         return out
 
     def render_path(self, name: str) -> Path:
-        if not re.match(r"^[\w.-]+\.mp4$", name or ""):
+        """A render or one of its sidecar files (.srt, .vtt, cover .png)."""
+        if not re.match(r"^[\w.-]+\.(mp4|srt|vtt|png)$", name or ""):
             raise StoreError("bad render name", 404)
         p = self.renders_dir / name
         if not p.is_file():
@@ -319,7 +330,8 @@ class Project:
             thumb = next(iter(assets))
         renders = self.renders()
         return {"id": self.id, "title": b.get("title"), "product": b.get("product"), "language": b.get("language"),
-                "format": b.get("format"), "scenes": len(b.get("scenes", [])), "assets": len(assets),
+                "format": b.get("format"), "languages": b.get("languages") or [b.get("language")],
+                "formats": b.get("formats") or [b.get("format")], "scenes": len(b.get("scenes", [])), "assets": len(assets),
                 "renders": len(renders), "latest_render": renders[0]["name"] if renders else None,
                 "thumb": thumb, "created": d.get("created"), "updated": d.get("updated"), "source": d.get("source")}
 
@@ -349,7 +361,7 @@ def import_project(raw_brief, files: list[tuple[Path, str]], source: str) -> tup
         if raw_brief is not None:
             fixed = B.rename_assets(raw_brief, mapping)
             brief, warnings = B.normalize(fixed, p.assets())
-        p.save_brief(brief)
+        p.save_brief(brief, kind="import", label="Imported" if raw_brief is not None else "Created")
     except Exception:
         p.delete()
         raise

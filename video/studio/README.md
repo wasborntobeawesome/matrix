@@ -2,8 +2,16 @@
 
 A local web app for making promo videos about other products. It builds them from screenshots,
 screen recordings and an AI-written script (the **brief**). People review and edit the brief in the
-browser, preview it live, generate the voice-over with the Ovoz TTS app, and render an MP4 in 9:16
-or 16:9. Everything is free/open source: FastAPI, Playwright Chromium, FFmpeg, and plain HTML/JS.
+browser, preview it live, generate the voice-over with the Ovoz TTS app, and render MP4s in 9:16, 1:1
+and 16:9, in several languages from one brief (uz, ru, en, ar), with background music, word-accurate
+captions, `.srt`/`.vtt` subtitles and a cover image per video. The look comes from a **template**
+(built in: *Aurora*, *Clean*, *Bold*; import your own as a zip — see
+[`../templates/TEMPLATES.md`](../templates/TEMPLATES.md)). The editor has undo/redo, a version history, a
+follow-up message for the source AI, and an English / Uzbek interface. A live system monitor (header widget +
+monitor page) shows GPU, VRAM by owner, CPU and RAM; optional local AI layers (b-roll from three video generators,
+image-to-video, a talking-head presenter, AI music) run in warm model workers, and any ComfyUI workflow can be a
+video generator through a managed local ComfyUI (HTTP API only). Everything is free/open source: FastAPI,
+Playwright Chromium, FFmpeg, faster-whisper, numpy, NVML/psutil and plain HTML/JS.
 
 ## Run
 
@@ -20,8 +28,10 @@ Open **http://127.0.0.1:8001/**. Voice-over needs the Ovoz app at `http://127.0.
 timing, and render a silent video. The UI shows a banner when Ovoz is down.
 
 One-time setup (already done in this repo's venv):
-`video/.venv/Scripts/python -m pip install fastapi "uvicorn[standard]" python-multipart`, plus
-playwright+Chromium, pillow, numpy, pyyaml (shared with `video/html`).
+`video/.venv/Scripts/python -m pip install fastapi "uvicorn[standard]" python-multipart faster-whisper`, plus
+playwright+Chromium, pillow, numpy, pyyaml (shared with `video/html`). The word-timing model is downloaded
+once: `video/.venv/Scripts/python -c "from faster_whisper import download_model; download_model('small')"`
+(≈ 480 MB in the Hugging Face cache; without it captions use the old estimate).
 
 Example assets for a fictional app ("Nimbo") are in [`example/`](example/). Click
 **Start from example** in the UI, or regenerate the assets with `example/make_example.py`.
@@ -35,12 +45,16 @@ Example assets for a fictional app ("Nimbo") are in [`example/`](example/). Clic
    - **Inbox folder**: `video/inbox/<name>/brief.json` + files are imported automatically within ~3 s
      and moved to `video/inbox/_imported/`. Errors go to `ERROR.txt` in that folder.
 2. In the editor: reorder, add, duplicate or delete scenes (drag, or Alt+↑/↓). Edit text, pick
-   screenshots, and drag a focus rectangle on the image. Set language, format, voice model/voice
-   (only available Ovoz models that speak the language), speed, brand colours, logo and captions.
-   Every change autosaves and updates the live preview.
-3. **Generate voice** synthesises only the missing or changed lines; ▶ next to a scene plays its
-   clip. **Render MP4** queues a render with stage and progress. The finished file appears under
-   Renders (play / download).
+   screenshots, and drag a focus rectangle on the image. Set the languages (toggle UZ/RU/EN/AR, ★ = main),
+   the formats (toggle 9:16 / 1:1 / 16:9), voice model/voice per language (only available Ovoz models
+   that speak that language), speed, brand colours, logo and captions. The scene form has a tab per
+   language plus **Side by side**; scenes with a missing translation show `⚠ RU` in the list and a
+   warning in the form. The **Music** tab picks / uploads background music. Every change autosaves and
+   updates the live preview, which has its own language and format switch.
+3. **Generate voice** synthesises only the missing or changed lines (every language) and measures the
+   word timing; ▶ next to a scene plays its clip. **Render MP4 (n)** renders every language × format.
+   The finished files appear under Renders with their cover, `.srt` and `.vtt` (play with subtitles /
+   download).
 
 ## Architecture
 
@@ -48,31 +62,55 @@ Example assets for a fictional app ("Nimbo") are in [`example/`](example/). Clic
 video/
   html/                 renderer (shared with the original HTML option)
     index.html          stage; ?data=<data.js url> | ?embed (live preview, waits for loadTimeline)
-    app.js              mount(timeline) -> seek(t) is a pure function of t; layouts hero, chips,
+    transitions.js      scene transitions (lift, fade, slide, zoom, wipe, blur, cut), shared with the studio UI
+    app.js              mount(timeline) -> seek(t) is a pure function of t; templates (tokens -> CSS variables,
+                        template.css, template.js layouts/transitions/hooks, run with a frozen clock); layouts hero, chips,
                         stat, list, cta, screen, screens, presenter; phone/browser frames; focus zoom (inside the screen) +
-                        callout; recordings (<video>, seek awaits 'seeked'); 9:16 + 16:9
-    render.py           --project DIR: 8 headless Chromium pages -> JPEG -> ffmpeg (H.264 + AAC)
-  shared/voicelib.py    Ovoz TTS client, silence trim, joining, caption chunks, length estimate
+                        callout; recordings (<video>, seek awaits 'seeked'); 9:16, 1:1 (.square) and 16:9 (.land);
+                        right-to-left (.rtl, mirrored side-by-side layouts); ?cover = no captions/progress
+    render.py           --project DIR [--timeline F] [--cover T --cover-out PNG]: 8 headless Chromium pages ->
+                        JPEG -> ffmpeg (H.264 + AAC); waveforms follow `analysis_audio` (the voice) when
+                        the muxed `audio` is the music mix
+  shared/voicelib.py    Ovoz TTS client, silence trim, joining, caption chunks (estimated or from word
+                        times), Uzbek display text (oʻ gʻ ʼ), length estimate
   studio/
     server.py           FastAPI app + static UI + /renderer and /shared/fonts mounts
-    brief.py            JSON Schema + lenient normalize/validate
+    brief.py            JSON Schema + lenient normalize/validate; localize(brief, lang); missing_translations
     store.py            projects on disk, safe uploads, VP9 transcode, thumbnails
-    build.py            per-scene voice cache, timeline, voiceover.wav
+    build.py            per-scene voice cache, timeline per language + format, voice-over, music mix
+    align.py            word timing: faster-whisper (CPU int8) + alignment onto the script, cache, fallback
+    music.py            music library (add_track/list/delete), builtin numpy tracks, ducking + loudness mix
+    exports.py          .srt / .vtt cues from the aligned captions, cover time
+    templates.py        template discovery, manifest checks, zip import, timeline.template for the renderer
+    history.py          version history: snapshot per save (coalesced), list, restore, change summaries
+    followup.py         "Ask the AI for missing material" message
     jobs.py             background queues: voice (1 worker), render (1 at a time, subprocess)
     inbox.py            shared-folder watcher
-    aijobs.py           GPU job queue for the AI layers (b-roll, portrait, presenter; subprocesses)
-    gpu.py              VRAM status: nvidia-smi + per-process GPU memory (Ovoz attribution)
+    aijobs.py           GPU job queue for the AI layers (b-roll, portrait, presenter, music) — runs them in warm workers
+    workers.py          warm AI model workers (one video/ai/worker.py per model family): RAM budget, idle timeout, release
+    providers.py        b-roll video generators (wan22-5b, fastwan-5b, wan22-a14b, comfy:<workflow>): licences, presets, estimates
+    comfy.py            ComfyUI: managed server (start/stop/adopt, flags, log), HTTP + WebSocket client, /free, cancel
+    comfyflows.py       ComfyUI workflow library: API-format parsing, mapping auto-detection, /object_info validation, fill
+    sysmon.py           1 Hz system sampler (NVML + psutil + PDH per-process GPU counters), 30-min history, stage markers
+    gpu.py              VRAM status for the AI queue (reads the sampler; nvidia-smi + PowerShell fallback)
     library.py          shared b-roll + portrait library (video/library/)
     presenter.py        talking-head planning, segment cache, assembly
     pipeline.py         "Make video": voice -> free GPU (Ovoz /api/unload) -> AI jobs -> render
-    static/             UI: index.html, app.js, ai.js (AI page + components), style.css, strings.js (all UI text)
+    static/             UI: index.html, app.js, ai.js (AI page + components), monitor.js (header widget + #/monitor),
+                        style.css, strings.js (English UI text), strings-uz.js (Uzbek UI text)
     example/            fictional sample brief + screenshots + recording
-  projects/<id>/        (gitignored) project.json, assets/, assets.json, thumbs/,
-                        build/{voice/<hash>.wav, voiceover.wav, timeline.json, data.js},
-                        renders/<timestamp>-<format>.mp4 (+ .json metadata)
+  templates/<id>/       manifest.json (+ template.css, template.js, fonts, previews); aurora, clean, bold,
+                        _starter (copy me), validate.py, TEMPLATES.md
+  projects/<id>/        (gitignored) project.json, history/, assets/, assets.json, thumbs/,
+                        build/{voice/<hash>.wav, voiceover[-<lang>].wav, mix-<lang>.wav (+.json),
+                        timeline-<lang>-<fmt>.json, data-<lang>-<fmt>.js},
+                        renders/<lang>-<fmt>-<timestamp>.mp4 (+ .json metadata, .srt, .vtt, .png cover)
   inbox/                (gitignored) drop folders here
-  library/              (gitignored) broll/<id>/, portraits/<id>/, ai-jobs.json, ai-timings.json
+  library/              (gitignored) broll/<id>/, portraits/<id>/, music/<id>/, align/<hash>.json,
+                        ai-jobs.json, ai-timings.json
   ai/                   local generative-AI scripts + their own venv (see ai/README.md)
+  comfyui/              setup.py (tracked) + the local ComfyUI install, venv, models, logs (gitignored)
+  comfy-workflows/<id>/ workflow_api.json + manifest.json + preview.jpg per ComfyUI workflow; README.md (guide)
 ```
 
 - **Voice cache.** Each line's clip is `build/voice/<sha1(text, model, voice, rate, language, style)>.wav`
@@ -102,7 +140,7 @@ Interactive docs: http://127.0.0.1:8001/docs
 | `GET /api/ai-request` | copy-paste prompt for a chat AI (text/plain, from BRIEF.md) |
 | `GET /api/inbox` | inbox path + recent import events |
 | `GET /api/projects` | project summaries |
-| `POST /api/projects` | create. multipart: `brief` (JSON text or file) + any files; or JSON brief; or `{"blank": true, "product", "language", "format"}` → `{id, warnings, ...}` |
+| `POST /api/projects` | create. multipart: `brief` (JSON text or file) + any files; or JSON brief; or `{"blank": true, "product", "language", "languages"?, "format", "formats"?}` → `{id, warnings, ...}` |
 | `POST /api/projects/example?format=9:16` | new project from `example/` |
 | `GET /api/projects/{id}` | project.json + assets + renders + voiced map + warnings + jobs |
 | `PUT /api/projects/{id}` | replace the brief (`{"brief": {...}}` or the brief itself) → normalised brief + warnings |
@@ -113,11 +151,24 @@ Interactive docs: http://127.0.0.1:8001/docs
 | `GET /api/projects/{id}/timeline` | preview timeline (estimated lengths where no voice yet) |
 | `GET /api/projects/{id}/voiceover.wav` | current joined voice-over |
 | `GET /api/projects/{id}/voice/{scene}.wav` | one scene's clip (404 if not generated) |
-| `POST /api/projects/{id}/voice` | job: `{"scene"?: id, "force"?: bool}` |
-| `POST /api/projects/{id}/render` | job: `{"allow_silent"?: bool, "skip_voice"?: bool, "workers"?: 8}`; 409 if one is already queued/running for the project |
+| `POST /api/projects/{id}/voice` | job: `{"scene"?: id, "force"?: bool, "lang"?: "ru" \| "langs"?: [...]}` (default every language) + word timing |
+| `POST /api/projects/{id}/render` | job: `{"allow_silent"?, "skip_voice"?, "workers"?: 8, "langs"?: [...], "formats"?: [...]}` → one MP4 per language × format; result `{renders: [...], outputs: [...]}`; 409 if one is already queued/running for the project |
 | `GET /api/jobs/{job}` · `POST /api/jobs/{job}/cancel` | `{status: queued/running/done/error/cancelled, stage, progress 0..1, message, error, result, position}` |
 | `GET /api/projects/{id}/jobs` | recent jobs of a project |
-| `GET /api/projects/{id}/renders` · `GET …/renders/{name}[?download=1]` · `DELETE …/renders/{name}` | list / stream or download / delete |
+| `GET /api/projects/{id}/renders` | renders, newest first: `{name, language, format, duration, srt, vtt, cover, timing: {aligned, voiced}, music: {lufs, true_peak, …}, …}` |
+| `GET …/renders/{name}[?download=1]` · `DELETE …/renders/{name}.mp4` | stream or download a render **or** its `.srt` / `.vtt` / cover `.png` · delete (with its sidecars) |
+| `GET /api/projects/{id}/timeline?lang=ru&format=1:1` | preview timeline of one language + format (adds `music` for the preview, `timing`, per-scene `timing: aligned/estimated`) |
+| `GET /api/projects/{id}/voiceover.wav?lang=` · `…/voice/{scene}.wav?lang=` | voice-over / one clip of a language (default: main language) |
+| `GET /api/library/music` · `GET …/music/{id}/track.{ext}` | music library (with `used_in`) · the audio file |
+| `POST /api/library/music` | multipart: audio file (mp3/wav/ogg/m4a ≤ 60 MB) + **`licence`** (required) + `title`, `artist`, `mood`, `bpm`, `project` (use it there) |
+| `DELETE /api/library/music/{id}` | delete an uploaded/generated track (projects using it render without music) |
+| `GET /api/align/status` | word-timing model, loaded, error |
+| `GET /api/templates` · `GET /api/templates/{id}` · `GET /api/templates/schema` | installed templates (built-ins first, broken ones with `error`) · one · manifest schema |
+| `POST /api/templates[?replace=1]` · `DELETE /api/templates/{id}` | import a template zip (multipart `file` or raw body; 422 `{errors: [...]}` lists every problem) · delete (not built-ins) |
+| `GET /templates/{id}/{file}` | template files for the preview (never cached: hot reload) |
+| `GET /api/projects/{id}/timeline?template=<id>` | preview another template without saving it (the picker's live preview) |
+| `GET /api/projects/{id}/history` · `GET …/history/{n}` · `POST …/history/{n}/restore` | version list (newest first: `{id, created, updated, kind, summary, scenes}`) · one snapshot with its brief · restore (saved as a new version) |
+| `GET /api/projects/{id}/followup[?format=text]` | ready-to-send English message for the source AI + `issues`, `counts`, `ok` |
 
 Render jobs go through one queue, so only one render runs at a time and the others wait. Voice jobs
 use their own queue. A render first generates any missing voice lines. If Ovoz fails it errors,
@@ -128,6 +179,531 @@ Uploads are checked by extension and by content: Pillow verify for images, ffmpe
 transcode for video. Size limits are enforced while streaming. File names are reduced to
 `[A-Za-z0-9._-]`, and asset/render paths are resolved inside the project folder, so `..` gives 404.
 The server binds to 127.0.0.1 only and has no authentication. It is meant for local use.
+
+## Languages, formats, music, word timing, exports
+
+### Several languages from one brief
+
+- `languages: ["uz", "ru", "ar"]` (the first is the main language, also `language`). Every text field
+  (`say`, `headline`, `sub`, `kicker`, `callout`, `button`, `url`, `stat`, items, screen labels) is a
+  plain string (all languages) or a map `{"uz": "...", "ru": "..."}`. Old single-language briefs are
+  unchanged. See [BRIEF.md](BRIEF.md#languages-translations-and-formats).
+- `voices: {lang: {model, voice, rate?, style?}}`, default a Microsoft (`edge`) voice per language;
+  `voice` stays the main language's voice.
+- `brief.localize(brief, lang)` makes the single-language brief that voice-over, timeline and renderer
+  use. A missing translation falls back to the main language and is reported per scene and language
+  (`GET /api/projects/{id}` → `missing`, the editor's ⚠ badges and warning box).
+- Voice clips are cached per language (the hash includes the language and voice). The main language
+  keeps `build/voiceover.wav` (the AI presenter lip-syncs to it); others use `voiceover-<lang>.wav`.
+- **Uzbek on screen:** for `uz`, headline, sub, kicker, items, callout, button, labels and the product
+  name get `oʻ gʻ` (U+02BB) and the tutuq belgisi `ʼ` (U+02BC), like the captions: "Nimbo'ni ko'ring" →
+  "Nimboʼni koʻring" (a product name or a capitalised name ending in *o* + apostrophe + case suffix is
+  the tutuq belgisi, not the letter oʻ). Applied at render/preview time; the stored brief and the
+  text sent to the TTS are unchanged. ru/en/ar are untouched.
+- **Arabic** (`ar`) renders right to left: `#stage.rtl` with `dir=rtl`, no letter-spacing (it breaks
+  Arabic joining), right-aligned lists, the progress bar fills from the right, and side-by-side
+  layouts are mirrored (16:9 and 1:1 `screen`: text right, device left; `screens`: first screen on the
+  right; 16:9 `presenter`: card left; the 1:1 presenter bubble moves to the bottom-right). 9:16 layouts
+  are centred and only flip text direction.
+
+### Formats: 9:16, 1:1, 16:9
+
+- `formats: ["9:16", "1:1", "16:9"]` (default `[format]`). 1:1 = 1080×1080: header y 34–84, content
+  y 100–885, caption pill at y≈958, progress at 1036. Every layout has a 1:1 version: hero, chips
+  (2 columns), stat, list, cta, `screen` (phones next to the text, browsers / wide shots below it),
+  `screens`, `presenter` (card on the right), presenter bubble (bottom-left, devices and text keep
+  clear of it), b-roll backgrounds (cover crop).
+- A render (`POST …/render`, the *Render MP4 (n)* button, and the "Make video" render stage) makes one
+  MP4 per language × format: `renders/<lang>-<9x16|1x1|16x9>-<timestamp>.mp4`, plus `.json`, `.srt`,
+  `.vtt` and the cover `.png`. The renders list shows the latest batch and folds older ones away.
+- **Caption over the phone:** in 9:16 `screen`/`screens` scenes the device now ends at y 1325 and that
+  scene's caption pill moves down to y≈1410 (still above the 1540 px bottom safe zone and the progress
+  bar), so it sits below the phone instead of covering its screen. In 16:9 the device box ends at y 900
+  (it used to touch the pill at the end of the camera drift); in 1:1 at y 885.
+  `preview/v2-phase1-caption-over-phone-before-after-9x16.png`, `…-caption-clearance-before-after-16x9.png`.
+- The AI presenter speaks the main language; other languages render without the bubble (the still
+  portrait on `presenter` scenes). B-roll is generated for the main format's orientation.
+
+### Background music
+
+- Library: `video/library/music/<id>/track.(mp3|wav|ogg|m4a)` + `meta.json` `{id, title, artist, licence,
+  source: upload|generated|builtin, duration, mood?, bpm?, prompt?, created, lufs, ext}`. `music.py` is
+  the only module that touches it; `music.add_track(file, meta)` is the entry point for uploads now and an
+  AI music generator later (it checks the file with ffmpeg, measures duration and loudness).
+- Three builtin tracks are synthesised with numpy on first start (pads, plucks, FM piano, kick/hat;
+  seamless loops; "CC0, generated locally"): *Calm pad* 72 bpm 27 s, *Bright pluck* 104 bpm 18 s,
+  *Soft pulse* 90 bpm 21 s.
+- Editor **Music** tab: list with ▶ preview, pick one per project, delete (uploads), upload (licence
+  required), and the mix settings. Project setting:
+  `music: {track, volume_db: -20, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0}`.
+- **Mix** (render, `build.music_mix` → `music.mix`): voice-over loudness-matched to −20 LUFS, track to
+  −12 LUFS (8 LU apart, like raw speech vs a mastered song), then `volume_db`; ducking by `duck_db`
+  while the voice speaks, from the voice-over's own level (10 ms RMS gate at peak − 38 dB, 0.15 s
+  look-ahead, 0.3 s hold, 80 ms attack / 450 ms release, so short gaps between lines don't pump);
+  equal-power loop cross-fade when the track is shorter than the video; fade in/out; then two-pass
+  EBU R128 `loudnorm` of the whole mix to **−14 LUFS, −1.5 dBTP** (linear). Cached per voice-over +
+  settings (`build/mix-<lang>.wav`). The renderer's waveforms still follow the voice, not the music.
+- **Editor preview** plays the track with the voice, gain from the same reference levels and the duck
+  envelope sampled every 0.1 s (`timeline.music.duck`), fades included (approximate: HTML audio volume).
+
+### Caption and word timing (faster-whisper)
+
+- After the voice-over (voice job, render job, "Make video" voice stage) each clip is transcribed with
+  **faster-whisper `small`, CPU, int8, 8 threads** (`align.py`; the GPU stays free) with word timestamps,
+  and the recognised words are mapped onto the KNOWN script words: both sides are normalised (case,
+  apostrophes, Arabic diacritics/alef forms, ё, Cyrillic Uzbek → Latin), then a character-level
+  `difflib.SequenceMatcher` alignment gives each script word the times of its matched characters;
+  unmatched words are interpolated between neighbours by character weight. The script is given to
+  Whisper as `initial_prompt`; when fewer than 85 % of the words match, the clip is transcribed again
+  without it (Whisper hallucinated "Редактор субтитров…" on one Russian line with the prompt) and the
+  better result is kept. Below 50 % the scene falls back to the old estimate.
+- Cached per audio hash + script + model in `library/align/<hash>.json`. The live preview queues
+  missing alignments in the background and picks them up; renders align synchronously.
+- Used for the caption chunks (start/end of their words), the karaoke word highlight (per-word times
+  in `captions[].words`) and the chip/list/screens item pop-ins. Scenes show **aligned / estimated** in
+  the scene list and the scene form; renders store `timing: {aligned, voiced}`.
+- Missing model or `faster-whisper` → estimated timing, as before. `STUDIO_WHISPER_MODEL` /
+  `STUDIO_WHISPER_THREADS` / `STUDIO_WHISPER_PROMPT=0` override the defaults.
+
+**Measured** (Ryzen 7 9800X3D; ground truth = Microsoft Edge TTS `WordBoundary` events for 3 lines per
+language, 23–36 words each; error = |aligned word start − true start|):
+
+| Model (CPU int8) | Speed (×real time) | uz mean / p90 | ru mean / p90 | en mean / p90 | ar mean / p90 |
+|---|---|---|---|---|---|
+| base | 0.17 | 57 / 110 ms | 70 / 135 ms | 70 / 115 ms | 61 / 105 ms |
+| **small** (default) | **0.20** (≈ 0.75 s per 4 s line, load 0.6 s) | **55 / 130 ms** | **51 / 100 ms** | **51 / 100 ms** | **44 / 85 ms** |
+| medium | 0.53 | 126 / 175 ms (+85 ms bias) | 122 / 173 ms | 119 / 200 ms | 139 / 240 ms |
+| large-v3-turbo | 0.56 | 59 / 110 ms | 56 / 100 ms | 51 / 100 ms | 41 / 100 ms |
+| old estimate (given the exact speech window) | – | 49 / 89 ms | 140 / 404 ms | 101 / 237 ms | 64 / 124 ms |
+
+- `small` is as accurate as `large-v3-turbo` here at 3× the speed; `medium` has a systematic +100 ms
+  bias. Median errors are 31–45 ms (about one video frame), mean bias ≤ 13 ms. All 4 languages matched
+  100 % of the words with the prompt.
+- Honest note: on these evenly paced Microsoft voices the estimate is already good for Uzbek and
+  Arabic; alignment mainly fixes lines with pauses and dashes (ru/en). On the local `navoiy` voice all
+  3 test lines aligned (100 % / 100 % / 100 % of words).
+- Method: the clips were synthesised with the `edge-tts` package (`boundary="WordBoundary"`, the same
+  Microsoft voices Ovoz uses) and decoded without trimming, then `align.transcribe` + `align.align_words`
+  were compared word by word with the boundary events. The Studio itself never calls Edge directly.
+
+### Exports per render
+
+- `<name>.srt` and `<name>.vtt`: cues from the aligned captions, ≤ 2 lines × 42 characters, ≤ 6 s, split
+  at sentence ends, never across scenes or real pauses; Arabic SRT lines are wrapped in RLE/PDF marks.
+- `<name>.png` cover: a still without captions and progress bar (`render.py --cover T --cover-out`,
+  `index.html?…&cover`). Default: the end of the first scene (everything in, before the exit fade);
+  `cover: {scene, t}` in the brief, or *Use this frame as cover* under the preview.
+- All three are listed with the render (`GET /api/projects/{id}/renders` → `srt`, `vtt`, `cover`), served
+  by `GET …/renders/{name}` (`?download=1`), deleted with the MP4, and the *Play* dialog loads the
+  `.vtt` as a subtitle track.
+
+### Verified (2026-11-15, test server on :8011, Playwright + API)
+
+- **3 languages × 3 formats from the UI:** the brief (uz main + ru + ar maps, 9 scenes incl. hero,
+  screen phone/recording/browser, screens, stat, list, chips with a b-roll clip, cta) and 5 assets were
+  dropped on the projects page; *Calm pad* picked in the Music tab; an AR translation removed (the scene
+  showed `⚠ AR: sub`) and restored; *Make video* (draft) clicked. First run with voice: voice stage 63 s
+  (27 Edge lines + alignment), render stage 395 s for **9 MP4s**. Final run after the last fixes:
+  alignment 28 s (27/27 aligned), render 389 s. Per output: 9:16 48–54 s, 1:1 31–35 s, 16:9 46–48 s for
+  39–47 s videos. Durations match the timelines (uz 39.36 → 39.37 s, ru 41.50, ar 46.56 → 46.57 s);
+  each has `.srt` (11/15/10 cues), `.vtt` and a cover.
+- **Loudness / ducking** (`ffmpeg ebur128` + `astats`, stems written with the final gain): every MP4
+  −14.0 LUFS (±0.02), true peak −1.5 dBTP. Voice vs music while speaking: uz 21.5 dB, ru 22.3 dB,
+  ar 23.6 dB (music ≈ −38 dBFS RMS under ≈ −16 dBFS voice). In the 2–3 s pause of the `web` scene the
+  music comes up by 7.4–8.8 dB (median over the window, incl. the release ramp; the plot shows the full
+  10 dB) and is back down before the next word: `preview/v2-phase1-ducking-{uz,ru,ar}.png`.
+  Editor preview: music gain −30.5 dB while speaking, −23 dB in that pause.
+- **Frames from the MP4s:** `preview/v2-phase1-frames-<lang>-<fmt>.png` (each scene at 80 %),
+  `…-uz-apostrophes.png` ("Nimboʼni koʻring"), `…-caption-word-sync-ru.png` (the highlighted word at
+  t = 1.30 s is "Nimbo", aligned 1.04–1.48 s), `…-covers.png`, presenter bubble / card layouts with a
+  stand-in video `…-presenter-{uz-1x1,ar-1x1,ar-16x9}.png`.
+- **UI:** `preview/v2-phase1-ui-*.png` (projects, new editor, music tab, missing translation, side by
+  side, AR 1:1 preview playing, Make running/done, renders with covers and subtitle links, AR render
+  playing with its `.vtt`). No console errors.
+- **Local voice:** a 3-scene Uzbek 1:1 project with Ovoz `navoiy`/`madina` + *Bright pluck*: voice,
+  alignment (3/3), mix (−14.0 LUFS) and render in 28 s.
+- **Old projects:** 18 stills of 3 old projects rendered from their old `timeline.json` with the new
+  renderer: identical except the 9:16 and 16:9 `screen`/`screens` scenes (caption/device change above).
+  The old CLI (`render.py` without arguments) stills are pixel-identical. Old briefs normalise with
+  `languages: [language]`, `formats: [format]`, `voices: {language: voice}` and no warnings.
+
+## Templates, transitions, history, follow-up, Uzbek UI (v2 phase 2)
+
+### Templates
+- `video/templates/<id>/manifest.json` (+ `template.css`, `template.js`, fonts, pictures). **theme** = design
+  tokens only (colours, fonts, radii, shadows, caption / progress / logo style, background picture);
+  **full** = + CSS and an ES module that can replace any layout (`layouts.<name>.build(scene, ctx)` /
+  `seek(el, localT, ctx)`), add transitions and background hooks. Full guide, API, safe zones, Figma
+  workflow: [`../templates/TEMPLATES.md`](../templates/TEMPLATES.md).
+- Built in: **Aurora** (the original look, the default), **Clean** (light, minimal: app-icon hero, check
+  chips, hairline list, *Drift* transition), **Bold** (huge stacked type, stickers, box captions, moving
+  bands, *Punch* / *Swipe*). All support every layout, 9:16 / 1:1 / 16:9, Arabic RTL, Cyrillic and Uzbek.
+- Brief: `template`, `template_options` (settings the manifest declares), `transition`, `scene.transition`.
+  The brand colours keep applying through the tokens (`"primary": "brand.primary"`).
+- Editor: **Template** in the settings bar opens a picker docked on the left, so the live preview stays
+  visible: thumbnails per format, point at one to see it in the preview, click to use it, its options,
+  *Import a template* (zip; every problem is listed), delete imported ones. **↻** re-reads the template
+  files (hot reload while you edit a template).
+- Determinism: template code runs with a frozen clock, seeded `Math.random` and timers refused; CSS
+  animations are paused and seeked; full templates render without compositor hints so a frame never
+  depends on the seek order. `video/templates/validate.py` checks manifests, renders every layout × format
+  × en/ar/ru/uz, flags overflow / safe-zone / caption collisions / fonts and compares double renders.
+- render.py starts Chromium with `--allow-file-access-from-files` so template.js can be an ES module from
+  `file://`. Only import templates you trust: they run JavaScript.
+
+### Transitions
+`lift` (the original), `fade`, `slide`, `zoom`, `wipe`, `blur`, `cut` (`video/html/transitions.js`) plus
+template ones. Project default in the settings bar, per scene in the scene form (“Transition into this
+scene”), each with a tiny animated preview (point at it). Pure functions of the cut's progress.
+
+### Undo / redo and version history
+- Ctrl+Z / Ctrl+Shift+Z (Ctrl+Y) and ↶ ↷ in the top bar; one step per burst of edits (typing in a field is
+  one step). The raw JSON editor keeps the browser's own undo.
+- Every save writes a snapshot to `projects/<id>/history/` (an *edit* younger than 45 s is updated in place,
+  the last 100 are kept). The **History** tab lists time, kind and a change summary (“template: bold →
+  clean · scene “hook”: headline (uz)”) with *Restore*; a restore is saved as a new version and is itself
+  undoable (Ctrl+Z or History).
+
+### “Ask the AI for missing material”
+Button under the scene list (and `GET /api/projects/{id}/followup`): an English message ready to paste into
+the source AI, listing missing or unusable files (a video as logo…), screenshots in the wrong orientation
+for their frame or too small, missing translations per language, voice-over lines over 18 words and empty
+text a layout needs, and up to five suggestions (a screenshot for a text-only scene, a focus area, a logo, a
+screen recording). Copy button in the dialog.
+
+### English / Oʻzbek interface
+EN / OʻZ switch in the top bar, remembered per browser (`localStorage`). Every UI string is in
+`static/strings.js` (English) and `static/strings-uz.js` (Uzbek Latin with oʻ gʻ ʼ, keys checked to match);
+buttons and tabs wrap instead of overflowing. Server messages (warnings, errors, history summaries, the
+follow-up) stay in English.
+
+### Verified (2026-11-15, test server on :8011, Playwright + API)
+
+- **Old projects pixel-identical:** 435 stills (15 old timelines: the 9 `nimbo-ade8` language × format
+  renders, 4 older projects, the original CLI timeline; each scene at 4 moments incl. the exit transition)
+  rendered with the phase-1 renderer and the new one, software raster, one page at a time: 435 / 435
+  identical without a template, and identical with `template: aurora` injected (one presenter-video first
+  frame differed once and matched on re-render — video decode timing). The old `render.py` CLI still
+  renders the Ovoz promo (641 frames, 17 s).
+- **Frame grid**, `nimbo-ade8` (uz + ru + ar, 9 scenes = every layout but presenter) × 9:16 / 1:1 / 16:9 ×
+  aurora / clean / bold: `preview/v2-phase2-grid-<template>-<lang>.png`. Fixed from these: bold chip labels
+  overflowing, stacked headlines measured too small, RTL stat overlapping the header, box captions wrapping
+  at half width, bold callouts covering the 1:1 text column, Arabic line height in clean.
+- **validate.py** on aurora, clean, bold, _starter and the imported starter: OK (108 frames each, no layout,
+  font or determinism problems). It found real issues during development (chip text clipped, a seek-order
+  dependent frame caused by `will-change` raster caching → full templates now render without it).
+- **Template switching from the UI** on `nimbo-ade8`: aurora → clean → bold → aurora, previews per format
+  `preview/v2-phase2-nimbo-<template>-<fmt>.png`; hovering a card previews it live in the editor
+  preview. The project was left on aurora, as before.
+- **Import:** a broken zip (bad id, empty name, code in a theme, colour "blue", caption style "wavy") was
+  rejected with all five errors listed (`v2-phase2-import-errors.png`); `_starter` zipped and imported
+  through the UI, applied, rendered (uz 9:16, 39.4 s video in 50.6 s): `v2-phase2-render-starter-frames.png`.
+- **Render time per template** (`nimbo` uz, 39.4 s = 1181 frames, 8 workers, incl. encoding):
+
+  | template | 9:16 | 16:9 |
+  |---|---|---|
+  | aurora | 49.7 s | 44.0 s |
+  | clean | 42.1 s | 34.8 s |
+  | bold | 33.2 s | 33.4 s |
+
+  Clean and bold are faster: no grid / particles / blurred glass caption to rasterise.
+- **Undo / redo:** typing in a headline → Ctrl+Z restored it, Ctrl+Shift+Z redid it, ↶ undid again; a
+  template change was undone (Ctrl+Z) and redone (Ctrl+Y). **History:** restoring the oldest version
+  reverted the template, Ctrl+Z undid the restore; summaries like “template: bold → clean”
+  (`v2-phase2-history*.png`).
+- **Follow-up:** a deliberately broken brief (missing `search.png` and `logo.png`, a landscape and a
+  400×860 screenshot in phone frames, missing en/uz/ru translations, a 21-word line, empty `say`, one chip)
+  produced all 13 issues + 3 suggestions (`v2-phase2-followup-broken.png`); a complete project only gets
+  suggestions (`…-followup-ok-project.png`).
+- **Uzbek UI:** every key translated (checked by script, no ASCII apostrophes in oʻ/gʻ); projects, editor,
+  template picker, scene transitions, history, follow-up, music and AI pages at 1600 px, 1280 px and 420 px
+  with an overflow check (no clipped buttons/labels, no horizontal scroll): `v2-phase2-uz-*.png`. The
+  choice survives a reload. No console errors.
+
+## System monitor, warm AI models, more video generators, AI music (v2 phase 3)
+
+### Live system monitor
+- **Header widget on every page** (`#sysmon`, `static/monitor.js`): GPU %, VRAM used/total, GPU temperature
+  and power, CPU %, RAM used/total. Updated every second over Server-Sent Events; amber from 60 % / 75 % /
+  70 °C, red from 90 % / 92 % / 82 °C. The tooltip splits VRAM into Ovoz / AI / Studio and shows the RAM of
+  the warm models. Click → **#/monitor**.
+- **Monitor page:** hand-written canvas charts of the last 5 / 15 / 30 minutes with a synced crosshair +
+  tooltip: GPU utilisation; VRAM stacked by owner (Ovoz TTS, AI jobs, Studio render/Chromium, desktop &
+  other, total as a line); CPU; RAM stacked (warm AI models, other AI, Ovoz, Studio, other); GPU temperature;
+  GPU power with the power-limit line (separate charts — no dual axes). Shaded bands = “Make video” stages
+  (voice amber, AI purple, render teal), AI jobs (labelled warm/cold) and renders; they are also listed under
+  *Timeline markers*. Tiles with the current values, *Running now*, the GPU process table (PID, owner, VRAM,
+  GPU %, RAM) and the warm-model table. Colours were checked with the dataviz palette validator against the
+  dark surface (lightness band, chroma, colour-blind separation).
+- **Sampler** (`sysmon.py`): one thread, 1 Hz, 30-minute ring buffer. NVML (`nvidia-ml-py`, BSD-3) for GPU
+  %, VRAM, temperature, power; `psutil` (BSD-3) for CPU/RAM and the process tree; the Windows counters
+  `\GPU Process Memory(*)\Dedicated Usage` and `\GPU Engine(*)\Utilization Percentage` read through PDH with
+  ctypes (≈1 ms — the old PowerShell probe took ~2 s). Owners: Ovoz = the process listening on :8000, its
+  children and anything running from `OVOZ_DIR`; AI = warm workers and their children; Studio = this server's
+  other children (render.py, headless Chromium). `gpu.Monitor` (VRAM gate, unload stage) now reads the sampler.
+- **Overhead (measured):** 2.7 ms CPU per 1 s sample in steady state = 0.27 % of one core (0.017 % of the
+  16-thread CPU), ~6 ms wall time, max 24 ms; the first samples read every process's command line once.
+  The page shows the live figure at the bottom.
+
+### Warm AI model workers (128 GB RAM)
+- One `video/ai/worker.py --family <f>` process per model family (`workers.py`): `wan` (Wan2.2-TI2V-5B,
+  FastWan, portraits), `a14b-t2v`, `a14b-i2v`, `echomimic`, `acestep`. It keeps the weights in RAM between
+  jobs; during a job they stream to the GPU (group offloading from page-locked RAM) and afterwards only the
+  CUDA context (~0.4 GB) stays on the GPU. Details and measurements: `../ai/README.md`.
+- **Make video:** before the voice-over stage every warm worker releases its GPU memory (the stage detail
+  lists the workers and the AI VRAM before/after); the weights stay in RAM, Ovoz gets the GPU. After
+  `/api/unload` the AI stage uses the warm workers.
+- **Settings** (AI page → *Warm AI models*, `library/ai-settings.json`): keep warm (on), unload after
+  **30 min** idle, **RAM budget 80 GB** — before a job, least recently used *other* idle workers are stopped
+  until the total working set + what the job still has to load fits; after a job the same check runs again.
+  A family that is bigger than the budget on its own exits after each job. **Release RAM** stops all idle
+  workers (or one). Busy workers are never stopped by the budget.
+- **Cold vs warm (same kind of job twice, Ovoz unloaded):**
+
+  | Job | Cold | Warm | Saved |
+  |---|---|---|---|
+  | FastWan 5B draft b-roll | 50.5 s (load 24 s) | **20.2 s** | 60 % |
+  | Wan2.2 5B draft b-roll | 129 s (load 11 s + text encoder already warm) | 115 s | 11 % |
+  | Wan2.2 A14B draft b-roll | 257 s (load 87 s) | **165 s** | 36 % |
+  | ACE-Step 30 s of music | 12.6–14 s (load 4.4 s + worker start) | **3.8–6 s** | 60–70 % |
+  | EchoMimic presenter | see “Verified” below | | |
+
+### Video generators (providers)
+`providers.py` — every provider has an id, name, licence (+ note), modes (t2v / i2v), presets (resolution,
+frames, fps, steps), max seconds, VRAM/RAM needs, `estimate` (learned timings, warm or cold) and runs as an
+AI-queue job (`generate`).
+
+| id | Model | Licence | Modes | Draft / final | Use |
+|---|---|---|---|---|---|
+| `wan22-5b` | Wan2.2-TI2V-5B (unchanged) | Apache-2.0 | t2v, i2v | 480×832 / 704×1280, 24 fps, 3.4 / 5 s | the original |
+| `fastwan-5b` | FastWan2.2-TI2V-5B (FastVideo, 3-step DMD) | Apache-2.0 | t2v, i2v | same sizes, 3 steps | **fast drafts** (20 s warm) |
+| `wan22-a14b` | Wan2.2-T2V/I2V-A14B + Wan2.2-Lightning 4-step LoRA | Apache-2.0 | t2v, i2v | 480×832 / 720×1280, 16 fps, 5 s | **quality** |
+
+- Same 3 prompts at draft settings (frames in `preview/v2-phase3-providers-compare.png`, full table and
+  judgement in `../ai/README.md`): A14B is clearly best (detail, natural motion), FastWan is good and 6× faster
+  than the 5B, the original 5B draft was nearly black on 2 of 3 prompts.
+- **Animate an image (image-to-video):** the b-roll form (AI page and the scene form) has *Animate this image*:
+  a project image or a library portrait; the prompt then describes the motion
+  (`preview/v2-phase3-i2v-portrait.png`): Wan2.2-I2V-A14B keeps the face and background (264 s cold); FastWan is
+  fast (78 s cold) but the face drifts after a few frames.
+- Per scene `background.provider` (+ `background.image`), project default `broll_provider` (editor → AI tab).
+  Library ids keep the old hash for `wan22-5b` text-to-video (existing clips stay cached); other providers
+  and image-to-video include the provider and the image's hash.
+- **Cloud providers (not implemented, nothing is called).** A paid API could be added later as one more
+  entry in `PROVIDERS` with `family: None` and a `CloudProvider` class (sketch in `providers.py`, disabled):
+  `generate(task) -> mp4` over HTTPS with the API key from an environment variable (never stored in projects),
+  `estimate()` from the service, `vram_gb = 0` so the AI queue skips the VRAM gate, and its own terms shown
+  next to the local licences. The rest of the studio (library, assignment, Make video) would work unchanged.
+
+### AI music (ACE-Step v1.5, MIT)
+- Job kind `music`: prompt, genre, mood, bpm, duration (10–240 s), seed; instrumental only. The track is
+  generated 6 s longer than asked, the leading silence and the faded/silent tail are cut, a 1.5 s fade-out is
+  added, it is encoded to OGG, checked and added with `music.add_track` as `source: "generated"` with the
+  licence text, prompt, seed, model and the check results. Identical requests reuse the track.
+- **Checks** (`music.analyze`, nobody can listen here): duration; EBU R128 loudness, true peak and LRA via
+  ffmpeg; silent fraction; spectral flatness (white noise 0.56, music ≈ 0.00), spectral centroid, band
+  energies and spectral flux (dB change of 24 log bands per 0.5 s: a sine 0.0, noise 2.0, music 4–6, the
+  builtin tracks 3–12). Fails on silence, noise-like spectra or a static drone. Tested on a sine and white
+  noise (both rejected) and every generated track (passed).
+- UI: **Generate music** on the AI page and in the editor's Music tab (generate now, or *Generate during
+  “Make video”*, which stores `music.generate` in the brief).
+
+### "Make video" + AI music + providers
+- The AI stage first generates the music when `music.generate` is set and the project has no (existing)
+  track (or reuses an identical generated one), then the portrait, the b-roll (each scene with its provider,
+  image-to-video when `background.image` is set), then the presenter. Every job runs alone on the GPU (one AI
+  queue), and the monitor shows each stage and job as a band.
+
+### API (v2 phase 3)
+
+| Method & path | What it does |
+|---|---|
+| `GET /api/monitor[?since=&procs=1]` | samples (1 Hz, 30 min), markers, latest sample, process table, warm workers, current pipeline/job, sampler overhead |
+| `GET /api/monitor/stream[?procs=1]` | Server-Sent Events, one sample per second |
+| `GET /api/ai/providers` | video generators with licences, capabilities, presets, estimates |
+| `POST /api/ai/broll` | now also `provider` and `image: {project, asset}` or `{portrait}` |
+| `POST /api/ai/music` | `{prompt, genre?, mood?, bpm?, duration?, seed?, title?, project?}` → job (or an instant done job when the same track exists) |
+| `GET /api/ai/workers` · `PUT /api/ai/workers/settings` · `POST /api/ai/workers/release-ram` · `POST /api/ai/workers/release-gpu` | warm workers: view, `{warm, idle_minutes, ram_budget_gb}`, stop idle workers (`{family?}`), free their GPU memory |
+
+### Verified (2026-11-15, test server on :8012, Playwright + API)
+
+- **Make video, 3-scene Uzbek project** (`nimbo-a7ea`: hook with `wan22-a14b` b-roll, screen scene with the
+  project default `fastwan-5b`, CTA; corner presenter (draft); `music.generate`; local Ovoz voice `navoiy`):
+
+  | Stage | Result |
+  |---|---|
+  | ① Voice | warm A14B worker released its GPU memory first (weights stayed in RAM, 68 GB); 3 lines in 42 s, 3/3 aligned |
+  | ② Free GPU | `unloaded navoiy`, Ovoz 2.9 → 0.0 GB, free 10.6 → 13.5 GB (1.5 s) |
+  | ③ AI (644 s) | music 21 s (cold) → A14B b-roll **165 s, warm** (no load) → FastWan b-roll 47 s (cold; the RAM budget stopped the idle A14B worker first) → presenter 405 s (cold: load 79 s, 11.6 s of talking head) |
+  | ④ Render | 40.6 s, 11.5 s video, −13.9 LUFS / −1.5 dBTP with the generated music |
+
+  Monitor during the run: `preview/v2-phase3-make-monitor-*.png` (one per stage / job), the whole run
+  `v2-phase3-monitor-after-make.png` — VRAM moves from Ovoz (amber, voice stage) to the AI workers (purple),
+  the RAM chart shows the 68 GB warm A14B model, then the eviction. Frames: `v2-phase3-make-render-frames.png`
+  (A14B light ribbons, FastWan bokeh behind the phone, presenter bubble).
+- **Warm presenter:** the CTA line was edited twice and *Make video* run again each time. The presenter job
+  (only the CTA chunk) took **186 s cold** (load 67 s, 4.0 s of video) and **74 s warm** (load 0, 3.1 s of
+  video); the voice stage released the warm EchoMimic worker's GPU memory (0.7 GB → context only) before
+  Ovoz ran. Whole pipeline 259 s → 157 s.
+- **Music:** 4 generated tracks (30 s, 30 s, 18.5 s in the pipeline, 33 s): all passed the checks (LUFS
+  −9.7 … −17.4, flux 3.8–6.3 dB, flatness 0.00, < 3 % silent after trimming); a white-noise and a sine test
+  file were rejected. Spectrograms: `preview/v2-phase3-music-*-spectrum.png` — clear beat and harmonic lines,
+  a fade-out at the end. Honest note: the takes are bass/low-mid heavy (< 1 % of the energy above 2 kHz);
+  nobody listened to them.
+- **Monitor:** `v2-phase3-monitor-running-warm-job.png` (a warm FastWan job: *Running now* chip, warm RAM
+  tile 23.9 GB = the chart band = the worker table), `…-hover.png` (crosshair tooltip with the stage list).
+  History lives in the server process: a restart starts a new 30 minutes.
+- **UI:** AI page (providers, image-to-video, Generate music, warm models), editor scene background (provider
+  pre-selected from the scene), Music tab (*Generate music*, *Generate during “Make video”*), AI tab (project
+  default provider) — EN and OʻZ at 1600 / 1280 / 420 px, no console errors, no horizontal overflow
+  (`v2-phase3-*`, `v2-phase3-uz-*`). Every new string has an Uzbek translation (key parity checked by script).
+- **Old projects:** every existing brief normalises exactly as with the committed code; `nimbo-ade8` (uz
+  9:16) rendered again: 39.36 s, PSNR 56.9 dB against its earlier render (encoder noise). The renderer and
+  `build.py` are unchanged.
+
+## ComfyUI provider (v2 phase 4)
+
+Any ComfyUI workflow can be a b-roll video generator. The Studio runs a local ComfyUI (or uses one you
+already run) and talks to it **only over its HTTP / WebSocket API** — ComfyUI is GPL-3.0 and is never
+imported, linked or shipped; it is a separate program in `video/comfyui/`. Full guide (building, exporting,
+mapping, custom-node risks, licences, troubleshooting): [`../comfy-workflows/README.md`](../comfy-workflows/README.md).
+
+### Install
+`py -3.12 video/comfyui/setup.py` — clones ComfyUI at the pinned tag **v0.45.3** into `video/comfyui/ComfyUI`
+(core nodes only, no Manager), makes `video/comfyui/.venv` (Python 3.12, **torch 2.8.0 + CUDA 12.8**, works on
+the RTX 5070 Ti / sm_120), installs ComfyUI's requirements (the web UI's template *JSON* only; `--templates full`
+adds ~670 MB of template preview media) and downloads the models of both samples into `video/comfyui/models/`
+(outside the checkout; `extra_model_paths.yaml` points ComfyUI there). Downloads resume and are checked
+against Hugging Face's SHA-256. Re-running it is a no-op (8 s). Only `setup.py`, `extra_model_paths.yaml` and a
+README are tracked by git; the install is ignored.
+
+| Downloaded (Comfy-Org/Wan_2.2_ComfyUI_Repackaged, Apache-2.0) | Size |
+|---|---|
+| `wan2.2_ti2v_5B_fp16` (draft sample) | 10.0 GB |
+| `wan2.2_t2v_high_noise_14B_fp8_scaled` + `…low_noise…` (quality sample) | 2 × 14.3 GB |
+| `umt5_xxl_fp8_e4m3fn_scaled` (both) | 6.7 GB |
+| `wan2.2_vae` / `wan_2.1_vae` | 1.4 / 0.25 GB |
+| **total downloaded** | **47.0 GB** (≈ 20 min at 25–30 MB/s, two streams) |
+| `wan2.2_t2v_lightx2v_4steps_lora_v1.1_{high,low}_noise` | 2 × 1.2 GB — **hard-linked**, byte-identical (SHA-256) to the LightX2V LoRAs the A14B worker already has |
+
+The diffusers folders in `video/ai/.models` can't be shared otherwise (ComfyUI loads single-file checkpoints).
+
+### Managed server
+- AI page → **ComfyUI**: state (running / busy / starting / stopped / error / external), URL, version, queue
+  (running + waiting), VRAM it holds, last `/free`, **Start / Stop / Free GPU memory / Open ComfyUI**, settings,
+  log tail (`video/comfyui/comfyui.log`). The header has a **ComfyUI** pill (state + queue length).
+- Command: `main.py --listen 127.0.0.1 --port 8188 --extra-model-paths-config … --output/input/temp/user-directory
+  video/comfyui/… --disable-auto-launch --preview-method none --disable-partner-nodes --reserve-vram 1.0
+  --disable-all-custom-nodes`. Output goes to the log file (not a pipe), so ComfyUI survives a studio restart
+  and the next studio process **adopts** it. Stop kills its process tree.
+- **Flags measured** (Wan 2.2 14B fp8 + LightX2V, 480×832×81): ComfyUI v0.45's default **dynamic VRAM**
+  (comfy-aimdo) streams the 14.3 GB experts through 16 GB without trouble: **89 s** cold, peak 11.6 GB
+  VRAM, ~32 GB RAM. With `--disable-dynamic-vram` (the old estimate-based loading) the same job loaded the
+  high-noise expert *partially* (7.7 GB on the GPU, 5.9 GB offloaded, lowvram patches) and had not finished
+  step 1 after 10 minutes → cancelled. `--lowvram` / `--normalvram` do nothing while dynamic VRAM is on, so
+  the default is **auto + `--reserve-vram 1`** (headroom for the desktop / Ovoz). VRAM mode, reserve, custom
+  nodes and extra flags are settings (`library/comfy-settings.json`).
+- **External mode**: give the URL of a ComfyUI you run yourself; the Studio never starts/stops it, the monitor
+  attributes the process that listens on that (local) port.
+
+### Workflows = providers
+- `video/comfy-workflows/<id>/` = `workflow_api.json` (Export (API) format) + `manifest.json` (name, licence,
+  commercial, notes, capabilities t2v / i2v / image / upscale / interpolate, **input mapping** node + input for
+  prompt, negative, seed, width, height, length, fps, steps, image; output nodes; draft/final sizes; estimated
+  time and VRAM) + `preview.jpg`. Each is the provider **`comfy:<id>`** everywhere a provider can be chosen (AI
+  page form, editor scene background, project default, `background.provider` / `broll_provider` in briefs).
+- **Upload** (AI page → *ComfyUI workflows* → *Upload a workflow*): the mapping is auto-detected (prompt /
+  negative by following the samplers' positive/negative links back to the text encoders, through
+  pass-through nodes; seed, steps, sizes, length, fps, input image, outputs; values driven by `Primitive*`
+  nodes are mapped to the primitive) and shown before saving, with what could not be mapped; then a small
+  **mapping editor** (node + input per value, several targets per value, outputs, capabilities, sizes,
+  licence). Every workflow is **validated against the running ComfyUI's `/object_info`**: missing node types
+  (custom nodes), missing model files (with the folder they belong in), mapping errors. **Custom nodes are
+  never installed**; the UI warns that they are third-party code with full access to the PC.
+- Samples (core nodes only, Apache-2.0 models): `wan22-5b-draft` (Wan 2.2 TI2V-5B, 20 steps; text **and** image
+  to video — the `LoadImage` is dropped for text-to-video) and `wan22-14b-lightx2v` (Wan 2.2 T2V-A14B fp8 high +
+  low noise, LightX2V 4-step LoRA, 2 + 2 steps).
+
+### A ComfyUI job
+In the one-at-a-time AI GPU queue like every other AI job: warm workers release their GPU memory → ComfyUI is
+auto-started if needed → validation → image upload (`/upload/image`) for image-to-video → mapped inputs filled,
+output prefix `studio/<job id>` → `POST /prompt` → progress from the WebSocket (loading → step x/y with ETA →
+decoding → encoding; `/history` polling as fallback) → result via `/view` → H.264 + VP9 WebM + thumbnail in the
+b-roll library with metadata (workflow id + graph hash, filled inputs, seed, prompt id, models, licence,
+timings, peak ComfyUI VRAM). **Cancel** = `POST /queue {"delete"}` + `POST /interrupt {"prompt_id"}` (measured:
+stopped 4.5 s after the click, ComfyUI queue empty). Library ids include the graph hash.
+
+### GPU coordination
+- Before the **voice stage** of Make video and before **any other AI worker job**, the Studio sends ComfyUI
+  `POST /free {"unload_models": true, "free_memory": true}` and waits until the monitor shows its VRAM dropped;
+  after a Make-video AI stage that ran ComfyUI jobs it frees it again. A ComfyUI job's VRAM gate counts what
+  ComfyUI already holds as available.
+- **Measured** `/free` (monitor counters, ComfyUI process / whole GPU): manual after jobs **3.6 → 0.36 GB**,
+  GPU 5.8 → 2.3 GB in 1.4 s; before a FastWan worker job **5.8 → 0.4 GB** (GPU 8.2 → 2.6 GB, 0.8 s); after the
+  Make-video AI stage **6.4 → 0.4 GB** and **5.6 → 0.4 GB** (GPU 8.7 → 2.6 / 8.0 → 2.6 GB, 0.9 s). What stays is
+  ComfyUI's CUDA context (~0.37 GB).
+- **Monitor**: new owner **ComfyUI** (pink, `#c75bb5`, validated with the dataviz palette script against the
+  other owners on the dark surface — all pairs pass) in the VRAM and RAM charts, tiles, header tooltip and the
+  process table (`python.exe ComfyUI`, owner COMFYUI). Sample keys `vc` (VRAM MB) and `rc` (RAM GB).
+
+### Timings (RTX 5070 Ti 16 GB, 128 GB RAM, ComfyUI v0.45.3, same prompt, nothing else on the GPU)
+
+| Workflow · preset | Size | Job time | Denoise | Peak VRAM (ComfyUI) | RAM | Compare (diffusers workers, phase 3) |
+|---|---|---|---|---|---|---|
+| `comfy:wan22-5b-draft` · draft (t2v) | 480×832×81 @24 | **68 s** | 54.7 s (2.7 s/step) | 13.1 GB | 4 GB | wan22-5b draft 115–129 s |
+| `comfy:wan22-5b-draft` · draft (**i2v**, portrait) | 480×832×81 | **68 s** | 55.2 s | 12.6 GB | 4 GB | |
+| `comfy:wan22-5b-draft` · final | 704×1280×121 @24 | 295 s | 261 s | 12.2 GB | 14 GB | |
+| `comfy:wan22-14b-lightx2v` · draft | 480×832×81 @16 | **89 s** | 80.2 s | 11.6 GB | 25 GB | wan22-a14b draft 165 s warm / 257 s cold |
+| `comfy:wan22-14b-lightx2v` · final | 720×1280×81 @16 | 298 s | 280 s | 12.4 GB | 32 GB | |
+| uploaded template (Wan 2.2 14B T2V, Lightning on) | 640×640×81 | 93 s | 82.7 s | 10.8 GB | 24 GB | |
+
+Frames: `preview/v2-phase4-compare-same-prompt.png` (top 5B draft — dark bokeh; bottom 14B — sharp, detailed
+ribbons, though orange instead of teal), `v2-phase4-frames-draft-i2v.png` (the library portrait smiles and
+nods; the face drifts a little by the end), `…-draft-wf-final-preset.png`, `…-quality-final-preset.png`,
+`…-uploaded-workflow.png`. The 5B at 480×832 stays the "fast draft" (as in phase 3, the 5B is weak at low
+resolution); the 14B LightX2V sample is faster in ComfyUI than the diffusers worker.
+
+### API (v2 phase 4)
+
+| Method & path | What it does |
+|---|---|
+| `GET /api/comfy/status` | state, reachable, busy, queue, version, devices, VRAM held, last /free, settings, log tail |
+| `POST /api/comfy/start` · `/stop` · `/free` | start / stop the managed server; `/free` with VRAM before/after |
+| `PUT /api/comfy/settings` | `{mode, url, port, autostart, vram_mode, reserve_vram_gb, custom_nodes, extra_args}` |
+| `GET /api/comfy/workflows` | library + validation against `/object_info` |
+| `GET /api/comfy/workflows/{id}` | manifest, validation, node list, graph, detected mapping |
+| `POST /api/comfy/workflows/detect` | dry run of an upload: detected mapping + validation |
+| `POST /api/comfy/workflows` | upload (multipart: JSON + name, licence, commercial, notes, preview image) |
+| `PUT /api/comfy/workflows/{id}` · `DELETE …` · `POST …/validate` · `GET …/workflow_api.json` · `GET …/preview` | edit mapping/manifest, delete (not the samples), re-check, download, preview |
+| `POST /api/ai/broll` | `provider: "comfy:<id>"` (+ `image` for i2v workflows) |
+
+### Verified (2026-11-15, test server on :8013, API + Playwright)
+- **Fresh setup** by `setup.py` (code + venv 191 s once the downloads had finished, models 47 GB, LoRAs
+  hard-linked), re-run = no-op; ComfyUI started **from the Studio** (ready in 6–14 s), adopted after studio restarts.
+- Both samples end to end as Studio jobs with the same prompt, plus image-to-video and both final presets
+  (table above), frames inspected. **Cancel** during a running 14B final job: cancelled in 4.5 s, ComfyUI queue
+  empty; a job stuck loading (dynamic VRAM off) cancelled in ~10 s.
+- **Upload through the UI**: ComfyUI's own template `video_wan2_2_14B_t2v` (a subgraph with primitives,
+  switches and a math expression) loaded in ComfyUI's web UI and exported in API format, then uploaded on the
+  AI page — prompt, negative, both seeds, width/height and fps (from a `PrimitiveFloat`) auto-detected,
+  steps/length reported as not mappable; validated OK; ran as a job (93 s; with the ribbon prompt this graph
+  drew ribbons over a face, with "a red vintage sports car … coastal road at sunset" exactly that —
+  `v2-phase4-frames-uploaded-workflow-car.png`; the test upload was deleted again afterwards — same models as the quality sample)
+  (`v2-phase4-upload-detected.png`, `…-mapping-editor.png`, `…-workflows.png`). A graph with `VHS_VideoCombine`
+  and an unknown LoRA reports *Missing nodes: VHS_VideoCombine* and *Missing model files:
+  some_style_lora.safetensors → models/loras* (`…-upload-missing-nodes.png`).
+- **Make video** on `nimbo-c2de` (2 scenes, uz, local Ovoz voice `navoiy`, hook background
+  `comfy:wan22-5b-draft`): ① voice (ComfyUI `/free` first) 17 s → ② Ovoz unload 2.9 → 0.0 GB → ③ ComfyUI clip
+  66 s, then `/free` 5.6 → 0.4 GB → ④ render 14 s; 105 s total (`v2-phase4-monitor-make-comfy.png`,
+  `…-monitor-vram-comfy-ai-stage.png`: ComfyUI 11.8 GB during ③, Ovoz 0; `…-make-render-frames.png`).
+- **Coordination**: a FastWan job after a ComfyUI job → `/free` 5.8 → 0.4 GB first; a ComfyUI job after a warm
+  FastWan worker → `released_workers: ["wan"]`.
+- **Old features**: FastWan provider job (60 s), every existing brief normalises exactly as with the committed
+  code, the old providers keep their library ids. UI EN + OʻZ (key parity checked), 1600 px and 420 px, no
+  console errors, no horizontal overflow (`v2-phase4-ai-*`, `v2-phase4-editor-scene.png`).
+- Known: the header pill is hidden below 600 px; a workflow whose length comes from a math node keeps its own
+  length (the Studio's frame count is a label only); ComfyUI's dynamic VRAM decides how much it keeps after a
+  job (3–6 GB) until the next `/free`.
 
 ## "Make video" (one button, voice first, then video)
 
@@ -293,6 +869,12 @@ held ~2 GB, leaving ≈ 8 GB free.
 | chinese-wav2vec2-base | MIT | trained on Chinese speech; lip shapes for uz/ru/en/ar are plausible, not dubbing-grade |
 | PyTorch / diffusers / transformers / accelerate | BSD-3 / Apache-2.0 | |
 | ffmpeg (gyan.dev, `--enable-gpl`) | GPL-3 | fine as a tool; don't ship it inside a closed product |
+| FastWan2.2-TI2V-5B-FullAttn (FastVideo) | Apache-2.0 | fine-tune of Wan2.2-TI2V-5B; same UMT5 + VAE |
+| Wan2.2-T2V-A14B / I2V-A14B (Wan-AI) + Wan2.1 VAE | Apache-2.0 | |
+| Wan2.2-Lightning LoRAs (lightx2v) | Apache-2.0 | fused at load time |
+| ACE-Step v1.5 XL turbo + its VAE | MIT | card: licensed / royalty-free / synthetic training data, generated music usable commercially |
+| Qwen3-Embedding-0.6B (ACE-Step text encoder) | Apache-2.0 | |
+| nvidia-ml-py, psutil, peft | BSD-3 / BSD-3 / Apache-2.0 | |
 
 There are no InsightFace, Basel Face Model or other non-commercial components. Uploaded portraits require
 ticking *"This is a fictional person or I have the person's permission"* (stored in the portrait's
@@ -382,10 +964,15 @@ presenters. The UI shows the licences and this disclosure on the AI page and in 
 
 ## Known limitations
 
-- Caption and word timing is estimated from character counts (there are no word timestamps from TTS).
-- Background music is not supported. Audio is the voice-over only, or silence.
-- The renderer captures screenshots: ~30–38 fps with 8 workers, so ~30 s for a 30 s video.
-  Recordings slow capture down a little, since each frame waits for a seek.
-- The design is dark-only. A light `background` colour is darkened automatically.
-- Only one brief language per project. Duplicate the project to make another language.
+- The renderer captures screenshots: ~30–38 fps with 8 workers (1:1 is faster), so ~30–50 s per output
+  for a 40 s video; 3 languages × 3 formats take 6–7 minutes. Recordings slow capture down a little,
+  since each frame waits for a seek.
+- Aurora and Bold are dark (a light `background` colour is darkened); Clean is the light template.
+- The AI presenter speaks the main language only (its lip-sync is generated from that voice-over);
+  renders in other languages leave the bubble out and show the still portrait on `presenter` scenes.
+  B-roll is generated for the main format's orientation.
+- Word timing for Uzbek is about as good as the old estimate on the uniform Microsoft voices (see the
+  table); it helps more on local voices with uneven pacing and on lines with pauses.
+- Music levels in the editor preview are approximate (HTML audio volume, the duck envelope sampled at
+  10 Hz); the render's mix is the reference.
 - No authentication: keep it on 127.0.0.1.

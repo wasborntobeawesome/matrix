@@ -1,14 +1,19 @@
 """"Make video": one button / one API call from brief to MP4, each step with the whole GPU.
 
 Stages, strictly in order, one pipeline at a time:
-  1. voice   generate every missing/changed voice-over line (Ovoz may use the whole GPU; no AI
-             GPU job may start meanwhile)
+  1. voice   the warm AI workers first give back their GPU memory (weights stay in RAM) and ComfyUI unloads
+             its models (POST /free, when it is running), then every
+             missing/changed voice-over line is generated (Ovoz may use the whole GPU; no AI GPU job may
+             start meanwhile)
   2. unload  POST {OVOZ}/api/unload, then confirm with the GPU counters that Ovoz's VRAM dropped
              (404 = old Ovoz: a notice, and the AI queue's normal VRAM wait / "start anyway" applies)
-  3. ai      every AI job the project still needs: a presenter portrait (from portrait_prompt),
-             b-roll for scenes that ask for one, the presenter video; quality = the pipeline's
-             (default "final"); the runners use full-GPU mode when enough VRAM is free.
-             The studio's own voice requests wait during this stage.
+  3. ai      every AI job the project still needs: generated music (music.generate without a track),
+             a presenter portrait (from portrait_prompt), b-roll for scenes that ask for one (each with
+             its provider: background.provider or the project's broll_provider), the presenter video;
+             quality = the pipeline's (default "final"). Jobs run one after another in the warm workers
+             or, for `comfy:<workflow>` providers, in ComfyUI (the AI queue frees ComfyUI's VRAM before a
+             worker job and the workers' VRAM before a ComfyUI job). After the stage ComfyUI frees its
+             memory again. The studio's own voice requests wait during this stage.
   4. render  the MP4 (the normal render queue)
 
 Pipelines are stored in library/pipelines.json. A failed or cancelled pipeline can be retried:
@@ -28,7 +33,10 @@ import urllib.request
 import build
 import gpu
 import library as L
+import music as MU
 import presenter as PR
+import providers as P
+from brief import localize as normalize_l
 from brief import normalize
 from store import Project, StoreError, now
 
@@ -147,6 +155,15 @@ class Pipelines:
     def list(self) -> list[dict]:
         return [self.view(p) for p in sorted(self.items.values(), key=lambda p: p["created"], reverse=True)[:30]]
 
+    def activity(self) -> list[tuple]:
+        """(key, label, category) of the running pipeline stage, for the monitor's timeline markers."""
+        it = self.items.get(self.current) if self.current else None
+        if not it or it.get("status") != "running" or not it.get("current"):
+            return []
+        names = {"voice": "① Voice-over", "unload": "② Free GPU", "ai": "③ AI clips", "render": "④ Render"}
+        return [(f"make:{it['id']}:{it['current']}", f"Make video · {names.get(it['current'], it['current'])} · "
+                 f"{(it.get('title') or it['project'])[:30]}", f"stage-{it['current']}")]
+
     def cancel(self, ident: str) -> dict | None:
         it = self.items.get(ident)
         if not it:
@@ -246,14 +263,42 @@ class Pipelines:
             st["message"] = f"waiting for the running AI job ({j.get('kind', '?')}) to finish"
             self._save()
             time.sleep(2)
+        # warm AI workers give back their GPU memory (their weights stay in RAM) so Ovoz gets the whole GPU
+        st["message"] = "warm AI workers: releasing GPU memory (weights stay in RAM)…"
+        self._save(force=True)
+        before = self.ai.monitor.refresh()
+        released = self.ai.pool.release_gpu()
+        comfy_free = None
+        if self.ai.comfy.reachable(1.5):            # ComfyUI unloads its models too (POST /free)
+            st["message"] = "ComfyUI: unloading its models (POST /free)…"
+            self._save(force=True)
+            comfy_free = self.ai.comfy.free(why="before the voice-over")
+        after = self.ai.monitor.refresh() if released or comfy_free else before
+        st["detail"]["released"] = {"workers": released, "ai_mb_before": before.get("ai_mb"),
+                                    "ai_mb_after": after.get("ai_mb"), "warm_ram_gb": self.ai.pool.view()["ram_gb"],
+                                    "comfy": comfy_free}
         brief = p.brief
-        todo = [s for s in brief["scenes"] if (s.get("say") or "").strip() and not build.scene_voice(p, brief, s)]
-        total = len([s for s in brief["scenes"] if (s.get("say") or "").strip()])
-        st["detail"] = {"lines": total, "to_generate": len(todo), "model": brief["voice"].get("model"),
-                        "voice": brief["voice"].get("voice")}
+        langs = build.langs_of(brief)
+        todo = build.todo_lines(p)
+        rel = st["detail"]["released"]
+        st["detail"] = {"released": rel}
+        total = sum(1 for lg in langs for s in normalize_l(brief, lg)["scenes"] if build.say_of(s))
+        st["detail"] = {**st["detail"], "lines": total, "to_generate": len(todo), "languages": langs,
+                        "model": brief["voice"].get("model"), "voice": brief["voice"].get("voice"),
+                        "voices": {lg: f"{v.get('model')}/{v.get('voice')}" for lg, v in (brief.get("voices") or {}).items()}}
+
+        def finish():
+            st["message"] = "word timing (faster-whisper, CPU)…"
+            self._save()
+            tim = build.align_all(p, langs)
+            st["detail"]["timing"] = tim
+            for lg in langs:
+                build.voiceover(p, build.timeline(p, lang=lg))
+            return tim
         if not todo:
-            st["message"] = f"all {total} lines already voiced"
-            build.voiceover(p, build.timeline(p))
+            tim = finish()
+            st["message"] = (f"all {total} lines already voiced ({len(langs)} language(s)); "
+                             f"timing aligned for {tim['aligned']}/{tim['lines']}")
             return
         t0 = time.time()
         done = [0]
@@ -274,9 +319,10 @@ class Pipelines:
                 raise RuntimeError(f"voice-over failed: {e}") from None
             st["state"] = "warning"
             self._notice(it, f"voice-over skipped (silent scenes): {e}")
-        build.voiceover(p, build.timeline(p))
         st["detail"]["seconds"] = round(time.time() - t0, 1)
-        st["message"] = f"{len(todo)} line(s) generated in {st['detail']['seconds']} s"
+        tim = finish()
+        st["message"] = (f"{len(todo)} line(s) generated in {st['detail']['seconds']} s "
+                         f"({len(langs)} language(s)); timing aligned for {tim['aligned']}/{tim['lines']}")
 
     # ------------------------------------------------------------ 2. free the GPU
     def _unload(self, it: dict, st: dict) -> None:
@@ -331,6 +377,26 @@ class Pipelines:
         bubble, full, _ = PR.needed(brief)
         wants_presenter = bool(bubble or full)
         jobs_done: list[dict] = []
+        # 0) generated music when the project asks for one and has no (existing) track yet
+        mu = brief.get("music") if isinstance(brief.get("music"), dict) else {}
+        spec = mu.get("generate")
+        if spec and not (mu.get("track") and MU.get(mu["track"])):
+            spec = {**spec, "duration": spec.get("duration") or min(240.0, round(build.timeline(p)["duration"] + 3, 1)),
+                    "seed": spec.get("seed", 7)}
+            have = MU.generated_for(spec)
+            if have:
+                b2 = p.brief
+                b2["music"] = {**b2.get("music", {}), "track": have["id"]}
+                p.save_brief(normalize(b2, p.assets())[0])
+                self._notice(it, f"music: reused the generated track '{have['title']}'")
+            else:
+                j = self.ai.submit("music", {**spec, "cache_key": MU.generate_key(spec), "assign_project": p.id,
+                                             "title": f"{brief.get('product') or brief.get('title') or 'Video'} — "
+                                                      f"{spec.get('mood') or spec.get('genre') or 'music'}"[:60]},
+                                   project=p.id, label=(spec.get("prompt") or spec.get("genre") or "music")[:70],
+                                   units=spec["duration"], preset="final")
+                jobs_done += self._wait_jobs(it, st, [j["id"]], base)
+            brief = p.brief
         # a) portrait from portrait_prompt when the presenter has none yet
         if wants_presenter and pres is not None and not pres.get("portrait") and pres.get("portrait_prompt"):
             j = self.ai.submit("portrait", {"prompt": pres["portrait_prompt"], "seed": 1, "steps": 40,
@@ -350,23 +416,34 @@ class Pipelines:
                     continue   # "AI clip" picked in the editor but no prompt: nothing to generate
                 self._notice(it, f"scene '{s['id']}': clip {bg['clip']} is missing and there is no prompt — brand gradient")
                 continue
-            pr = L.BROLL_PRESETS[q]
+            provider = bg.get("provider") or brief.get("broll_provider") or P.DEFAULT
+            if not P.exists(provider):
+                self._notice(it, f"scene '{s['id']}': video generator '{provider}' is not installed — using {P.DEFAULT}")
+                provider = P.DEFAULT
             orient = "landscape" if fmt == "16:9" else "portrait"
-            w, h = pr[orient]
-            params = {"prompt": bg["prompt"], "negative": None, "seed": 42, "orientation": orient,
+            img = None
+            if bg.get("image"):
+                img = image_ref(p, bg["image"])
+                if not img:
+                    self._notice(it, f"scene '{s['id']}': image '{bg['image']}' to animate is missing — text to video instead")
+            params = {"prompt": bg["prompt"], "negative": None, "seed": 42, "orientation": orient, "provider": provider,
                       "assign": {"project": p.id, "scene": s["id"], "dim": bg.get("dim", 0.55), "blur": bg.get("blur", 0)}}
-            cid = L.broll_key(bg["prompt"], 42, pr["steps"], w, h, pr["frames"])
+            if img:
+                params["image"] = img
+            cid = P.clip_key(provider, bg["prompt"], 42, q, orient, img["sha"] if img else None)
             if L.broll_get(cid):
                 self.ai._assign_broll({"params": params}, cid)
                 continue
-            ids.append(self.ai.submit("broll", params, project=p.id, label=bg["prompt"][:70], units=pr["steps"], preset=q)["id"])
+            pv = P.get(provider)
+            ids.append(self.ai.submit("broll", params, project=p.id, label=f"{pv['name']} · {bg['prompt'][:56]}",
+                                      units=pv["presets"][q]["steps"], preset=q)["id"])
         if wants_presenter:
             brief = p.brief
             if (brief.get("presenter") or {}).get("quality") != q and isinstance(brief.get("presenter"), dict):
                 brief["presenter"]["quality"] = q          # the renderer looks for the video of this quality
                 p.save_brief(normalize(brief, p.assets())[0])
             tl = build.timeline(p)
-            pl = PR.plan(p, p.brief, tl, q)
+            pl = PR.plan(p, normalize_l(p.brief), tl, q)
             if pl and pl.get("error"):
                 self._notice(it, f"presenter skipped: {pl['error']}")
             elif pl and not pl["ready"]:
@@ -374,6 +451,10 @@ class Pipelines:
                                           label=f"{brief.get('title')} · {q}", units=pl["missing_seconds"], preset=q)["id"])
         if ids:
             jobs_done += self._wait_jobs(it, st, ids, base)
+        if any(P.is_comfy(j.get("provider")) for j in jobs_done) and self.ai.comfy.reachable(1.5):
+            st["message"] = "ComfyUI: freeing its GPU memory after the AI stage…"
+            self._save(force=True)
+            st["detail"]["comfy_free"] = self.ai.comfy.free(why="after the AI stage")
         st["detail"]["jobs"] = [{"id": j["id"], "kind": j["kind"], "status": j["status"], "elapsed": j.get("elapsed"),
                                  "result": j.get("result")} for j in jobs_done]
         st["message"] = (f"{len(jobs_done)} AI job(s) done" if jobs_done else "nothing to generate — everything is cached")
@@ -428,9 +509,13 @@ class Pipelines:
             eta = int(m.group(1)) + 5 if m else (round(el / f * (1 - f)) if f > 0.2 else None)
             st.update(progress=round(f, 3), eta=eta, message=f"{j.get('stage')}: {j.get('message') or ''}".strip(": "))
             if j["status"] == "done":
-                it["result"] = {"render": j["result"]["render"], **{k: j["result"].get(k) for k in ("duration", "format", "seconds")}}
-                st["detail"] = {"render": j["result"]["render"], "seconds": j["result"].get("seconds")}
-                st["message"] = f"{j['result']['render']} ({j['result'].get('duration', 0):.1f} s video)"
+                r = j["result"]
+                rs = r.get("renders") or [r["render"]]
+                it["result"] = {"render": r["render"], "renders": rs,
+                                **{k: r.get(k) for k in ("duration", "format", "seconds")}}
+                st["detail"] = {"render": r["render"], "renders": rs, "seconds": r.get("seconds")}
+                st["message"] = (f"{len(rs)} videos ({', '.join(rs)})" if len(rs) > 1
+                                 else f"{r['render']} ({r.get('duration', 0):.1f} s video)")
                 return
             if j["status"] in ("error", "cancelled"):
                 raise RuntimeError(f"render {j['status']}: {j.get('error') or ''}")
@@ -440,3 +525,18 @@ class Pipelines:
 
 def _snap(s: dict) -> dict:
     return {k: s.get(k) for k in ("ovoz_mb", "free_mb", "used_mb", "ai_mb")}
+
+
+def image_ref(p: Project, name: str) -> dict | None:
+    """An image asset of the project (or a library portrait id) to animate: {path, sha, label}."""
+    try:
+        f = p.asset_path(name)
+        if f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+            return {"path": str(f), "sha": L.file_sha(f), "label": name}
+    except StoreError:
+        pass
+    m = L.portrait_get(name)
+    if m:
+        f = L.PORTRAITS / name / "portrait.png"
+        return {"path": str(f), "sha": L.file_sha(f), "label": f"portrait {name}"}
+    return None

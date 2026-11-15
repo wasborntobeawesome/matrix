@@ -108,6 +108,15 @@ def load(model_dir: Path, steps: int, teacache: float, prompts, gpu: str = "offl
         prompt = prompt[0] if isinstance(prompt, list) else prompt
         return [e.to(device or "cuda", dtype or DT) for e in cache[prompt]]
     pipe._get_t5_prompt_embeds = cached_embeds
+
+    def ensure_prompts(prompts):
+        """Warm worker: encode prompts the cache doesn't have yet (CPU, once)."""
+        with torch.no_grad():
+            for p in prompts:
+                if p not in cache:
+                    cache[p] = [e.to(DT) for e in raw_embeds(prompt=p, device="cpu", dtype=torch.float32)]
+    raw_embeds = type(pipe)._get_t5_prompt_embeds.__get__(pipe)
+    pipe.ensure_prompts = ensure_prompts
     if gpu == "full":
         # Full-GPU mode: transformer, VAE and CLIP image encoder stay on the GPU for the whole job
         # (no per-call moves); only the T5 text encoder stays on the CPU (its embeddings are cached).
@@ -128,11 +137,16 @@ def load(model_dir: Path, steps: int, teacache: float, prompts, gpu: str = "offl
     return pipe
 
 
+_W2V: dict = {}   # the audio encoder is loaded once per process (the warm worker reuses it across jobs)
+
+
 def audio_embeds(wav: np.ndarray, n_frames: int):
-    d = str(W_DIR / "chinese-wav2vec2-base")
-    enc = Wav2Vec2Model.from_pretrained(d, local_files_only=True).to("cpu")
-    enc.feature_extractor._freeze_parameters()
-    fe = Wav2Vec2FeatureExtractor.from_pretrained(d, local_files_only=True)
+    if not _W2V:
+        d = str(W_DIR / "chinese-wav2vec2-base")
+        enc = Wav2Vec2Model.from_pretrained(d, local_files_only=True).to("cpu")
+        enc.feature_extractor._freeze_parameters()
+        _W2V["enc"], _W2V["fe"] = enc, Wav2Vec2FeatureExtractor.from_pretrained(d, local_files_only=True)
+    enc, fe = _W2V["enc"], _W2V["fe"]
     feat = torch.from_numpy(np.squeeze(fe(wav, sampling_rate=16000).input_values)).float()[None]
     # transformers 5.x no longer fills hidden_states through the repo's custom forward, so
     # capture each encoder layer's output with hooks (== hidden_states[1:] in transformers 4.x).

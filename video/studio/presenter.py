@@ -81,6 +81,9 @@ def needed(brief: dict) -> tuple[list[str], list[str], dict]:
 def plan(p: Project, brief: dict, tl: dict, quality: str | None = None) -> dict | None:
     """Current presenter state for a timeline. None when the project uses no presenter."""
     import build  # late import (build imports this module)
+    from brief import localize
+    if not brief.get("_lang"):
+        brief = localize(brief)          # the presenter speaks the main language
     bubble, full, pres = needed(brief)
     if not bubble and not full:
         return None
