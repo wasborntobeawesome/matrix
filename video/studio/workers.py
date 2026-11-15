@@ -32,6 +32,10 @@ AI_PY = AI / ".venv" / "Scripts" / "python.exe"
 SETTINGS_FILE = L.LIB / "ai-settings.json"
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 DEFAULTS = {"warm": True, "idle_minutes": 30, "ram_budget_gb": 80}
+READY_TIMEOUT = 120          # seconds a new worker may take to announce its port (@@READY)
+# a running job that prints nothing at all (no progress, no log line) for this long is stuck: the worker is
+# killed and the job fails, instead of the AI queue waiting forever (model loading prints its own lines)
+STALL_SECONDS = float(os.environ.get("STUDIO_WORKER_STALL_MIN") or 20) * 60
 # RAM a family needs before it has reported real numbers (GB, bf16 weights + pinned buffers)
 # measured working sets (RTX 5070 Ti PC): a model's weights + ~3-8 GB of torch/CUDA runtime per process
 FAMILY_RAM = {"wan": 36.0, "a14b-t2v": 68.0, "a14b-i2v": 68.0, "echomimic": 43.0, "acestep": 19.0}
@@ -81,20 +85,24 @@ class Worker:
         self.sock = None                      # commands go over a localhost socket (see worker.py)
         self.jobs_run = 0
         self.log: list[str] = []
+        self.last_output = time.time()        # any line from the worker: the watchdog's heartbeat
         threading.Thread(target=self._read, name=f"worker-{family}", daemon=True).start()
 
     # ---------------------------------------------------------------- io
     def alive(self) -> bool:
         return self.proc.poll() is None
 
-    def send(self, cmd: dict) -> None:
+    def send(self, cmd: dict) -> bool:
+        """False when the command could not be delivered (not connected, or the socket broke)."""
         with self.wlock:
             if self.sock is None:
-                return
+                return False
             try:
                 self.sock.sendall((json.dumps(cmd) + "\n").encode())
-            except OSError:
-                pass
+                return True
+            except OSError as e:
+                self.log.append(f"could not send '{cmd.get('op')}' to the worker: {e}")
+                return False
 
     def _connect(self, port) -> None:
         try:
@@ -119,6 +127,7 @@ class Worker:
                 line = raw.decode("utf-8", "replace").strip()
                 if not line:
                     continue
+                self.last_output = time.time()
                 m = pat.search(line)
                 if m:
                     try:
@@ -150,9 +159,16 @@ class Worker:
     def run(self, jid: str, task: dict, on_event, cancelled) -> dict:
         """Blocking. on_event(kind, data) gets PROGRESS / LOG; returns the RESULT dict."""
         with self.lock:
-            self.ready.wait(120)
+            self.ready.wait(READY_TIMEOUT)
             if not self.alive():
                 raise RuntimeError(f"AI worker '{self.family}' exited: " + " | ".join(self.log[-4:]))
+            if not self.ready.is_set() or self.sock is None:
+                # a worker that never announced itself, or that we could not connect to, would silently drop the
+                # job: stop it (the next job starts a fresh one) and fail this job with the reason
+                why = (f"did not start within {READY_TIMEOUT} s" if not self.ready.is_set()
+                       else "could not be connected to")
+                kill_tree(self.pid)
+                raise RuntimeError(f"AI worker '{self.family}' {why}: " + " | ".join(self.log[-4:]))
             done = threading.Event()
             box: dict = {}
 
@@ -169,9 +185,13 @@ class Worker:
             self.listener = listen
             self.last_used = time.time()
             self.status["busy"] = jid
-            self.send({"op": "run", "id": jid, "task": task})
             sent_cancel = None
             try:
+                self.last_output = time.time()
+                if not self.send({"op": "run", "id": jid, "task": task}):
+                    kill_tree(self.pid)              # the connection is gone: the worker cannot get any job
+                    raise RuntimeError(f"AI worker '{self.family}': the job could not be sent to it "
+                                       "(connection lost) — it was stopped; try again")
                 while not done.wait(0.5):
                     if cancelled() and sent_cancel is None:
                         sent_cancel = time.time()
@@ -179,6 +199,10 @@ class Worker:
                     if sent_cancel and time.time() - sent_cancel > 25:
                         kill_tree(self.pid)          # did not stop at a step boundary: lose the warm weights
                         raise Cancelled()
+                    if not sent_cancel and time.time() - self.last_output > STALL_SECONDS:
+                        kill_tree(self.pid)          # alive but silent: hung (driver, deadlock) — free the queue
+                        raise RuntimeError(f"AI worker '{self.family}' stopped responding (no progress for "
+                                           f"{STALL_SECONDS / 60:.0f} min) — it was stopped; try again")
             finally:
                 self.listener = None
                 self.last_used = time.time()

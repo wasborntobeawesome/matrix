@@ -311,6 +311,7 @@ window.STRINGS_UZ = {
       no_audio: "“{model}” ovoz modeli bu satr uchun {n} urinishda audio qaytarmadi. Qayta urinib koʻring, gapni biroz oʻzgartiring yoki boshqa ovozni tanlang.",
       service_error: "Ovoz xizmatida {n} urinishdan keyin ham xato (HTTP {status}) — odatda vaqtinchalik (tarmoq yoki GPU). Bir daqiqadan soʻng qayta urining yoki boshqa ovozni tanlang.",
       rejected: "Ovoz bu satrning ovoz sozlamalarini qabul qilmadi ({detail}). Boshqa ovozni tanlang.",
+      invalid: "Ovoz rad etdi: {detail}. Bu satrning matnini (yoki tezligini) qisqartiring yoki tuzating va qayta yarating.",
       model_missing: "Bu ovoz modeli Ovozʼda oʻrnatilmagan. Boshqa ovozni tanlang.",
       unreachable: "Ovoz ishlamayapti, shuning uchun ovoz yaratilmadi.",
     },

@@ -313,6 +313,7 @@ window.STRINGS_EN = {
       no_audio: "The voice model “{model}” returned no audio for this line after {n} tries. Try again, rephrase it a little or pick another voice.",
       service_error: "The voice service had an error (HTTP {status}) after {n} tries — usually temporary (network or GPU). Try again in a minute, or pick another voice.",
       rejected: "Ovoz did not accept the voice settings of this line ({detail}). Pick another voice.",
+      invalid: "Rejected by Ovoz: {detail}. Shorten or fix the text (or the speed) of this line and generate again.",
       model_missing: "This voice model is not installed in Ovoz. Pick another voice.",
       unreachable: "Ovoz is not running, so no voice could be generated.",
     },

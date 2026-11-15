@@ -188,6 +188,7 @@ _P = [
     (r"(?P<e>.*)\. Fix the voice settings, or render without voice-over\.",
      "\\g<e>. Ovoz sozlamalarini tuzating yoki ovozsiz render qiling."),
     (r"voice-over skipped: (?P<e>.*)", "ovoz oʻtkazib yuborildi: \\g<e>"),
+    (r"Ovoz rejected the request: (?P<e>.*)", "Ovoz soʻrovni rad etdi: \\g<e>"),
     (r"(?P<lg>\w\w): (?P<n>\d+) scene\(s\) without voice-over \(silence\)",
      "\\g<lg>: \\g<n> ta sahna ovozsiz (jimlik)"),
     (r"lost", "aloqa uzildi"),

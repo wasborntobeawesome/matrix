@@ -1148,7 +1148,9 @@ templates / workflows / briefs come from other people or AIs. The v2 hardening r
   in a sandboxed preview iframe and, when rendering, on a virtual origin that exposes only the needed folders
   (no `--allow-file-access-from-files`, no network). `templates/validate.py` uses the same sandbox.
 - **ComfyUI:** an external ComfyUI must be on loopback unless `STUDIO_COMFY_HOSTS=host1,host2` (or `*`)
-  allows it; `extra_args` cannot change `--listen`, ports, folders or CORS; uploaded workflows are size- and
+  allows it; `extra_args` takes only an allowlist of tuning flags, written out in full (argparse abbreviations
+  such as `--liste` are refused), and the studio's own `--listen` / `--port` / folder flags come last, so they
+  win; uploaded workflows are size- and
   shape-checked (≤ 1500 nodes, node ids, class names) and previews must be real images.
 - **Warm workers** accept commands only after a secret handshake (`STUDIO_WORKER_TOKEN`, set by the studio).
 - **Processes:** cancelling a render kills render.py with its Chromium and ffmpeg (process tree); the server

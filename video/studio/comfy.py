@@ -50,12 +50,27 @@ VRAM_MODES = {"auto": [], "lowvram": ["--lowvram"], "novram": ["--novram"], "hig
 #   STUDIO_COMFY_HOSTS=192.168.1.20,gpu-box.local   (or * for any host)
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 REMOTE_HOSTS = {h.strip().lower() for h in os.environ.get("STUDIO_COMFY_HOSTS", "").split(",") if h.strip()}
-# extra_args may tune ComfyUI, but not re-open it to the network, move its folders or load other code
-BLOCKED_ARGS = ("--listen", "--port", "--enable-cors-header", "--tls-keyfile", "--tls-certfile", "--output-directory",
-                "--input-directory", "--temp-directory", "--user-directory", "--base-directory",
-                "--extra-model-paths-config", "--front-end-root", "--front-end-version", "--enable-manager",
-                "--comfy-api-base", "--database-url", "--multi-user", "--enable-compress-response-body")
-ARG_RE = re.compile(r"^(--[a-z0-9][a-z0-9-]*(=[\w.:,+-]*)?|[\w.:,+-]+)$", re.I)
+# extra_args may tune ComfyUI (precision, attention, caching, VRAM), but not re-open it to the network, move its
+# folders, load other code or write files. An ALLOWLIST, compared exactly: ComfyUI parses its flags with argparse,
+# which also accepts any unambiguous prefix ("--liste 0.0.0.0" = --listen), so a blocklist of names leaks.
+SAFE_FLAGS = frozenset("""
+    --cuda-malloc --disable-cuda-malloc --force-fp32 --force-fp16 --fp32-unet --fp64-unet --bf16-unet --fp16-unet
+    --fp8_e4m3fn-unet --fp8_e5m2-unet --fp8_e8m0fnu-unet --fp16-vae --fp32-vae --bf16-vae --cpu-vae
+    --fp8_e4m3fn-text-enc --fp8_e5m2-text-enc --fp16-text-enc --fp32-text-enc --bf16-text-enc --fp16-intermediates
+    --force-channels-last --supports-fp8-compute --enable-triton-backend --disable-triton-backend
+    --cache-classic --cache-none --high-ram --use-split-cross-attention --use-quad-cross-attention
+    --use-pytorch-cross-attention --use-sage-attention --use-flash-attention --use-ck-attention --disable-xformers
+    --force-upcast-attention --dont-upcast-attention --gpu-only --highvram --lowvram --novram --cpu
+    --disable-nvml-pressure --disable-async-offload --disable-dynamic-vram --enable-dynamic-vram --fast-disk
+    --disable-fast-disk --disable-cuda-graphs --disable-comfy-compiler --force-non-blocking --disable-smart-memory
+    --deterministic --disable-pinned-memory --mmap-torch-files --disable-mmap --disable-metadata
+    --disable-all-custom-nodes --disable-partner-nodes --offline --disable-api-nodes --disable-product-tips
+""".split())
+# flags that take values: how many (None = any number, "?" = zero or one)
+SAFE_VALUE_FLAGS = {"--cuda-device": 1, "--default-device": 1, "--cache-lru": 1, "--cache-ram": None,
+                    "--vram-headroom": 1, "--async-offload": "?", "--preview-size": 1, "--max-upload-size": 1,
+                    "--default-hashing-function": 1, "--fast": None}
+ARG_RE = re.compile(r"^(--[a-z0-9][a-z0-9_-]*(=[\w.:,+-]*)?|[\w.:,+-]+)$", re.I)
 
 
 def check_url(u: str) -> str:
@@ -77,16 +92,32 @@ def check_url(u: str) -> str:
 
 
 def check_args(extra: str) -> str:
+    """Only SAFE_FLAGS / SAFE_VALUE_FLAGS, written out in full (no argparse abbreviations, no single-dash forms),
+    and values only after a flag that takes them."""
     extra = str(extra or "").strip()[:300]
     try:
         toks = shlex.split(extra, posix=False)
     except ValueError:
         raise ValueError("extra_args: unbalanced quotes") from None
+    room = 0                                   # values the previous flag can still take (None = any number)
     for t in toks:
         if not ARG_RE.match(t):
             raise ValueError(f"extra_args: '{t}' is not allowed (plain --flags and values only)")
-        if t.lower().split("=")[0] in BLOCKED_ARGS:
-            raise ValueError(f"extra_args: {t.split('=')[0]} is managed by the studio and cannot be changed")
+        if t.startswith("-"):
+            name, eq, _ = t.partition("=")
+            if name in SAFE_FLAGS and not eq:
+                room = 0
+            elif name in SAFE_VALUE_FLAGS:
+                n = SAFE_VALUE_FLAGS[name]
+                room = 0 if eq else (1 if n == "?" else n)
+            else:
+                raise ValueError(f"extra_args: {name} is not allowed (managed by the studio, or not a known safe "
+                                 "ComfyUI flag — write flags out in full)")
+        else:
+            if room == 0:
+                raise ValueError(f"extra_args: '{t}' is a value without a flag that takes it")
+            if room is not None:
+                room -= 1
     return extra
 SAMPLERS = ("KSampler", "KSamplerAdvanced", "SamplerCustom", "SamplerCustomAdvanced")
 
@@ -210,7 +241,9 @@ class Comfy:
     # ------------------------------------------------------------ managed server
     def command(self) -> list[str]:
         s = self.settings
-        cmd = [str(PY), str(MAIN), "--listen", "127.0.0.1", "--port", str(s["port"]),
+        # the user's extra flags first: the studio's own (listen address, port, folders) come last and win
+        extra = shlex.split(s["extra_args"], posix=False) if s["extra_args"].strip() else []
+        cmd = [str(PY), str(MAIN), *extra, "--listen", "127.0.0.1", "--port", str(s["port"]),
                "--extra-model-paths-config", str(HOME / "extra_model_paths.yaml"),
                "--output-directory", str(HOME / "output"), "--input-directory", str(HOME / "input"),
                "--temp-directory", str(HOME / "temp"), "--user-directory", str(HOME / "user"),
@@ -218,8 +251,6 @@ class Comfy:
                "--reserve-vram", str(s["reserve_vram_gb"]), *VRAM_MODES.get(s["vram_mode"], [])]
         if not s["custom_nodes"]:
             cmd.append("--disable-all-custom-nodes")
-        if s["extra_args"].strip():
-            cmd += shlex.split(s["extra_args"], posix=False)
         return cmd
 
     def _adopt(self) -> None:

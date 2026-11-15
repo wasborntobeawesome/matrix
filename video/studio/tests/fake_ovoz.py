@@ -78,6 +78,10 @@ class Handler(BaseHTTPRequestHandler):
         text = data.get("text") or ""
         with State.lock:
             State.calls.append(data)
+        if len(text) > 5000:                     # Ovoz's TTSRequest model: FastAPI validation error (detail list)
+            return self._send(422, json.dumps({"detail": [{
+                "type": "string_too_long", "loc": ["body", "text"], "msg": "String should have at most 5000 characters",
+                "input": text[:20], "ctx": {"max_length": 5000}}]}).encode())
         if State.refuse and State.refuse.search(text) and data.get("voice") not in State.accept_voices:
             return self._send(422, json.dumps({"detail": "Ovoz yaratib bo'lmadi. Matnni tekshiring."}).encode())
         return self._send(200, tone(min(4.0, 0.6 + len(text) / 16)), "audio/wav")

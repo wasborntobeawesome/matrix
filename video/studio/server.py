@@ -319,6 +319,7 @@ async def update_project(pid: str, request: Request):
     body = _parse_brief(await request.body())
     raw = body.get("brief") if isinstance(body, dict) and isinstance(body.get("brief"), dict) else body
     clean, warnings = B.normalize(raw, p.assets())
+    L.drop_stale_alts(clean)          # another main clip picked: its old other-orientation variant no longer fits
     snap = p.save_brief(clean)
     lang = I.ui_lang(request)
     if snap:

@@ -297,14 +297,26 @@ def compute(wav: Path, text: str, lang: str, product: str = "") -> dict:
     return res
 
 
+def with_display(res: dict | None, text: str, lang: str, product: str = "") -> dict | None:
+    """The cache key covers the audio + spoken text, not the product name, but the caption words depend on it
+    (Uzbek "Nimbo'ni" -> tutuq belgisi ʼ for the product, else the letter oʻ). The timings do not (alignment
+    compares words without apostrophes), so the words' display form is applied on every read."""
+    if not res or not res.get("words"):
+        return res
+    disp = V.display_text(text, lang, product).split()
+    if len(disp) != len(res["words"]):
+        return res
+    return {**res, "words": [{**w, "w": d} for w, d in zip(res["words"], disp)]}
+
+
 def timing(wav: Path, text: str, lang: str, product: str = "", run: bool = True) -> dict | None:
     """Cached result, or compute it now (run=True), or None (run=False and not cached yet)."""
     c = cached(wav, text, lang)
     if c is not None or not run:
-        return c
+        return with_display(c, text, lang, product)
     with _run_lock:
         c = cached(wav, text, lang)
-        return c if c is not None else compute(wav, text, lang, product)
+        return with_display(c if c is not None else compute(wav, text, lang, product), text, lang, product)
 
 
 _run_lock = threading.Lock()

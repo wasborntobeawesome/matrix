@@ -25,21 +25,37 @@ DEFAULT_API = "http://localhost:8000"
 class TTSError(RuntimeError):
     """Ovoz refused or could not be reached. `unreachable` is True when it is down.
 
-    `status` = Ovoz's HTTP status, `detail` = its message, `attempts` = how many times the line was tried."""
+    `status` = Ovoz's HTTP status, `detail` = its message, `attempts` = how many times the line was tried,
+    `invalid` = Ovoz rejected the request itself (FastAPI validation: text too long, rate out of range…)."""
 
     def __init__(self, message: str, unreachable: bool = False, status: int | None = None, detail: str = "",
-                 attempts: int = 1):
+                 attempts: int = 1, invalid: bool = False):
         super().__init__(message)
         self.unreachable = unreachable
         self.status = status
         self.detail = detail
         self.attempts = attempts
+        self.invalid = invalid
 
 
-# Ovoz answers 422 when the voice engine returned no audio (Microsoft's online service sends
-# "NoAudioReceived" for some sentences, sometimes only now and then) and 5xx for engine / network errors:
-# worth another try. 400 (bad voice / language), 410 (voice deleted), 503 (model not installed) are not.
+# Ovoz answers 422 with a message (detail is a string) when the voice engine returned no audio (Microsoft's
+# online service sends "NoAudioReceived" for some sentences, sometimes only now and then) and 5xx for engine /
+# network errors: worth another try. A 422 whose detail is a LIST is FastAPI's request validation (text too
+# long, rate out of range): the same request fails the same way, never retried. 400 (bad voice / language),
+# 410 (voice deleted), 503 (model not installed) are not retried either.
 RETRY_STATUS = {422, 500, 502, 504}
+
+
+def validation_reason(detail: list) -> str:
+    """FastAPI's [{loc: ["body", "text"], msg: "String should have at most 5000 characters"}, …] -> readable."""
+    out = []
+    for d in detail[:3]:
+        if isinstance(d, dict):
+            loc = [str(x) for x in d.get("loc") or [] if x != "body"]
+            out.append((".".join(loc) + ": " if loc else "") + str(d.get("msg") or "invalid"))
+        else:
+            out.append(str(d))
+    return "; ".join(out) or "invalid request"
 RETRY_DELAYS = (1.5, 4.0)          # seconds before the 2nd and the 3rd attempt, times a 0.7..1.3 jitter
 _sleep = time.sleep                # tests replace it
 
@@ -59,6 +75,9 @@ def _tts_once(text, model, voice, lang, rate, style, api, timeout) -> bytes:
             body = json.loads(body).get("detail", body)
         except (ValueError, AttributeError):
             pass
+        if isinstance(body, list):                 # FastAPI validation error: the request itself is wrong
+            reason = validation_reason(body)
+            raise TTSError(f"Ovoz rejected the request: {reason}", status=e.code, detail=reason, invalid=True) from None
         raise TTSError(f"Ovoz error {e.code}: {body}", status=e.code, detail=str(body)) from None
     except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
         reason = getattr(e, "reason", e)
@@ -78,7 +97,7 @@ def tts(text: str, model: str, voice: str, lang: str, rate: int = 0, style: str 
             return _tts_once(text, model, voice, lang, rate, style, api, timeout)
         except TTSError as e:
             e.attempts = attempt + 1
-            if e.unreachable or e.status not in RETRY_STATUS or attempt >= len(delays):
+            if e.unreachable or e.invalid or e.status not in RETRY_STATUS or attempt >= len(delays):
                 raise
             if on_retry:
                 on_retry(attempt + 1, e)

@@ -204,7 +204,8 @@ class Jobs:
         brief = p.brief
         langs = _langs(p, prm)
         fmts = [f for f in (prm.get("formats") or []) if f in FORMATS] or build.formats_of(brief)
-        warnings = []
+        warnings = []                               # about every output
+        per_lang: dict[str, list[str]] = {}         # about one language's outputs only
         # 1. voice-over (only what is missing) + word timing
         if not prm.get("skip_voice"):
             job.update(stage="voice", message="voice-over", progress=0.0)
@@ -226,7 +227,10 @@ class Jobs:
                     if not prm.get("allow_silent"):
                         raise JobFailed(build.failed_summary(vres["failed"]), {"failed": vres["failed"],
                                                                              "generated": vres["generated"]})
-                    warnings.append(f"voice-over skipped: {build.failed_summary(vres['failed'])}")
+                    for lg in langs:
+                        mine = [x for x in vres["failed"] if x.get("lang") == lg]
+                        if mine:
+                            per_lang.setdefault(lg, []).append(f"voice-over skipped: {build.failed_summary(mine)}")
         job.update(stage="timing", message="word timing", progress=0.12)
         build.align_all(p, langs, progress=lambda f, m: job.update(progress=round(0.12 + 0.03 * f, 3), message=m))
         # 2. timelines (+ voice-over joins and music mixes, shared by the formats of a language)
@@ -247,7 +251,9 @@ class Jobs:
             tl = tls[(lg, f)]
             tag = f"{lg} {f}" + (f" ({k + 1}/{len(outputs)})" if len(outputs) > 1 else "")
             if tl["voice_needed"] and tl["voiced"] < tl["voice_needed"]:
-                warnings.append(f"{lg}: {tl['voice_needed'] - tl['voiced']} scene(s) without voice-over (silence)")
+                w = f"{lg}: {tl['voice_needed'] - tl['voiced']} scene(s) without voice-over (silence)"
+                if w not in per_lang.setdefault(lg, []):
+                    per_lang[lg].append(w)
             base = f"{lg}-{build.fmt_slug(f)}-{stamp}"
             out = p.build_dir / f"render-{job['id']}-{k}.mp4"   # moved into renders/ only when complete
             cover_png = p.build_dir / f"render-{job['id']}-{k}.png"
@@ -273,7 +279,8 @@ class Jobs:
             if cover_png.exists():
                 cover_png.replace(p.renders_dir / f"{base}.png")
             meta = {"language": lg, "format": f, "duration": tl["duration"], "width": tl["width"], "height": tl["height"],
-                    "voiced": tl["voiced"], "voice_needed": tl["voice_needed"], "warnings": warnings,
+                    "voiced": tl["voiced"], "voice_needed": tl["voice_needed"],
+                    "warnings": [*warnings, *per_lang.get(lg, [])],     # the job's own + this language's, a copy
                     "seconds": round(time.time() - t0, 1), "cover_t": cover_t, "timing": tl.get("timing"),
                     "music": tl.get("music"), "template": (tl.get("template") or {}).get("id"), "srt": f"{base}.srt", "vtt": f"{base}.vtt",
                     "cover": f"{base}.png" if (p.renders_dir / f"{base}.png").exists() else None, "batch": stamp}
@@ -283,7 +290,8 @@ class Jobs:
         p.touch()
         first = results[0]
         return {"render": first["render"], "renders": [r["render"] for r in results], "outputs": results,
-                "duration": first["duration"], "format": first["format"], "warnings": warnings,
+                "duration": first["duration"], "format": first["format"],
+                "warnings": [*warnings, *(w for lg in langs for w in per_lang.get(lg, []))],
                 "seconds": round(time.time() - t_all, 1)}
 
     def _run_render(self, job, cmd, tag, done_frames, total_frames, t_all):

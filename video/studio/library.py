@@ -118,6 +118,40 @@ def broll_get(cid: str) -> dict | None:
     return m if m and (d / "clip.webm").exists() else None
 
 
+def broll_spec(m: dict) -> tuple:
+    """What a b-roll clip shows: (prompt, seed, image sha, provider). Both orientations of one b-roll share it."""
+    return (str(m.get("prompt") or "").strip(), str(m.get("seed")), m.get("image_sha") or None, m.get("provider") or None)
+
+
+def spec_matches(m: dict, want: tuple) -> bool:
+    """broll_spec(m) == want; a provider missing on either side (clips from before providers) is not compared."""
+    have = broll_spec(m)
+    if have[3] is None or want[3] is None:
+        return have[:3] == tuple(want[:3])
+    return have == tuple(want)
+
+
+def variant_fits(main_id: str | None, alt_id: str | None) -> bool:
+    """Was the other-orientation clip `alt_id` made for the same b-roll as `main_id` (same prompt, seed, animated
+    image, provider)? A clip that is not in the library cannot be compared and counts as fitting."""
+    m, a = broll_get(main_id) if main_id else None, broll_get(alt_id) if alt_id else None
+    if not m or not a:
+        return True
+    return spec_matches(a, broll_spec(m))
+
+
+def drop_stale_alts(brief: dict) -> list[str]:
+    """Remove `clip_alt` from scenes whose main clip it was not made for (another clip was picked / generated).
+    Returns the scene ids it changed."""
+    out = []
+    for s in brief.get("scenes") or []:
+        bg = s.get("background")
+        if isinstance(bg, dict) and bg.get("clip_alt") and bg.get("clip") and not variant_fits(bg["clip"], bg["clip_alt"]):
+            bg.pop("clip_alt", None)
+            out.append(s.get("id"))
+    return out
+
+
 def broll_file(cid: str, name: str) -> Path:
     if name not in ("clip.mp4", "clip.webm", "thumb.jpg"):
         raise StoreError("not found", 404)

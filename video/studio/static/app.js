@@ -1391,7 +1391,8 @@
         const variantBtn = bg.prompt ? el("button", { class: "btn small", onclick: async () => {
           try {
             const j = await api("POST", "/api/ai/broll", { prompt: bg.prompt, seed: bg.seed ?? 42, preset: "final", orientation: otherOrient,
-              provider: bg.provider || projProv, assign: { project: pid, scene: sc.id, dim: bg.dim, blur: bg.blur, variant: true } });
+              provider: bg.provider || projProv, assign: { project: pid, scene: sc.id, dim: bg.dim, blur: bg.blur, variant: true },
+              ...(bg.image ? { image: { project: pid, asset: bg.image } } : {}) });
             toast(j.status === "done" ? t("ai.reused") : t("ai.queued"), "ok"); onAiJob(j);
           } catch (e) { toast(e.message, "error", 8000); }
         } }, "✦ " + t("ai.variantMake", { o: t("ai.orientations." + otherOrient) })) : null;
@@ -1415,7 +1416,13 @@
       bg.dim = bg.dim ?? 0.55; bg.blur = bg.blur ?? 0;
       box.append(el("div", { class: "row gap wrap" }, slider("dim", 0, 0.9, 0.05, v => `${Math.round(v * 100)}%`), slider("blur", 0, 20, 1, v => `${v}px`)));
       box.append(el("span", { class: "lbl" }, t("ai.bgPick")),
-        AI.clipGrid(clips, { compact: true, selected: bg.clip, onPick: m => { bg.clip = m.id; changed({ list: true, now: true }); renderSceneForm(); } }));
+        AI.clipGrid(clips, { compact: true, selected: bg.clip, onPick: m => {
+          // the other-orientation variant belongs to the old clip unless it shows the same b-roll (server checks too)
+          const alt = bg.clip_alt && clips.find(c => c.id === bg.clip_alt);
+          const same = alt && String(alt.prompt || "").trim() === String(m.prompt || "").trim() && String(alt.seed) === String(m.seed)
+            && (alt.image_sha || null) === (m.image_sha || null) && (!alt.provider || !m.provider || alt.provider === m.provider);
+          if (bg.clip_alt && !same) delete bg.clip_alt;
+          bg.clip = m.id; changed({ list: true, now: true }); renderSceneForm(); } }));
       S.pendBox = el("div", { class: "jobs" });
       box.append(S.pendBox);
       box.append(el("details", { class: "gen", open: !!(bg.prompt && !bg.clip) },

@@ -611,6 +611,9 @@ class AIJobs:
                                    "dim": a.get("dim", bg.get("dim", 0.55)), "blur": a.get("blur", bg.get("blur", 0))}
                 if not a.get("variant") and job["params"].get("seed") is not None:
                     s["background"]["seed"] = job["params"]["seed"]       # the seed the clip was really made with
+                if not a.get("variant") and not L.variant_fits(cid, s["background"].get("clip_alt")):
+                    s["background"].pop("clip_alt", None)    # made for an earlier prompt / seed / image: regenerate
+
                 p.save_brief(normalize(b, p.assets())[0])
                 job.setdefault("result_note", f"assigned to scene '{a['scene']}'")
                 return

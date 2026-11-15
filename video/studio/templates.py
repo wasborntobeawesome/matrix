@@ -571,14 +571,22 @@ def _install(src: Path, tid: str, replace: bool) -> None:
         ROOT.mkdir(parents=True, exist_ok=True)
         tag = secrets.token_hex(4)
         new, old = ROOT / f".new-{tid}-{tag}", ROOT / f".old-{tid}-{tag}"
+        moved = False
         try:
             shutil.copytree(src, new)
             if dest.exists():
                 dest.rename(old)
+                moved = True
             new.rename(dest)
+        except BaseException:
+            if moved and not dest.exists():
+                old.rename(dest)           # roll back: the installed template stays as it was
+            raise
+        else:
+            if moved:
+                shutil.rmtree(old, ignore_errors=True)      # only once the new one is in place
         finally:
             shutil.rmtree(new, ignore_errors=True)
-            shutil.rmtree(old, ignore_errors=True)
 
 
 def _zip_entries(src: Path) -> int | None:

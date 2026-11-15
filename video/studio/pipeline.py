@@ -231,8 +231,13 @@ class Pipelines:
         for st in it["stages"].values():
             if st["state"] in ("error", "cancelled", "running", "paused"):
                 st.update(_stage())
-        if skip_failed:
-            it["skip_failed"] = True
+        # the choice applies to this retry only: a later plain Retry tries the failed lines again (and pauses
+        # again if they still fail) instead of silently rendering them silent forever
+        it["skip_failed"] = bool(skip_failed)
+        vst = it["stages"]["voice"]
+        if not skip_failed and not it.get("allow_silent") and vst["state"] == "warning" and vst["detail"].get("failed"):
+            vst.update(_stage())         # lines skipped by an earlier "continue without them": voice them again
+            it["notices"] = [n for n in it.get("notices") or [] if not n.startswith("voice-over:")]
         it.pop("voice_failures", None)
         it.update(status="queued", error=None, finished=None)
         it.pop("_cancel", None)
@@ -367,7 +372,7 @@ class Pipelines:
             comfy = comfy or P.is_comfy(provider)
             out.append(("broll", self.ai.estimate_broll(provider, q, bool(img))))
             if bg.get("both") and other_orientation(brief) and not (bg.get("clip_alt") and L.broll_get(bg["clip_alt"])):
-                out.append(("broll", self.ai.estimate_broll(provider, q, False)))
+                out.append(("broll", self.ai.estimate_broll(provider, q, bool(img))))
         if comfy and not self.ai.comfy.reachable(1.0):
             out.append(("comfy-start", 25.0))         # ComfyUI starts (measured ~21 s) before its first job
         if bubble or fullp:
@@ -587,20 +592,27 @@ class Pipelines:
             pv = P.get(provider)
             ids.append(self.ai.submit("broll", params, project=p.id, label=f"{pv['name']} · {bg['prompt'][:56]}",
                                       units=pv["presets"][q]["steps"], preset=q)["id"])
+        brief = p.brief          # the loop above may have assigned cached clips (and dropped stale variants)
         for s in brief["scenes"]:
             # b) the other orientation (e.g. 16:9 next to a 9:16 main format) instead of a hard crop
             bg = s.get("background") or {}
             oth = other_orientation(brief)
-            if (bg.get("type") != "broll" or not bg.get("both") or not bg.get("prompt") or not oth
-                    or (bg.get("clip_alt") and L.broll_get(bg["clip_alt"]))):
+            if bg.get("type") != "broll" or not bg.get("both") or not bg.get("prompt") or not oth:
                 continue
             provider = bg.get("provider") or brief.get("broll_provider") or P.DEFAULT
             provider = provider if P.exists(provider) else P.DEFAULT
             seed = broll_seed(bg)
+            # the same image as the main clip (an image-to-video scene must not get unrelated text-to-video footage)
+            img = image_ref(p, bg["image"]) if bg.get("image") else None
+            alt = L.broll_get(bg["clip_alt"]) if bg.get("clip_alt") else None
+            if alt and L.spec_matches(alt, (bg["prompt"].strip(), str(seed), img["sha"] if img else None, provider)):
+                continue            # a variant of this very b-roll exists already
             params = {"prompt": bg["prompt"], "negative": None, "seed": seed, "orientation": oth, "provider": provider,
                       "assign": {"project": p.id, "scene": s["id"], "dim": bg.get("dim", 0.55), "blur": bg.get("blur", 0),
                                  "variant": True}}
-            cid = P.clip_key(provider, bg["prompt"], seed, q, oth, None)
+            if img:
+                params["image"] = img
+            cid = P.clip_key(provider, bg["prompt"], seed, q, oth, img["sha"] if img else None)
             if L.broll_get(cid):
                 self.ai._assign_broll({"params": params}, cid)
                 continue

@@ -141,9 +141,12 @@ def _write_failures(p: Project, d: dict) -> None:
 def fail_code(e: "V.TTSError", model: str | None) -> str:
     """Why a line failed, for the UI: no_audio_online (Microsoft's online service sent no audio — the text is
     usually fine), no_audio (a local model sent none), service_error (5xx), rejected (bad voice / language),
-    model_missing (503), unreachable (Ovoz is down)."""
+    invalid (Ovoz refused the request itself: text too long, speed out of range), model_missing (503),
+    unreachable (Ovoz is down)."""
     if e.unreachable:
         return "unreachable"
+    if getattr(e, "invalid", False):
+        return "invalid"
     if e.status == 422:
         return "no_audio_online" if (model or "").lower() in ONLINE_MODELS else "no_audio"
     if e.status == 503:
@@ -181,12 +184,16 @@ def generate(p: Project, scene_ids: list[str] | None = None, force: bool = False
     voice, text, attempts}]}. Only "Ovoz is not reachable" stops the whole run (raises voicelib.TTSError).
     skip_failed: lines that already failed (unchanged since) are not tried again; they are reported as failed."""
     api = api or OVOZ
+    brief = p.brief                       # read project.json once, localize once per language
     todo = todo_lines(p, langs, scene_ids, force)
-    known = {f["key"]: f for f in voice_failures(p)} if skip_failed else {}
-    total = sum(1 for lg in (langs or langs_of(p.brief)) for s in localize(p.brief, lg)["scenes"]
-                if say_of(s) and not is_silent(localize(p.brief, lg), s) and (scene_ids is None or s["id"] in scene_ids))
+    known = {f["key"]: f for f in voice_failures(p, brief)} if skip_failed else {}
+    total = 0
+    for lg in langs or langs_of(brief):
+        lb = localize(brief, lg)
+        total += sum(1 for s in lb["scenes"]
+                     if say_of(s) and not is_silent(lb, s) and (scene_ids is None or s["id"] in scene_ids))
     made, failed = [], []
-    multi = len(langs_of(p.brief)) > 1
+    multi = len(langs_of(brief)) > 1
     for i, (lg, lb, s) in enumerate(todo):
         tag = f"{lg} · {s['id']}"
         if progress:
