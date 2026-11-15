@@ -58,11 +58,42 @@ NEGATIVE = (
 )
 
 
+# Full-GPU mode ("full"): the three stages run one after another, each with the GPU to itself and the
+# CUDA cache emptied in between: UMT5 text encoder (11.4 GB) encodes the prompts -> back to the CPU;
+# the whole transformer (10 GB) is resident for every diffusion step (no weight streaming); then the
+# VAE decodes. Plain model-level offload ("model") keeps the encoder's freed blocks cached and spilled
+# ~2.3 GB into shared memory at 704x1280. Needs ~13 GB free; otherwise fall back to block-level group
+# offloading (weights stream in block by block, ~8-11 GB peak).
+FULL_GPU_GB = 13.0
+
+
+def full_need_gb(width: int, height: int, frames: int) -> float:
+    """VRAM the full-GPU mode needs, from measured peaks on an RTX 5070 Ti (torch reserved + 0.5 GB):
+    480x832x81 (8.2k latent tokens) 11.65 GB, 704x1280x121 (27.3k tokens) 16.95 GB."""
+    tokens = ((frames - 1) // 4 + 1) * (width // 32) * (height // 32)
+    return 9.4 + 0.28 * tokens / 1000 + 0.5
+
+
+def pick_offload(mode: str, need_gb: float = FULL_GPU_GB) -> str:
+    """auto: full GPU only when it fits without spilling into shared memory (spilling made it slower
+    than group offload: 32 vs 23 s/step at 704x1280); otherwise group offload, which streams weights
+    with CUDA streams and is within ~3 % of full-GPU speed when the GPU is otherwise free."""
+    if mode != "auto":
+        return mode
+    free = torch.cuda.mem_get_info()[0] / 2**30
+    print(f"free VRAM {free:.1f} GB, full-GPU mode needs ~{need_gb:.1f} GB -> "
+          f"{'full GPU' if free >= need_gb else 'group offload'}", flush=True)
+    return "full" if free >= need_gb else "group"
+
+
 def load_pipe(offload: str):
+    offload = pick_offload(offload)
     src = str(MODEL_DIR) if (MODEL_DIR / "model_index.json").exists() else MODEL_ID
     vae = AutoencoderKLWan.from_pretrained(src, subfolder="vae", torch_dtype=torch.float32)
     pipe = WanPipeline.from_pretrained(src, vae=vae, torch_dtype=torch.bfloat16)
-    if offload == "none":
+    if offload == "full":
+        pass  # components are moved stage by stage in run_full()
+    elif offload == "none":
         pipe.to("cuda")
     elif offload == "model":
         pipe.enable_model_cpu_offload()
@@ -98,7 +129,8 @@ def main():
     ap.add_argument("--height", type=int, default=1280)
     ap.add_argument("--frames", type=int, default=121, help="4k+1; 121 = 5 s @ 24 fps")
     ap.add_argument("--fps", type=int, default=24)
-    ap.add_argument("--offload", default="group", choices=["none", "model", "group", "sequential"])
+    ap.add_argument("--offload", default="group", choices=["auto", "full", "none", "model", "group", "sequential"],
+                    help="auto = full GPU when >= 13 GB are free, else group")
     ap.add_argument("--out", default=str(HERE / "clips"))
     ap.add_argument("--out-file", help="studio mode: write this one mp4 (needs --prompt)")
     ap.add_argument("--negative", default=NEGATIVE, help="negative prompt")
@@ -147,6 +179,38 @@ def main():
         print(json.dumps(rec), flush=True)
 
 
+def run_full(pipe, args, on_step):
+    """Full-GPU generation: encoder, transformer and VAE each get the GPU alone (see FULL_GPU_GB)."""
+    dev = torch.device("cuda")
+
+    class _OnCuda(type(pipe)):
+        @property
+        def _execution_device(self):
+            return dev
+    pipe.__class__ = _OnCuda
+    pipe.text_encoder.to(dev)
+    with torch.no_grad():
+        pe, ne = pipe.encode_prompt(prompt=args.prompt, negative_prompt=args.negative, do_classifier_free_guidance=True,
+                                    num_videos_per_prompt=1, max_sequence_length=512, device=dev)
+    pipe.text_encoder.to("cpu")
+    torch.cuda.empty_cache()
+    pipe.transformer.to(dev)
+    latents = pipe(prompt_embeds=pe, negative_prompt_embeds=ne, height=args.height, width=args.width,
+                   num_frames=args.frames, num_inference_steps=args.steps, guidance_scale=args.guidance,
+                   generator=torch.Generator("cpu").manual_seed(args.seed), callback_on_step_end=on_step,
+                   output_type="latent").frames
+    del pe, ne
+    pipe.transformer.to("cpu")
+    torch.cuda.empty_cache()
+    vae = pipe.vae.to(dev)
+    with torch.no_grad():
+        latents = latents.to(dev, dtype=vae.dtype)
+        mean = torch.tensor(vae.config.latents_mean).view(1, vae.config.z_dim, 1, 1, 1).to(dev, latents.dtype)
+        std = 1.0 / torch.tensor(vae.config.latents_std).view(1, vae.config.z_dim, 1, 1, 1).to(dev, latents.dtype)
+        video = vae.decode(latents / std + mean, return_dict=False)[0]
+        return pipe.video_processor.postprocess_video(video, output_type="np")[0]
+
+
 def studio(args):
     """One clip -> args.out_file, with progress lines for the studio queue."""
     if not args.prompt:
@@ -157,6 +221,8 @@ def studio(args):
     out.parent.mkdir(parents=True, exist_ok=True)
     io.progress("load", 0, args.steps)
     t0 = time.time()
+    free0 = torch.cuda.mem_get_info()[0] / 2**30
+    args.offload = pick_offload(args.offload, full_need_gb(args.width, args.height, args.frames))
     pipe = load_pipe(args.offload)
     load_s = time.time() - t0
     print(f"pipeline loaded in {load_s:.1f}s", flush=True)
@@ -173,22 +239,25 @@ def studio(args):
         return kw
 
     io.progress("denoise", 0, args.steps)
-    result = pipe(
-        prompt=args.prompt, negative_prompt=args.negative,
-        height=args.height, width=args.width, num_frames=args.frames,
-        num_inference_steps=args.steps, guidance_scale=args.guidance,
-        generator=torch.Generator("cpu").manual_seed(args.seed),
-        callback_on_step_end=on_step, output_type="np",
-    )
+    if args.offload == "full":
+        frames = run_full(pipe, args, on_step)
+    else:
+        frames = pipe(
+            prompt=args.prompt, negative_prompt=args.negative,
+            height=args.height, width=args.width, num_frames=args.frames,
+            num_inference_steps=args.steps, guidance_scale=args.guidance,
+            generator=torch.Generator("cpu").manual_seed(args.seed),
+            callback_on_step_end=on_step, output_type="np",
+        ).frames[0]
     denoise_s = step_t[-1] - t1
-    frames = result.frames[0]
     torch.cuda.synchronize()
     io.progress("encode", args.steps, args.steps)
     export_to_video(frames, str(out), fps=args.fps, quality=9)
     gen_s = time.time() - t1
     io.result(file=str(out), prompt=args.prompt, negative=args.negative, seed=args.seed, steps=args.steps,
               guidance=args.guidance, width=args.width, height=args.height, frames=args.frames, fps=args.fps,
-              seconds=round(args.frames / args.fps, 2), offload=args.offload, load_seconds=round(load_s, 1),
+              seconds=round(args.frames / args.fps, 2), offload=args.offload, free_vram_at_start_gb=round(free0, 1),
+              full_gpu=args.offload in ("full", "none"), load_seconds=round(load_s, 1),
               denoise_seconds=round(denoise_s, 1), decode_seconds=round(gen_s - denoise_s, 1),
               gen_seconds=round(gen_s, 1), torch=torch.__version__, **io.vram_stats())
 

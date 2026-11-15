@@ -24,6 +24,7 @@ import library as L
 import presenter as PR
 from aijobs import AI_PY, DISCLOSURE, LICENCES, AIJobs
 from jobs import Jobs
+from pipeline import Pipelines
 from store import MAX_IMAGE, MAX_VIDEO, Project, StoreError, import_project, kind_of
 
 STUDIO = Path(__file__).resolve().parent
@@ -39,6 +40,7 @@ try:
 except Exception as e:  # never block the studio on the AI library
     print("library import failed:", e)
 ai = AIJobs()
+make = Pipelines(jobs, ai)
 
 
 @app.on_event("startup")
@@ -206,7 +208,7 @@ def _detail(p: Project) -> dict:
     voiced = {s["id"]: bool(build.scene_voice(p, brief, s)) for s in brief["scenes"]}
     _, warnings = B.normalize(brief, p.assets())
     return {**d, "assets": p.assets(), "renders": p.renders(), "voiced": voiced, "warnings": warnings,
-            "jobs": jobs.for_project(p.id), "ai_jobs": ai.active(project=p.id),
+            "jobs": jobs.for_project(p.id), "ai_jobs": ai.active(project=p.id), "make": make.latest(p.id),
             "presenter_state": _presenter_state(p)}
 
 
@@ -233,6 +235,8 @@ def delete_project(pid: str):
         raise HTTPException(409, "a render is running for this project")
     if any(j["status"] == "running" for j in ai.active(project=pid)):
         raise HTTPException(409, "an AI job is running for this project")
+    if make.active(pid):
+        raise HTTPException(409, "a “Make video” pipeline is running for this project")
     p.delete()
     return {"deleted": pid}
 
@@ -650,6 +654,56 @@ def presenter_file(pid: str, name: str):
     if not f.is_file():
         raise HTTPException(404, "not found")
     return FileResponse(f)
+
+
+# ---------------------------------------------------------------- "Make video" pipeline
+@app.post("/api/projects/{pid}/make", status_code=202)
+async def make_video(pid: str, request: Request):
+    """Brief -> finished MP4 in one call: voice-over -> free GPU (Ovoz /api/unload) -> AI jobs -> render.
+    Body (optional): {"quality": "final"|"draft" (AI quality, default final), "allow_silent": false}.
+    409 + the running pipeline if one is already queued/running for this project."""
+    Project.get(pid)
+    d = _body(await request.body())
+    act = make.active(pid)
+    if act:
+        return JSONResponse(act, status_code=409)
+    q = d.get("quality") if d.get("quality") in ("draft", "final") else "final"
+    return make.submit(pid, q, bool(d.get("allow_silent")))
+
+
+@app.get("/api/projects/{pid}/make")
+def make_status(pid: str):
+    Project.get(pid)
+    return JSONResponse(make.latest(pid) or {}, headers=NOCACHE)
+
+
+@app.get("/api/make")
+def make_list():
+    return JSONResponse(make.list(), headers=NOCACHE)
+
+
+@app.get("/api/make/{mid}")
+def make_get(mid: str):
+    it = make.get(mid)
+    if not it:
+        raise HTTPException(404, "pipeline not found")
+    return JSONResponse(it, headers=NOCACHE)
+
+
+@app.post("/api/make/{mid}/cancel")
+def make_cancel(mid: str):
+    it = make.cancel(mid)
+    if not it:
+        raise HTTPException(404, "pipeline not found")
+    return it
+
+
+@app.post("/api/make/{mid}/retry", status_code=202)
+def make_retry(mid: str):
+    it = make.retry(mid)
+    if not it:
+        raise HTTPException(409, "only a failed, cancelled or interrupted pipeline can be retried (and none may be active)")
+    return it
 
 
 @app.get("/api/ai-licences")

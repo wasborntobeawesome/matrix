@@ -65,6 +65,26 @@ step and one `@@RESULT {json}` (timings, peak VRAM) at the end (`studio_io.py`):
 
 See the "AI layers" section of `video/studio/README.md` for presets and timings measured in the studio.
 
+**GPU modes** (`broll.py --offload auto|full|group|model`, `avatar.py` job `"gpu": "auto"|"full"|"offload"`):
+
+- `full` runs each Wan stage with the GPU to itself:
+  1. The UMT5 encoder encodes the prompts, then moves back to the CPU, and the CUDA cache is emptied.
+  2. The whole transformer stays resident for every diffusion step.
+  3. The VAE decodes.
+- `auto` picks `full` only when it fits without spilling into shared memory.
+- On the RTX 5070 Ti, with Ovoz unloaded (14.7 GB free):
+
+| Resolution | `full` | `group` |
+|---|---|---|
+| draft, 480×832×81 | 3.89 s/step; 10.9 / 11.7 GB (alloc / reserved) | 3.99 s/step |
+| final, 704×1280×121 | 32 s/step; 14.6 / 17.0 GB, **spills 2.2 GB** | **23 s/step**; 8.7 / 11.0 GB |
+
+- At final resolution, `auto` therefore keeps group offload.
+- Group offload with CUDA streams is within ~3 % of full residency. The big win is a free GPU: 23 s/step
+  instead of 43 s/step when it shared VRAM with the TTS models and spilled.
+- EchoMimic `full` keeps the transformer, VAE and CLIP image encoder resident (the T5 stays on the CPU, its
+  embeddings are cached) instead of model-level CPU offload.
+
 ## A. B-roll with Wan2.2-TI2V-5B
 
 - Pipeline: `WanPipeline` in diffusers, bf16 transformer, fp32 VAE with tiling.

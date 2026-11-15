@@ -62,6 +62,15 @@ class Jobs:
         self.jobs: dict[str, dict] = {}
         self.procs: dict[str, subprocess.Popen] = {}
         self.queues = {"voice": Queue("voice", self._voice), "render": Queue("render", self._render)}
+        self.gate = None   # callable -> str | None: why voice synthesis must wait now ("Make video" AI stage)
+
+    def _wait_gate(self, job: dict) -> None:
+        """Hold voice synthesis while a "Make video" pipeline has the GPU for AI jobs."""
+        while self.gate and (reason := self.gate()):
+            if job.get("cancel"):
+                raise Cancelled()
+            job.update(stage="waiting", message=reason)
+            time.sleep(2)
 
     # ---------- public ----------
     def submit(self, kind: str, project: str, **params) -> dict:
@@ -116,6 +125,7 @@ class Jobs:
         p = Project.get(job["project"])
         prm = job["params"]
         ids = [prm["scene"]] if prm.get("scene") else None
+        self._wait_gate(job)
 
         def prog(f, msg):
             if job.get("cancel"):
@@ -134,6 +144,9 @@ class Jobs:
         # 1. voice-over (only what is missing)
         if not prm.get("skip_voice"):
             job.update(stage="voice", message="voice-over", progress=0.0)
+            tl0 = build.timeline(p)
+            if tl0["voiced"] < tl0["voice_needed"]:
+                self._wait_gate(job)
 
             def prog(f, msg):
                 if job.get("cancel"):

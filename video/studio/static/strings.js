@@ -144,6 +144,7 @@ window.STRINGS = {
   stages: {
     queued: "Queued", starting: "Starting", voice: "Voice-over", timeline: "Timeline", audio: "Audio analysis",
     frames: "Rendering frames", encoding: "Encoding MP4", done: "Done", failed: "Failed", cancelled: "Cancelled",
+    waiting: "Waiting",
   },
   cancelJob: "Cancel",
   renderDone: "Render finished",
@@ -151,6 +152,26 @@ window.STRINGS = {
   jobFailed: "Failed: {msg}",
   confirmDeleteRender: "Delete render {name}?",
   shortcuts: "Space: play/pause · ←/→: 1 s · Alt+↑/↓: move scene",
+
+  // ---------------------------------------------------------------- "Make video" pipeline
+  make: {
+    title: "Make video",
+    button: "Make video",
+    help: "Runs everything in order, each step with the whole GPU: voice-over → free GPU (Ovoz unloads its models) → AI clips + presenter → render.",
+    quality: "AI quality",
+    qualities: { final: "Final", draft: "Draft" },
+    stages: { voice: "Voice-over", unload: "Free GPU", ai: "AI clips & presenter", render: "Render MP4" },
+    states: { pending: "waiting", running: "running", done: "done", warning: "done (note)", skipped: "skipped", error: "failed", cancelled: "cancelled" },
+    status: { queued: "Queued", running: "Running", done: "Finished", error: "Failed", cancelled: "Cancelled", interrupted: "Interrupted" },
+    elapsed: "{t}",
+    eta: "~{t} left",
+    cancel: "Cancel",
+    retry: "Retry from “{stage}”",
+    again: "Make again",
+    done: "Video ready: {name}",
+    busy: "“Make video” is running for this project.",
+    queuedPos: "Queued (#{n}) — one pipeline runs at a time",
+  },
 
   // ---------------------------------------------------------------- AI layers
   tabAi: "AI",

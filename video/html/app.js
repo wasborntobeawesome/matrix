@@ -591,7 +591,10 @@
           const { dev, screen } = deviceDom(g, sc.url);
           place(dev, g.x, g.y);
           cam.appendChild(dev);
-          screen.appendChild(m.el);
+          // the focus zoom happens inside the device screen (clipped by it), so the frame never grows
+          // over the headline, the captions or the progress bar
+          const zoomer = screen.appendChild(h("div", "zoomer"));
+          zoomer.appendChild(m.el);
           // media size inside the screen: fill width, natural height (tall shots scroll)
           const imgH = g.sw * m.aspect;
           const coverH = Math.max(imgH, g.sh);
@@ -605,24 +608,32 @@
             const off = clamp(fy + fh / 2 - g.sh / 2, 0, scrollMax);
             scroll0 = scroll1 = off;
             R = { x: (g.sw - mw) / 2 + f.x * mw, y: fy - off, w: f.w * mw, h: fh };
-            ring = screen.appendChild(h("div", "focus-ring"));
+            ring = zoomer.appendChild(h("div", "focus-ring"));
             place(ring, R.x, R.y, R.w, R.h);
           }
-          // focus in stage coordinates (before any camera move)
-          const F = R ? { x: g.x + g.sx + R.x + R.w / 2, y: g.y + g.sy + R.y + R.h / 2, w: R.w, h: R.h } : null;
-          const P = { x: box.x + box.w / 2, y: box.y + box.h / 2 };
-          let kz = 1;
-          if (F) {
-            const maxW = LAND ? box.w * 0.82 : W * 0.86, maxH = LAND ? box.h * 0.62 : box.h * 0.55;
-            kz = clamp(Math.min(maxW / F.w, maxH / F.h), 1, sc.zoom ? clamp(+sc.zoom, 1, 4) : (kind === "browser" ? 1.7 : 2.4));
-            if (RV && !LAND) {
-              // presenter bubble bottom-left: move the zoom target up so the focus never sits under it
-              const lim = RV.y - 18;
-              if (P.y + kz * F.h / 2 > lim) P.y = Math.max(box.y + kz * F.h / 2, lim - kz * F.h / 2);
-              if (P.y + kz * F.h / 2 > lim) { kz = Math.max(1, (lim - box.y) / F.h); P.y = (box.y + lim) / 2; }
+          // zoom inside the screen: scale kz about the origin + translate Z so the focus lands at the
+          // target point, clamped so the screenshot always covers the whole screen
+          let kz = 1, Z = { x: 0, y: 0 };
+          if (R) {
+            kz = clamp(Math.min(0.92 * g.sw / R.w, 0.8 * g.sh / R.h), 1, sc.zoom ? clamp(+sc.zoom, 1, 4) : (kind === "browser" ? 2.2 : 2.6));
+            let ty = g.sh / 2;
+            if (RV) {
+              // presenter bubble: keep the zoomed focus above it when they would overlap horizontally
+              const x0 = g.x + g.sx, lim = RV.y - 18 - (g.y + g.sy);
+              if (x0 < RV.x + RV.w && x0 + g.sw > RV.x && ty + kz * R.h / 2 > lim) {
+                ty = Math.max(kz * R.h / 2, lim - kz * R.h / 2);
+                if (ty + kz * R.h / 2 > lim) { kz = Math.max(1, lim / R.h); ty = lim / 2; }
+              }
             }
+            const cx = R.x + R.w / 2, cy = R.y + R.h / 2;
+            const c0 = { x0: (g.sw - mw) / 2, x1: (g.sw + mw) / 2, y0: -scroll0, y1: coverH - scroll0 };
+            const fitT = (t, a0, a1, size) => {
+              const lo = size - kz * a1, hi = -kz * a0;
+              return lo <= hi ? clamp(t, lo, hi) : (lo + hi) / 2;
+            };
+            Z = { x: fitT(g.sw / 2 - kz * cx, c0.x0, c0.x1, g.sw), y: fitT(ty - kz * cy, c0.y0, c0.y1, g.sh) };
           }
-          G = { g, box, dev, screen, ring, R, F, P, kz, scroll0, scroll1, cw: callout ? callout.offsetWidth : 0, ch: callout ? callout.offsetHeight : 0 };
+          G = { g, box, dev, screen, zoomer, ring, R, kz, Z, scroll0, scroll1, cw: callout ? callout.offsetWidth : 0, ch: callout ? callout.offsetHeight : 0 };
         };
 
         const D = sc.end - sc.start;
@@ -640,32 +651,33 @@
           const sp = prog(t, sc.start + 0.9, Math.max(0.5, D - 1.4), E.inOutSine);
           const scroll = lerp(G.scroll0, G.scroll1, sp);
           m.el.style.transform = `translate3d(0,${(-scroll).toFixed(2)}px,0)`;
-          // camera
-          let s = 1 + 0.035 * prog(t, sc.start, D, E.linear), tx = 0, ty = 0;
-          const k = G.F ? prog(t, zs, zd, E.inOutCubic) : 0;
-          if (G.F) {
-            s = lerp(1, G.kz, k) * (1 + 0.025 * prog(t, zs + zd, Math.max(0.5, D), E.linear));
-            const fx = lerp(G.F.x, G.P.x, k), fy = lerp(G.F.y, G.P.y, k);
-            tx = fx - s * G.F.x; ty = fy - s * G.F.y;
-          } else {
-            const c = { x: G.g.x + G.g.w / 2, y: G.g.y + G.g.h / 2 };
-            tx = c.x - s * c.x; ty = c.y - s * c.y;
-          }
+          // camera: a slow drift of the whole device (no growth beyond ~3.5 %)
+          const s = 1 + 0.035 * prog(t, sc.start, D, E.linear);
+          const c = { x: G.g.x + G.g.w / 2, y: G.g.y + G.g.h / 2 };
+          const tx = c.x - s * c.x, ty = c.y - s * c.y;
           cam.style.transform = `translate3d(${tx.toFixed(2)}px,${ty.toFixed(2)}px,0) scale(${s.toFixed(4)})`;
+          // focus zoom inside the screen
+          const k = G.R ? prog(t, zs, zd, E.inOutCubic) : 0;
+          const zk = lerp(1, G.kz, k) * (G.R ? 1 + 0.02 * prog(t, zs + zd, Math.max(0.5, D), E.linear) : 1);
+          const zx = lerp(0, G.Z.x, k), zy = lerp(0, G.Z.y, k);
+          if (G.R) G.zoomer.style.transform = `translate3d(${zx.toFixed(2)}px,${zy.toFixed(2)}px,0) scale(${zk.toFixed(4)})`;
           if (G.ring) {
             const rp = prog(t, zs - 0.35, 0.6, E.outBack);
             const ro = clamp((t - zs + 0.35) / 0.25);
             const pulse = 0.5 + 0.5 * Math.sin((t - zs) * 4.5);
             G.ring.style.opacity = ro.toFixed(3);
-            G.ring.style.borderWidth = px(Math.max(2, 5 / s));
-            G.ring.style.borderRadius = px(16 / s);
+            G.ring.style.borderWidth = px(Math.max(2, 5 / zk));
+            G.ring.style.borderRadius = px(16 / zk);
             G.ring.style.transform = `scale(${lerp(1.25, 1, rp).toFixed(4)})`;
-            G.ring.style.boxShadow = `0 0 0 4000px rgba(4,6,14,${(0.5 * ro).toFixed(3)}), 0 0 ${px((18 + 18 * pulse) / s)} ${rgba(B.accent, 0.75)}`;
+            G.ring.style.boxShadow = `0 0 0 4000px rgba(4,6,14,${(0.5 * ro).toFixed(3)}), 0 0 ${px((18 + 18 * pulse) / zk)} ${rgba(B.accent, 0.75)}`;
           }
-          if (callout && G.F) {
-            // ring rectangle in stage coordinates after the camera move
-            const rx = s * (G.F.x - G.F.w / 2) + tx, ry = s * (G.F.y - G.F.h / 2) + ty, rw = s * G.F.w, rh = s * G.F.h;
-            const lim = LAND ? { x0: G.box.x, x1: G.box.x + G.box.w, y0: 120, y1: 900 } : { x0: 50, x1: W - 50, y0: 330, y1: RV ? RV.y - 14 : 1270 };
+          if (callout && G.R) {
+            // ring rectangle in stage coordinates: zoom inside the screen, then the device drift
+            const sx0 = G.g.x + G.g.sx + zk * G.R.x + zx, sy0 = G.g.y + G.g.sy + zk * G.R.y + zy;
+            const rx = s * sx0 + tx, ry = s * sy0 + ty, rw = s * zk * G.R.w, rh = s * zk * G.R.h;
+            // never above the device area (= below the headline), never into the captions
+            const lim = LAND ? { x0: G.box.x, x1: G.box.x + G.box.w, y0: 120, y1: 900 }
+                             : { x0: 50, x1: W - 50, y0: hasText ? G.box.y - 8 : 330, y1: RV ? RV.y - 14 : 1270 };
             let below = ry + rh + 34 + G.ch <= lim.y1;
             let cy = below ? ry + rh + 34 : ry - 34 - G.ch;
             cy = clamp(cy, lim.y0, lim.y1 - G.ch);

@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 
 import studio_io as io
-from broll import load_pipe
+from broll import load_pipe, pick_offload
 
 HERE = Path(__file__).resolve().parent
 
@@ -42,6 +42,7 @@ def main():
     ap.add_argument("--negative", default=NEG)
     ap.add_argument("--out", help="studio mode: output PNG path")
     ap.add_argument("--progress", action="store_true")
+    ap.add_argument("--offload", default="auto", help="studio mode: auto | model | group")
     args = ap.parse_args()
     if args.out:
         return studio(args)
@@ -64,7 +65,10 @@ def studio(args):
     out.parent.mkdir(parents=True, exist_ok=True)
     io.progress("load", 0, args.steps)
     t0 = time.time()
-    pipe = load_pipe("group")
+    mode = pick_offload(args.offload)
+    if mode == "full":
+        mode = "model"   # one frame: model-level offload is already full speed
+    pipe = load_pipe(mode)
     load_s = time.time() - t0
     torch.cuda.reset_peak_memory_stats()
     t1 = time.time()
@@ -80,7 +84,7 @@ def studio(args):
                callback_on_step_end=on_step).frames[0][0]
     img.save(out)
     io.result(file=str(out), prompt=prompt, seed=seed, steps=args.steps, width=args.width, height=args.height,
-              load_seconds=round(load_s, 1), gen_seconds=round(time.time() - t1, 1), **io.vram_stats())
+              offload=mode, load_seconds=round(load_s, 1), gen_seconds=round(time.time() - t1, 1), **io.vram_stats())
 
 
 if __name__ == "__main__":

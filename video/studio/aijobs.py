@@ -47,10 +47,10 @@ NEED_GB = {"broll/draft": 7.7, "broll/final": 11.5, "portrait/final": 7.7, "pres
 # (video/ai/README.md + this studio's own draft runs); replaced by real job timings as they finish.
 TIME_DEFAULTS = {
     "broll/draft": {"load": 24, "per_unit": 4.3, "tail": 36},
-    "broll/final": {"load": 15, "per_unit": 43.0, "tail": 70},
+    "broll/final": {"load": 12, "per_unit": 23.5, "tail": 115},   # free GPU; 43 s/step when it spills
     "portrait/final": {"load": 25, "per_unit": 0.6, "tail": 5},
     "presenter/draft": {"load": 100, "per_unit": 23.5, "tail": 15},
-    "presenter/final": {"load": 100, "per_unit": 66.0, "tail": 20},
+    "presenter/final": {"load": 70, "per_unit": 55.0, "tail": 5},   # free GPU, model offload
 }
 LICENCES = [
     {"what": "Wan2.2-TI2V-5B weights + code (Wan-AI) — b-roll and generated portraits", "licence": "Apache-2.0",
@@ -86,6 +86,7 @@ class AIJobs:
         self.lock = threading.RLock()
         self.wake = threading.Event()
         self.current: str | None = None
+        self.hold = None   # callable -> str | None: a reason why no GPU job may start now ("Make video" voice stage)
         self._saved = 0.0
         self.timings = self._load_timings()
         self.monitor = gpu.Monitor(ai_pids=self._ai_pids)
@@ -272,6 +273,13 @@ class AIJobs:
                 self.wake.wait(3.0)
                 self.wake.clear()
                 continue
+            reason = self.hold() if self.hold else None
+            if reason:
+                job.update(waiting=True, stage="waiting_gpu", message=reason)
+                self._save()
+                self.wake.wait(3.0)
+                self.wake.clear()
+                continue
             if not job.get("force") and not self._no_gpu_work(job):
                 snap = self.monitor.get(fresh=True)
                 if snap.get("ok"):
@@ -427,7 +435,8 @@ class AIJobs:
         tl = self.timings.get(_key("broll", job["preset"]), {})
         res = self._proc(job, ["broll.py", "--prompt", prm["prompt"], "--negative", prm.get("negative") or L.NEGATIVE,
                                "--seed", str(prm["seed"]), "--steps", str(pr["steps"]), "--width", str(w),
-                               "--height", str(h), "--frames", str(pr["frames"]), "--out-file", str(tmp), "--progress"],
+                               "--height", str(h), "--frames", str(pr["frames"]), "--out-file", str(tmp), "--progress",
+                               "--offload", prm.get("offload") or "auto"],
                          self._stepper(job, pr["steps"], 0.06, 0.82, tl.get("tail", 40)))
         job.update(stage="library", message="adding to the library (VP9 + thumbnail)…", progress=0.97)
         t = time.time()
@@ -438,13 +447,18 @@ class AIJobs:
                                  "gen_seconds": res.get("gen_seconds"), "load_seconds": res.get("load_seconds"),
                                  "job_seconds": round(time.time() - job["started"]),
                                  "peak_vram_allocated_gb": res.get("peak_vram_allocated_gb"),
-                                 "peak_vram_reserved_gb": res.get("peak_vram_reserved_gb")}, move=True)
+                                 "peak_vram_reserved_gb": res.get("peak_vram_reserved_gb"),
+                                 "offload": res.get("offload"), "full_gpu": res.get("full_gpu"),
+                                 "denoise_seconds": res.get("denoise_seconds"),
+                                 "free_vram_at_start_gb": res.get("free_vram_at_start_gb")}, move=True)
         post = time.time() - t
         self._learn(_key("broll", job["preset"]), res.get("load_seconds"),
                     (res.get("denoise_seconds") or 0) / pr["steps"], (res.get("decode_seconds") or 0) + post,
-                    (res.get("peak_vram_reserved_gb") or 0) + 0.5 if res.get("peak_vram_reserved_gb") else None)
+                    _need(res, res.get("full_gpu")))
         self._assign_broll(job, cid)
         return {"clip": cid, "seconds": meta.get("duration"), "gen_seconds": res.get("gen_seconds"),
+                "denoise_seconds": res.get("denoise_seconds"), "load_seconds": res.get("load_seconds"),
+                "offload": res.get("offload"), "full_gpu": res.get("full_gpu"),
                 "peak_vram_reserved_gb": res.get("peak_vram_reserved_gb")}
 
     def _assign_broll(self, job: dict, cid: str) -> None:
@@ -523,7 +537,8 @@ class AIJobs:
         res = {}
         if todo:
             jf = d / f"job-{job['id']}.json"
-            jf.write_text(json.dumps({"portrait": str(portrait), **{k: st[k] for k in ("width", "height", "steps", "teacache", "seed")},
+            jf.write_text(json.dumps({"portrait": str(portrait), "gpu": job["params"].get("gpu") or "auto",
+                                      **{k: st[k] for k in ("width", "height", "steps", "teacache", "seed")},
                                       "segments": [{"wav": x["wav"], "out": x["out"], "min_dur": x["dur"]} for x in todo]}),
                           encoding="utf-8")
             tlm = self.timings.get(_key("presenter", quality), {})
@@ -538,11 +553,21 @@ class AIJobs:
         post = time.time() - t
         if res.get("video_seconds"):
             self._learn(_key("presenter", quality), res.get("load_seconds"), res["gen_seconds"] / res["video_seconds"],
-                        post, (res.get("peak_vram_reserved_gb") or 0) + 0.5 if res.get("peak_vram_reserved_gb") else None)
+                        post, _need(res, res.get("gpu_mode") == "full"))
         p.touch()
         return {"video": Path(pl["file"]).name, "key": pl["key"], "segments": len(todo),
                 "generated_seconds": res.get("video_seconds"), "gen_seconds": res.get("gen_seconds"),
+                "load_seconds": res.get("load_seconds"), "gpu_mode": res.get("gpu_mode"),
+                "per_segment": res.get("per_segment"), "assemble_seconds": round(post, 1),
                 "peak_vram_reserved_gb": res.get("peak_vram_reserved_gb")}
+
+
+def _need(res: dict, full_gpu) -> float | None:
+    """VRAM a job of this kind needs before it may start = offload-mode peak + CUDA context. Full-GPU
+    runs only happen when plenty is free, so their (higher) peak is not the minimum and is not learned."""
+    if full_gpu or not res.get("peak_vram_reserved_gb"):
+        return None
+    return res["peak_vram_reserved_gb"] + 0.5
 
 
 def _kill_tree(pid: int) -> None:

@@ -29,6 +29,22 @@ curl http://127.0.0.1:8001/api/jobs/<job id>          # poll: status, stage, pro
 curl -OJ "http://127.0.0.1:8001/api/projects/nimbo-3f9a/renders/<name>.mp4?download=1"
 ```
 
+**Brief → finished MP4 in one call ("Make video").** It runs the voice-over, frees the GPU (Ovoz unloads
+its models), generates every AI layer the brief asks for (b-roll `prompt`s, the presenter; quality
+`final` by default) and renders the video, one step after another:
+
+```sh
+curl -X POST http://127.0.0.1:8001/api/projects/nimbo-3f9a/make -H "Content-Type: application/json" -d "{\"quality\": \"final\"}"
+# -> 202 {"id": "<pipeline id>", "status": "queued", "stages": {"voice": {...}, "unload": {...}, "ai": {...}, "render": {...}}}
+curl http://127.0.0.1:8001/api/projects/nimbo-3f9a/make     # poll: status, current stage, per-stage progress/eta/message
+# when status == "done": result.render is the file name
+curl -OJ "http://127.0.0.1:8001/api/projects/nimbo-3f9a/renders/<result.render>?download=1"
+# failed or cancelled?  POST /api/make/<pipeline id>/retry resumes at the stage that failed
+```
+
+AI layers are slow (minutes per clip/presenter, see the studio README). Without `background`/`presenter` in
+the brief, the AI stage finishes instantly.
+
 JSON-only (no files) also works: `curl -H "Content-Type: application/json" -d @brief.json http://127.0.0.1:8001/api/projects`.
 
 **3. Shared folder inbox.** Create a folder inside `video/inbox/` and put `brief.json` plus the asset

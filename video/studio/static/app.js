@@ -265,8 +265,9 @@
     const transport = el("div", { class: "transport" });
     const actions = el("div", { class: "actions" });
     const jobBox = el("div", { class: "jobs", "aria-live": "polite" });
+    const makeBox = el("div", { class: "make", "aria-live": "polite" });
     const rendersBox = el("div", { class: "renders" });
-    const right = el("section", { class: "col col-preview", "aria-label": t("preview") }, previewBox, transport, actions, jobBox, rendersBox);
+    const right = el("section", { class: "col col-preview", "aria-label": t("preview") }, previewBox, transport, actions, makeBox, jobBox, rendersBox);
     view.append(el("div", { class: "editor" }, settings, el("div", { class: "editor-grid" }, left, mid, right)));
 
     // ---------- save ----------
@@ -303,6 +304,7 @@
       document.title = `${S.brief.title} — ${t("appName")}`;
       for (const j of d.jobs || []) if (j.status === "queued" || j.status === "running") trackJob(j);
       S.aiJobs = d.ai_jobs || [];
+      S.make = d.make && d.make.id ? d.make : null;
       for (const j of S.aiJobs) S.aiPrev[j.id] = j.status;
     }
     async function refreshTimeline() {
@@ -583,7 +585,7 @@
       if (L === "presenter") {
         f.append(text("kicker", t("kicker")), text("headline", t("headline")), text("sub", t("sub")));
         const pst = S.tl && S.tl.presenter;
-        f.append(el("p", { class: "muted small" }, !pst || !pst.portrait ? t("ai.noPortrait") : pst.ready ? t("ai.presenterReady") : pst.stale ? t("ai.presenterStale") : t("ai.presenterMissing"),
+        f.append(el("p", { class: "muted small" }, !pst || !pst.portrait_url ? t("ai.noPortrait") : pst.ready ? t("ai.presenterReady") : pst.stale ? t("ai.presenterStale") : t("ai.presenterMissing"),
           " ", el("button", { class: "btn small", onclick: () => setTab("ai") }, t("ai.presenter"))));
       }
       if (L === "screen" || L === "screens") {
@@ -788,7 +790,7 @@
         if (S.tab === "ai") { await AI.loadStatus(); }
         refreshAiViews();
       } catch { /* server restarting */ }
-      if (S.alive && (S.tab === "ai" || S.aiJobs.some(j => isActive(j) && mine(j)))) aiTimer = setTimeout(pollAi, 2000);
+      if (S.alive && (S.tab === "ai" || S.aiJobs.some(j => isActive(j) && mine(j)) || (S.make && S.make.status === "running"))) aiTimer = setTimeout(pollAi, 2000);
     }
     async function handleDone(j) {
       const r = j.result || {};
@@ -828,6 +830,7 @@
         S.pendBox.replaceChildren(...js.map(j => AI.jobRow(j, pollAi)));
       }
       renderActions();
+      if (S.make && S.make.current === "ai") renderMake();
     }
 
     // scene form: Background (brand gradient | AI clip from the library)
@@ -1175,6 +1178,77 @@
       return close;
     }
 
+    // ---------- "Make video": voice -> free GPU -> AI -> render ----------
+    let makeTimer = null, makeQuality = "final";
+    const makeActive = () => S.make && (S.make.status === "queued" || S.make.status === "running");
+    async function startMake() {
+      await flush();
+      const pres = S.brief.presenter;
+      if (pres && pres.quality !== makeQuality) { pres.quality = makeQuality; changed({ now: true }); await flush(); }
+      try { S.make = await api("POST", `/api/projects/${pid}/make`, { quality: makeQuality }); }
+      catch (e) { if (e.status === 409 && e.data && e.data.id) S.make = e.data; else { toast(e.message, "error", 9000); return; } }
+      renderMake(); pollMake(); pollAi();
+    }
+    async function makeAction(path) {
+      try { S.make = await api("POST", `/api/make/${S.make.id}/${path}`); renderMake(); pollMake(); }
+      catch (e) { toast(e.message, "error"); }
+    }
+    async function pollMake() {
+      clearTimeout(makeTimer);
+      if (!S.alive || !S.make) return;
+      const was = S.make.status, wasStage = S.make.current;
+      try { S.make = await api("GET", `/api/make/${S.make.id}`); } catch { /* restarting */ }
+      renderMake();
+      if (S.make.current !== wasStage || S.make.status !== was) {
+        // the server changed the brief (b-roll / portrait / presenter quality) or made a render
+        await refreshAssets(true); renderRenders(); await refreshTimeline();
+        if (S.make.status === "done" && was !== "done") toast(t("make.done", { name: (S.make.result || {}).render || "" }), "ok", 8000);
+        if (S.make.status === "error" && was !== "error") toast(t("jobFailed", { msg: S.make.error }), "error", 12000);
+      }
+      if (makeActive()) makeTimer = setTimeout(pollMake, 1500);
+    }
+    function renderMake() {
+      const m = S.make;
+      const fmtT = AI.fmtDur;
+      const qSel = el("div", { class: "seg small-seg", role: "radiogroup", "aria-label": t("make.quality") },
+        ["final", "draft"].map(q => el("button", { type: "button", class: `seg-btn ${q === makeQuality ? "on" : ""}`, role: "radio",
+          "aria-checked": q === makeQuality ? "true" : "false", disabled: makeActive(), onclick: () => { makeQuality = q; renderMake(); } }, t("make.qualities." + q))));
+      const head = el("div", { class: "row between wrap" },
+        el("div", { class: "row gap" }, el("b", {}, t("make.title")), AI.badge()),
+        el("div", { class: "row gap" }, el("span", { class: "muted small" }, t("make.quality")), qSel,
+          el("button", { class: "btn primary", disabled: makeActive(), onclick: startMake }, "▶ " + (m && m.status === "done" ? t("make.again") : t("make.button")))));
+      if (!m) { makeBox.replaceChildren(head, el("p", { class: "muted small" }, t("make.help"))); return; }
+      const failedAt = Object.entries(m.stages).find(([, st]) => ["error", "cancelled", "pending", "running"].includes(st.state));
+      const status = el("div", { class: "row between wrap" },
+        el("span", { class: `small mk-status mk-${m.status}` }, (m.status === "queued" && m.position ? t("make.queuedPos", { n: m.position }) : t("make.status." + m.status)) +
+          (m.elapsed != null ? ` · ${fmtT(m.elapsed)}` : "") + (m.eta ? ` · ${t("make.eta", { t: fmtT(m.eta) })}` : "")),
+        el("div", { class: "row gap" },
+          makeActive() ? el("button", { class: "btn small danger", onclick: () => makeAction("cancel") }, t("make.cancel")) : null,
+          ["error", "cancelled", "interrupted"].includes(m.status) && failedAt
+            ? el("button", { class: "btn small", onclick: () => makeAction("retry") }, t("make.retry", { stage: t("make.stages." + failedAt[0]) })) : null));
+      const steps = el("ol", { class: "steps" }, ["voice", "unload", "ai", "render"].map((k, i) => {
+        const st = m.stages[k];
+        const icon = st.state === "done" ? "✓" : st.state === "warning" ? "!" : st.state === "error" ? "✕" : st.state === "cancelled" ? "–" : String(i + 1);
+        const meta = [];
+        if (st.state === "running") {
+          if (st.elapsed != null) meta.push(fmtT(st.elapsed));
+          if (st.eta) meta.push(t("make.eta", { t: fmtT(st.eta) }));
+        } else if (st.started && st.finished) meta.push(fmtT(st.finished - st.started));
+        const pct = Math.round((st.progress || 0) * 100);
+        return el("li", { class: `step s-${st.state}` }, el("span", { class: "st-icon" }, icon),
+          el("div", { class: "st-body" },
+            el("div", { class: "row between" }, el("b", {}, t("make.stages." + k)),
+              el("span", { class: "muted small" }, [t("make.states." + st.state), ...meta].join(" · "))),
+            st.state === "running" ? el("div", { class: "bar" }, el("i", { style: { width: `${pct}%` } })) : null,
+            st.message ? el("div", { class: "muted small" }, st.message) : null,
+            st.error ? el("div", { class: "error small" }, st.error) : null));
+      }));
+      const notes = (m.notices || []).map(n => el("div", { class: "warn small notice" }, "⚠ " + n));
+      const aiRows = m.current === "ai" ? (S.aiJobs || []).filter(j => (m.ai_jobs || []).includes(j.id) && (j.status === "queued" || j.status === "running"))
+        .map(j => AI.jobRow(j, pollAi)) : [];
+      makeBox.replaceChildren(head, status, steps, ...notes, ...aiRows);
+    }
+
     // ---------- keyboard ----------
     const onKey = e => {
       const tag = (e.target.tagName || "").toLowerCase();
@@ -1206,6 +1280,8 @@
       await refreshTimeline();
       AI.loadStatus().catch(() => {});
       pollAi();
+      renderMake();
+      if (makeActive()) pollMake();
       const st = S.tl && S.tl.scenes[0];
       if (st) preview.seek(Math.min(1.6, st.end - 0.3));
     })();
@@ -1214,6 +1290,7 @@
       S.alive = false;
       timers.forEach(clearTimeout);
       clearTimeout(aiTimer);
+      clearTimeout(makeTimer);
       clearTimeout(saveTimer);
       if (S.version !== S.savedVersion) save();
       preview.stop();

@@ -65,7 +65,12 @@ NEG_PROMPT = ("Gesture is bad. Gesture is unclear. Strange and twisted hands. Ba
               "Unclear and blurry hands. Blurry face, distorted mouth, extra teeth.")
 
 
-def load(model_dir: Path, steps: int, teacache: float, prompts):
+# free VRAM needed to keep transformer + VAE + CLIP resident (measured peak reserved + 0.6 GB):
+# 448x800 12.0 GB; 576x1024 15.8 GB -> spills on a 16 GB card, so "auto" keeps model offload there
+FULL_GPU_GB = {448: 12.6, 576: 16.4}
+
+
+def load(model_dir: Path, steps: int, teacache: float, prompts, gpu: str = "offload"):
     cfg = OmegaConf.load(REPO / "config" / "config.yaml")
     tr = WanTransformerAudioMask3DModel.from_pretrained(
         str(model_dir / cfg["transformer_additional_kwargs"].get("transformer_subpath", "transformer")),
@@ -103,8 +108,20 @@ def load(model_dir: Path, steps: int, teacache: float, prompts):
         prompt = prompt[0] if isinstance(prompt, list) else prompt
         return [e.to(device or "cuda", dtype or DT) for e in cache[prompt]]
     pipe._get_t5_prompt_embeds = cached_embeds
-    # The upstream script does pipe.to("cuda"); offload instead.
-    pipe.enable_model_cpu_offload()
+    if gpu == "full":
+        # Full-GPU mode: transformer, VAE and CLIP image encoder stay on the GPU for the whole job
+        # (no per-call moves); only the T5 text encoder stays on the CPU (its embeddings are cached).
+        for m in (pipe.transformer, pipe.vae, pipe.clip_image_encoder):
+            m.to("cuda")
+
+        class _OnCuda(type(pipe)):
+            @property
+            def _execution_device(self):
+                return torch.device("cuda")
+        pipe.__class__ = _OnCuda
+    else:
+        # The upstream script does pipe.to("cuda"); offload instead.
+        pipe.enable_model_cpu_offload()
     if teacache > 0:
         coeff = get_teacache_coefficients(str(model_dir))
         pipe.transformer.enable_teacache(coeff, steps, teacache, num_skip_start_steps=5, offload=False)
@@ -251,8 +268,13 @@ def studio_job(job_path: Path):
         io.result(generated=0, segments=len(job["segments"]))
         return
     portrait = Image.open(job["portrait"]).convert("RGB").resize((W, H), Image.LANCZOS)
+    gpu = job.get("gpu", "auto")
+    free0 = torch.cuda.mem_get_info()[0] / 2**30
+    if gpu == "auto":
+        gpu = "full" if free0 >= FULL_GPU_GB.get(W, 11.0) else "offload"
+    print(f"free VRAM {free0:.1f} GB -> {gpu}", flush=True)
     t0 = time.time()
-    pipe = load(W_DIR / "Wan2.1-Fun-V1.1-1.3B-InP", steps, float(job.get("teacache", 0.1)), [prompt, NEG_PROMPT])
+    pipe = load(W_DIR / "Wan2.1-Fun-V1.1-1.3B-InP", steps, float(job.get("teacache", 0.1)), [prompt, NEG_PROMPT], gpu)
     load_s = time.time() - t0
     print(f"pipeline loaded in {load_s:.1f}s", flush=True)
     torch.cuda.reset_peak_memory_stats()
@@ -278,7 +300,8 @@ def studio_job(job_path: Path):
         per.append({"out": out.name, "frames": n, "seconds": round(time.time() - ts, 1)})
         print(json.dumps(per[-1]), flush=True)
     io.result(generated=len(todo), segments=len(job["segments"]), width=W, height=H, steps=steps,
-              video_seconds=round(video_s, 2), load_seconds=round(load_s, 1),
+              video_seconds=round(video_s, 2), load_seconds=round(load_s, 1), gpu_mode=gpu,
+              full_gpu=gpu == "full", free_vram_at_start_gb=round(free0, 1),
               gen_seconds=round(time.time() - t1, 1), per_segment=per, **io.vram_stats())
 
 

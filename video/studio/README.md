@@ -49,7 +49,7 @@ video/
   html/                 renderer (shared with the original HTML option)
     index.html          stage; ?data=<data.js url> | ?embed (live preview, waits for loadTimeline)
     app.js              mount(timeline) -> seek(t) is a pure function of t; layouts hero, chips,
-                        stat, list, cta, screen, screens, presenter; phone/browser frames; focus zoom +
+                        stat, list, cta, screen, screens, presenter; phone/browser frames; focus zoom (inside the screen) +
                         callout; recordings (<video>, seek awaits 'seeked'); 9:16 + 16:9
     render.py           --project DIR: 8 headless Chromium pages -> JPEG -> ffmpeg (H.264 + AAC)
   shared/voicelib.py    Ovoz TTS client, silence trim, joining, caption chunks, length estimate
@@ -64,6 +64,7 @@ video/
     gpu.py              VRAM status: nvidia-smi + per-process GPU memory (Ovoz attribution)
     library.py          shared b-roll + portrait library (video/library/)
     presenter.py        talking-head planning, segment cache, assembly
+    pipeline.py         "Make video": voice -> free GPU (Ovoz /api/unload) -> AI jobs -> render
     static/             UI: index.html, app.js, ai.js (AI page + components), style.css, strings.js (all UI text)
     example/            fictional sample brief + screenshots + recording
   projects/<id>/        (gitignored) project.json, assets/, assets.json, thumbs/,
@@ -127,6 +128,78 @@ Uploads are checked by extension and by content: Pillow verify for images, ffmpe
 transcode for video. Size limits are enforced while streaming. File names are reduced to
 `[A-Za-z0-9._-]`, and asset/render paths are resolved inside the project folder, so `..` gives 404.
 The server binds to 127.0.0.1 only and has no authentication. It is meant for local use.
+
+## "Make video" (one button, voice first, then video)
+
+**Make video** in the editor, or `POST /api/projects/{id}/make` for a coding agent, runs four stages in
+order. Each stage gets the whole GPU, and only one pipeline runs at a time (others queue).
+
+| Stage | What happens |
+|---|---|
+| ① Voice-over | Generates every missing or changed line (local Ovoz models may take the whole GPU). No AI GPU job may start; if one is running, the stage first waits for it to finish. |
+| ② Free GPU | Calls Ovoz `POST /api/unload`, then confirms with the per-process GPU counters that Ovoz's VRAM dropped (before/after numbers are shown). An old Ovoz without the endpoint (404) gets the notice *"Ovoz is outdated — update it to free GPU memory automatically"*. The AI queue's normal VRAM wait / *Start anyway* then applies. |
+| ③ AI clips & presenter | Runs every AI job the project still needs: a presenter portrait from `portrait_prompt` (when no portrait is set), b-roll for scenes whose `background` has a `prompt` but no clip, and the presenter video when it is missing or stale. Uses the pipeline's quality (default **final**; `presenter.quality` is set to match). The studio's own voice requests wait during this stage. If Ovoz loads models again meanwhile (someone using the Ovoz page), the stepper shows a notice. |
+| ④ Render | The normal render queue. |
+
+- The UI shows a stepper with each stage's state, progress, elapsed time and ETA, any notices, and the AI
+  job rows (with *Start anyway* when a job waits for memory).
+- **Cancel** works at any stage. It stops the voice loop, kills the AI subprocess tree, or cancels the
+  render.
+- **Retry** resumes at the stage that failed, without redoing finished stages.
+- Pipelines are kept in `library/pipelines.json`. After a server restart, a running pipeline shows as
+  *interrupted*, and Retry resumes it.
+
+**Full-GPU mode.** The runners choose it automatically (`auto`) and fall back to offloading.
+- **Wan2.2** `full`: the UMT5 encoder encodes the prompt and goes back to the CPU, the cache is emptied,
+  and the whole transformer stays resident for every step; then the VAE decodes.
+- **EchoMimic** `full`: transformer, VAE and CLIP stay resident; T5 stays on the CPU.
+- `auto` uses full mode only when its measured need fits in free VRAM. A run that spills into shared memory
+  is *slower* than offloading.
+
+**Measured on the 16 GB card, with Ovoz unloaded (14.7 GB free):**
+
+| Job | Full GPU | Offload (fallback) | Before this change |
+|---|---|---|---|
+| B-roll final, 704×1280×121, 30 steps | needs 17 GB, spills 2.2 GB: 32 s/step | group: **23 s/step**, 8.7 / 11 GB → **823 s per clip end to end** | ~23 min (43 s/step), shared GPU |
+| B-roll draft, 480×832×81 | 3.89 s/step (11.7 GB) | 3.99 s/step | 4.2–4.5 s/step next to Ovoz |
+| Presenter final, 576×1024 | needs 15.8 GB, spills 1.4 GB: 60–66 GPU-s per video second (206 s for a 3.4 s chunk) | model offload: **55 GPU-s per video second** (188 s for the same chunk), 9.7 GB | ~66 GPU-s per video second |
+| Presenter draft, 448×800 | 24 GPU-s per video second (12.0 GB) | ≈ 23 GPU-s per video second | |
+
+- **Where the speed-up comes from.** Freeing the GPU (stage ②) is the real speed-up: final b-roll is
+  1.7× faster and the final presenter 1.2× faster than on the shared GPU.
+- **Full residency itself gains ≤ 3 %.** Group offload with CUDA streams is already close to full speed,
+  and at final resolution full residency doesn't fit on 16 GB.
+- **Which mode `auto` picks:**
+  - Final b-roll: group offload.
+  - Final presenter: model offload.
+  - Draft b-roll and draft presenter: full mode (it fits).
+- The in-pipeline run selected full mode for the final presenter before this threshold was measured,
+  which is why its 10.2 s took 679 s.
+
+| Method & path | What it does |
+|---|---|
+| `POST /api/projects/{id}/make` | `{quality?: "final"\|"draft", allow_silent?: false}` → 202 pipeline (409 + the running one if the project already has one) |
+| `GET /api/projects/{id}/make` | latest pipeline of the project: `{status: queued/running/done/error/cancelled/interrupted, current, eta, stages: {voice, unload, ai, render: {state, progress, message, eta, elapsed, detail}}, notices, result: {render}}` |
+| `GET /api/make` · `GET /api/make/{pid}` · `POST /api/make/{pid}/cancel` · `POST /api/make/{pid}/retry` | all pipelines · one · cancel · resume from the failed stage |
+
+**Verified (2026-11-15).**
+- **Full run from the UI** (Final quality): a 3-scene Uzbek project (9.9 s) using Ovoz's local `navoiy` model.
+
+  | Stage | Result |
+  |---|---|
+  | ① Voice | 26 s |
+  | ② Unload | 6.5 s: `unloaded navoiy`, Ovoz 2.9 → 0.0 GB, free 10.4 → 13.3 GB |
+  | ③ AI | final b-roll 823 s (group offload) + final presenter 759 s (3 chunks) |
+  | ④ Render | 22.5 s |
+
+  Screens: `preview/make-stepper-*.png`. Frames: `preview/make-render-9x16-*.png`.
+- **Cancel and Retry:** the AI stage was cancelled mid-job (the subprocess tree was killed). Retry resumed
+  at stage ③, without redoing voice or unload.
+- **Voice gate:** a Studio voice request made during stage ③ waited with *"“Make video” is running AI jobs
+  on the GPU"*.
+- **API path** (`POST /api/projects` → `POST …/make {"quality":"draft"}` → poll): MP4 in 176 s with the
+  local `qwen3uz` voice and a draft b-roll. A TTS call made directly to Ovoz during stage ③ produced the
+  *"Ovoz loaded models again…"* notice.
 
 ## AI layers (optional, local, slow)
 
@@ -197,9 +270,9 @@ source. They are off by default, and briefs without them render exactly as befor
 | Job | Settings | Time | VRAM (torch peak alloc / reserved) |
 |---|---|---|---|
 | B-roll **draft** | 480×832 or 832×480, 81 frames (3.4 s @ 24 fps), 20 steps | **137 s** end to end: model load 12–24 s, 4.2–4.5 s/step (≈ 86 s), VAE decode ≈ 32 s, library/VP9 ≈ 3 s | 5.0 / 7.2 GB (process ≈ 7.6 GB) |
-| B-roll **final** | 704×1280 or 1280×704, 121 frames (5 s), 30 steps | ≈ 23 min per clip (43 s/step), measured earlier on the shared GPU while it spilled into shared memory (ai/README.md); not re-run here | 8.65 / 11.0 GB, so it **waits** while Ovoz is loaded (≈ 8 GB free) |
+| B-roll **final** | 704×1280 or 1280×704, 121 frames (5 s), 30 steps | **823 s** via "Make video" with Ovoz unloaded: load 12 s, 23.3 s/step, decode ≈ 100 s. It took ≈ 23 min (43 s/step) earlier on the shared GPU | 8.7 / 11.0 GB, so it **waits** while Ovoz is loaded (≈ 8 GB free) |
 | Presenter **draft** | 448×800, 8 steps, TeaCache 0.1, 25 fps | **318 s for 9.3 s** of talking head: pipeline load ≈ 100 s (UMT5 prompt encoding on CPU), then ≈ 23 s of GPU per second of video (3.2 s chunk 79 s, 2.3 s chunk 46 s); re-assembly from cache 2 s | ≈ 6.1–6.3 / 7.6–7.9 GB (ai/README.md). Started with "start anyway" at 8.0 GB free next to Ovoz, with no OOM |
-| Presenter **final** | 576×1024, 8 steps | ≈ 66 s of GPU per second of video + load (ai/README.md) | 8.0 / 10.6 GB, so it waits while Ovoz is loaded |
+| Presenter **final** | 576×1024, 8 steps | **55 GPU-s per video second** + 66–70 s load (model offload, free GPU). The pipeline run with spilling full mode took 679 s for 10.2 s | 6.7 / 9.7 GB, so it waits while Ovoz is loaded |
 | Portrait | Wan2.2 text-to-image, 704×1280, 40 steps | ≈ 22 s + load (ai/README.md) | ≈ 7 GB |
 
 **VRAM with Ovoz.** Ovoz's TTS workers held ~5.6 GB (navoiy 3.0 + qwen 2.5 + server 0.2), and the desktop
@@ -287,8 +360,11 @@ presenters. The UI shows the licences and this disclosure on the AI page and in 
 - Final presets don't fit next to a loaded Ovoz. They wait for memory, or you choose *start anyway*
   (spills, slow).
 - Per-process VRAM attribution needs Windows performance counters. On other OSes only the totals are shown.
-- The final b-roll preset and the portrait generator were not re-run in this session. Their figures come
-  from the earlier experiment (ai/README.md).
+- The portrait generator was not re-run in this session. Its figure comes from the earlier experiment
+  (ai/README.md).
+- `screen` scenes zoom into `focus` *inside* the device screen, so the frame never grows over the
+  headline, captions or progress bar. This was the 9:16 overlap bug. A focus that already spans almost the
+  full screenshot width gets little extra magnification; the ring and the dimming carry it.
 
 ## Verified (2026-11-15)
 
