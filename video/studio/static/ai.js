@@ -292,8 +292,277 @@
     el("td", {}, el("b", {}, p.licence), el("div", { class: "muted tiny" }, p.licence_note)),
     el("td", { class: "muted small" }, `${p.modes.map(m => m.toUpperCase()).join(" + ")} · ${p.presets.draft.portrait.join("×")} / ${p.presets.final.portrait.join("×")} · ${p.presets.final.fps} fps · ≤ ${p.max_seconds} s · RAM ~${Math.round(p.ram_gb)} GB`)))));
 
+  // ---------------------------------------------------------------- ComfyUI: server, header pill, workflows
+  A.comfyState = s => !s ? "off" : (s.state === "external" ? (s.reachable ? (s.busy ? "busy" : "running") : "stopped")
+    : s.state === "running" ? (s.busy ? "busy" : "running") : s.state);
+  A.initHeader = () => {
+    const pill = document.getElementById("comfy-pill");
+    if (!pill || pill.dataset.ready) return;
+    pill.dataset.ready = "1";
+    const tick = async () => {
+      let s = null;
+      try { s = await api("GET", "/api/comfy/status"); } catch { /* studio down: the Ovoz pill says so */ }
+      A.comfy = s;
+      const st = A.comfyState(s);
+      if (!s || (!s.installed && s.mode === "managed")) { pill.hidden = true; return; }
+      pill.hidden = false;
+      const q = (s.queue_running || 0) + (s.queue_pending || 0);
+      pill.className = `pill comfy-pill cs-${st}`;
+      pill.textContent = `ComfyUI · ${t("comfy.state." + st)}${s.reachable ? ` · ${t("comfy.queueN", { n: q })}` : ""}`;
+      pill.title = `${s.url}${s.version ? " · v" + s.version : ""}${s.vram_mb != null ? ` · VRAM ${gbOf(s.vram_mb)} GB` : ""}${s.error ? "\n" + s.error : ""}`;
+    };
+    tick();
+    setInterval(tick, 5000);
+  };
+
+  A.comfyCard = (s, onChange) => {
+    const box = el("div", { class: "comfy-card" });
+    if (!s) return box;
+    const st = A.comfyState(s);
+    const act = (path, msg) => async () => {
+      try { const r = await api("POST", path); if (msg) toast(typeof msg === "function" ? msg(r) : msg, "ok"); onChange && onChange(); }
+      catch (e) { toast(e.message, "error", 9000); }
+    };
+    const lf = s.last_free;
+    const set = s.settings || {};
+    const save = async patch => {
+      try { await api("PUT", "/api/comfy/settings", patch); toast(t("ai.wSaved"), "ok"); onChange && onChange(); }
+      catch (e) { toast(e.message, "error"); }
+    };
+    const mode = el("select", { onchange: e => save({ mode: e.target.value }) },
+      ["managed", "external"].map(m => el("option", { value: m, selected: set.mode === m }, t("comfy.mode." + m))));
+    const url = el("input", { type: "url", value: set.url || "", placeholder: "http://127.0.0.1:8188", onchange: e => save({ url: e.target.value }) });
+    const vram = el("select", { onchange: e => save({ vram_mode: e.target.value }) },
+      ["auto", "lowvram", "novram", "highvram"].map(m => el("option", { value: m, selected: set.vram_mode === m }, t("comfy.vram." + m))));
+    const reserve = el("input", { type: "number", class: "narrow", min: 0, max: 8, step: 0.5, value: set.reserve_vram_gb, onchange: e => save({ reserve_vram_gb: e.target.value }) });
+    const auto = el("input", { type: "checkbox", id: "cf-auto", checked: !!set.autostart, onchange: e => save({ autostart: e.target.checked }) });
+    const custom = el("input", { type: "checkbox", id: "cf-custom", checked: !!set.custom_nodes, onchange: e => {
+      if (e.target.checked && !U().confirmBox(t("comfy.customWarn"))) { e.target.checked = false; return; }
+      save({ custom_nodes: e.target.checked }); } });
+    const extra = el("input", { type: "text", value: set.extra_args || "", placeholder: "--fast", onchange: e => save({ extra_args: e.target.value }) });
+    box.append(...[
+      el("div", { class: "row between wrap" },
+        el("div", {}, el("span", { class: `pill comfy-pill cs-${st}` }, t("comfy.state." + st)), " ",
+          el("span", { class: "muted small" }, `${s.url}${s.version ? ` · ComfyUI ${s.version}` : ""}${s.pytorch ? ` · torch ${s.pytorch}` : ""}`)),
+        el("div", { class: "row gap wrap" },
+          s.mode === "managed" && !["running", "busy", "starting"].includes(st) ? el("button", { class: "btn small primary", disabled: !s.installed,
+            onclick: act("/api/comfy/start", t("comfy.starting")) }, "▶ " + t("comfy.start")) : null,
+          s.mode === "managed" && ["running", "busy", "starting", "error"].includes(st) ? el("button", { class: "btn small danger",
+            onclick: act("/api/comfy/stop", t("comfy.stopped")) }, "■ " + t("comfy.stop")) : null,
+          s.reachable ? el("button", { class: "btn small", title: t("comfy.freeHelp"), onclick: act("/api/comfy/free",
+            r => t("comfy.freed", { a: gbOf(r.comfy_mb_before), b: gbOf(r.comfy_mb_after) })) }, "⏏ " + t("comfy.free")) : null,
+          s.reachable ? el("a", { class: "btn small", href: s.url, target: "_blank", rel: "noopener" }, t("comfy.openUi") + " ↗") : null)),
+      !s.installed && s.mode === "managed" ? el("p", { class: "warn small" }, t("comfy.notInstalled")) : null,
+      s.error ? el("p", { class: "error small" }, s.error) : null,
+      el("div", { class: "muted small" }, [
+        s.reachable ? t("comfy.queue", { r: s.queue_running || 0, p: s.queue_pending || 0 }) : null,
+        s.vram_mb ? t("comfy.vramHeld", { gb: gbOf(s.vram_mb) }) : null,
+        s.uptime_s != null ? t("comfy.uptime", { t: fmtDur(s.uptime_s) }) : null,
+        lf && lf.ok ? t("comfy.lastFree", { a: gbOf(lf.comfy_mb_before), b: gbOf(lf.comfy_mb_after), why: lf.why || "" }) : null].filter(Boolean).join(" · ")),
+      el("p", { class: "muted small" }, t("comfy.help")),
+      el("details", { class: "small" }, el("summary", { class: "muted" }, t("comfy.settings")),
+        el("div", { class: "form comfy-settings" },
+          el("label", { class: "row gap" }, el("span", {}, t("comfy.modeL")), mode),
+          set.mode === "external" ? el("label", { class: "row gap" }, el("span", {}, "URL"), url) : null,
+          el("label", { class: "row gap", for: "cf-auto" }, auto, el("span", {}, t("comfy.autostart"))),
+          el("label", { class: "row gap" }, el("span", {}, t("comfy.vramMode")), vram),
+          el("label", { class: "row gap" }, el("span", {}, t("comfy.reserve")), reserve),
+          el("label", { class: "row gap", for: "cf-custom" }, custom, el("span", {}, t("comfy.customNodes"))),
+          el("p", { class: "warn tiny" }, t("comfy.customWarn")),
+          el("label", { class: "row gap" }, el("span", {}, t("comfy.extraArgs")), extra),
+          el("p", { class: "muted tiny" }, t("comfy.restartNote")),
+          s.command ? el("pre", { class: "log" }, s.command) : null)),
+      (s.log || []).length ? el("details", { class: "small" }, el("summary", { class: "muted" }, t("comfy.log")),
+        el("pre", { class: "log" }, s.log.slice(-30).join("\n"))) : null].filter(Boolean));
+    return box;
+  };
+
+  const capChip = c => el("span", { class: "chipx" }, t("comfy.cap." + c));
+  A.validationLine = v => {
+    if (!v) return null;
+    if (!v.checked && v.ok) return el("div", { class: "muted small" }, t("comfy.notChecked"));
+    if (v.ok) return el("div", { class: "ok-t small" }, "✓ " + t("comfy.valid") + (v.custom_nodes && v.custom_nodes.length ? ` · ${t("comfy.usesCustom", { n: v.custom_nodes.map(c => c.pack).filter((x, i, a) => a.indexOf(x) === i).join(", ") })}` : ""));
+    return el("div", { class: "error small" },
+      v.missing_nodes.length ? el("div", {}, t("comfy.missingNodes", { n: v.missing_nodes.join(", ") })) : null,
+      v.missing_models.length ? el("div", {}, t("comfy.missingModels", { n: v.missing_models.map(m => `${m.file} → models/${m.folder || "?"}`).join(", ") })) : null,
+      v.mapping_errors.length ? el("div", {}, t("comfy.mappingErrors", { n: v.mapping_errors.join("; ") })) : null,
+      v.missing_nodes.length ? el("div", { class: "warn tiny" }, t("comfy.neverInstall")) : null);
+  };
+
+  A.workflowList = (d, onChange) => {
+    const list = (d && d.workflows) || [];
+    if (!list.length) return el("p", { class: "muted small" }, t("comfy.noWorkflows"));
+    return el("div", { class: "wf-grid" }, list.map(w => {
+      const pr = (w.presets || {}).draft || {};
+      const est = A.status && A.status.providers ? (A.status.providers.find(p => p.id === w.provider) || {}).presets : null;
+      return el("div", { class: "wf-card" },
+        w.preview_url ? el("img", { src: w.preview_url, alt: "", loading: "lazy" }) : el("div", { class: "wf-noprev" }, "ComfyUI"),
+        el("div", { class: "wf-body" },
+          el("b", {}, w.name), el("div", { class: "muted tiny mono" }, w.provider),
+          el("div", { class: "row gap wrap" }, (w.capabilities || []).map(capChip),
+            el("span", { class: `chipx ${w.commercial ? "ok" : "bad"}` }, `${w.licence || t("comfy.noLicence")}${w.commercial ? "" : " · " + t("comfy.notCommercial")}`),
+            w.source === "builtin" ? el("span", { class: "chipx" }, t("comfy.sample")) : null),
+          el("div", { class: "muted small" }, `${pr.width || "?"}×${pr.height || "?"} · ${pr.length || "?"} ${t("comfy.frames")} · ${pr.fps || "?"} fps` +
+            (est && est.draft ? ` · ${t("ai.estimate", { t: fmtDur(est.draft.estimate) })}` : "")),
+          A.validationLine(w.validation),
+          el("div", { class: "row gap wrap" },
+            el("button", { class: "btn small", onclick: () => A.workflowEditor(w.id, onChange) }, "✎ " + t("comfy.editMapping")),
+            el("button", { class: "btn small", title: t("comfy.recheckHelp"), onclick: async () => {
+              try { const r = await api("POST", `/api/comfy/workflows/${w.id}/validate`); toast(r.validation.ok ? (r.checked ? t("comfy.valid") : t("comfy.notChecked")) : t("comfy.savedInvalid"), r.validation.ok ? "ok" : "warn"); onChange && onChange(); }
+              catch (e) { toast(e.message, "error"); } } }, "↻ " + t("comfy.recheck")),
+            el("a", { class: "btn small", href: `/api/comfy/workflows/${w.id}/workflow_api.json`, download: "" }, "⇩ JSON"),
+            w.source !== "builtin" ? el("button", { class: "btn small danger", onclick: async () => {
+              if (!U().confirmBox(t("comfy.confirmDelete", { n: w.name }))) return;
+              try { await api("DELETE", `/api/comfy/workflows/${w.id}`); onChange && onChange(); } catch (e) { toast(e.message, "error"); }
+            } }, t("delete")) : null)));
+    }));
+  };
+
+  A.workflowUpload = onDone => {
+    const file = el("input", { type: "file", accept: ".json,application/json" });
+    const prev = el("input", { type: "file", accept: ".png,.jpg,.jpeg,.webp" });
+    const name = el("input", { type: "text", placeholder: t("comfy.namePh") });
+    const lic = el("input", { type: "text", placeholder: "Apache-2.0 (model …), MIT (…)" });
+    const com = el("input", { type: "checkbox", id: `wf-com-${Math.random().toString(36).slice(2, 7)}` });
+    const notes = el("textarea", { rows: 2, placeholder: t("comfy.notesPh") });
+    const out = el("div", {});
+    const form = () => {
+      const fd = new FormData();
+      fd.append("workflow", file.files[0], file.files[0].name);
+      if (prev.files.length) fd.append("preview", prev.files[0], prev.files[0].name);
+      fd.append("name", name.value.trim() || file.files[0].name.replace(/\.json$/i, ""));
+      fd.append("licence", lic.value.trim()); fd.append("notes", notes.value.trim()); fd.append("commercial", com.checked ? "true" : "false");
+      return fd;
+    };
+    const showDetect = r => {
+      const m = r.manifest || r;
+      const inp = m.inputs || {};
+      out.replaceChildren(el("div", { class: "panel inner" },
+        el("b", {}, t("comfy.detected")),
+        el("table", { class: "mon-table" }, el("tbody", {}, ((A.status && A.status.comfyKeys) || ["prompt", "negative", "seed", "width", "height", "length", "fps", "steps", "image"]).map(k =>
+          el("tr", {}, el("td", {}, t("comfy.key." + k)), el("td", { class: "mono small" }, (inp[k] || []).map(x => `#${x.node}.${x.input}`).join(", ") || el("span", { class: "muted" }, "—")))))),
+        el("div", { class: "small" }, `${t("comfy.outputs")}: ${(m.outputs || []).map(x => "#" + x).join(", ") || "—"} · ${t("comfy.caps")}: ${(m.capabilities || []).join(", ") || "—"}`),
+        ((r.detected || {}).notes || []).length ? el("ul", { class: "warn small" }, r.detected.notes.map(n => el("li", {}, n))) : null,
+        A.validationLine(r.validation)));
+    };
+    file.addEventListener("change", async () => {
+      if (!file.files.length) return;
+      if (!name.value) name.value = file.files[0].name.replace(/\.json$/i, "").replace(/[_-]+/g, " ");
+      try { showDetect(await api("POST", "/api/comfy/workflows/detect", form(), true)); }
+      catch (e) { out.replaceChildren(el("p", { class: "error small" }, e.message)); }
+    });
+    const btn = el("button", { class: "btn primary", onclick: async () => {
+      if (!file.files.length) { file.click(); return; }
+      btn.disabled = true;
+      try {
+        const m = await api("POST", "/api/comfy/workflows", form(), true);
+        toast(t("comfy.uploaded", { n: m.name }), "ok");
+        file.value = ""; prev.value = ""; name.value = ""; out.replaceChildren();
+        onDone && onDone(m);
+        A.workflowEditor(m.id, onDone);
+      } catch (e) { toast(e.message, "error", 9000); }
+      finally { btn.disabled = false; }
+    } }, "⇪ " + t("comfy.upload"));
+    return el("div", { class: "form ai-form" },
+      el("p", { class: "muted small" }, t("comfy.uploadHelp")),
+      el("p", { class: "warnbox" }, "⚠ " + t("comfy.customWarn")),
+      el("div", { class: "field" }, el("label", {}, t("comfy.file")), file),
+      el("div", { class: "row gap wrap" }, el("div", { class: "field" }, el("label", {}, t("comfy.name")), name),
+        el("div", { class: "field" }, el("label", {}, t("licence")), lic)),
+      el("label", { class: "row gap", for: com.id }, com, el("span", {}, t("comfy.commercial"))),
+      el("div", { class: "field" }, el("label", {}, t("comfy.notes")), notes),
+      el("div", { class: "field" }, el("label", {}, t("comfy.previewImg")), prev),
+      out, el("div", {}, btn));
+  };
+
+  // mapping editor (modal)
+  A.workflowEditor = async (wid, onChange) => {
+    let d;
+    try { d = await api("GET", `/api/comfy/workflows/${wid}`); } catch (e) { toast(e.message, "error"); return; }
+    const nodes = d.nodes_list || [];
+    const byId = Object.fromEntries(nodes.map(n => [n.id, n]));
+    const keys = ["prompt", "negative", "seed", "width", "height", "length", "fps", "steps", "image"];
+    const map = JSON.parse(JSON.stringify(d.inputs || {}));
+    let outs = [...(d.outputs || [])];
+    const caps = new Set(d.capabilities || []);
+    const presets = JSON.parse(JSON.stringify(d.presets || { draft: {}, final: {} }));
+    const mapBox = el("div", { class: "wf-map" });
+    const nodeLabel = n => `#${n.id} · ${n.class_type}${n.title && n.title !== n.class_type ? " · " + n.title : ""}`;
+    const drawMap = () => {
+      mapBox.replaceChildren(el("table", { class: "mon-table wf-map-t" },
+        el("thead", {}, el("tr", {}, el("th", {}, t("comfy.input")), el("th", {}, t("comfy.node")), el("th", {}, t("comfy.field")), el("th", {}, t("comfy.value")), el("th", {}, ""))),
+        el("tbody", {}, keys.flatMap(k => {
+          const rows = (map[k] && map[k].length ? map[k] : [null]);
+          return rows.map((tg, i) => {
+            const nsel = el("select", { "aria-label": `${t("comfy.key." + k)} ${t("comfy.node")}`, onchange: e => {
+              const n = byId[e.target.value];
+              const first = n ? Object.keys(n.inputs)[0] : "";
+              const guess = n && ({ prompt: "text", negative: "text", seed: n.inputs.noise_seed != null ? "noise_seed" : "seed", image: "image", fps: n.inputs.frame_rate != null ? "frame_rate" : "fps" })[k];
+              if (!e.target.value) { map[k] = (map[k] || []).filter((_, j) => j !== i); }
+              else { map[k] = map[k] || []; map[k][i] = { node: e.target.value, input: guess && n.inputs[guess] !== undefined ? guess : (n.inputs[k] !== undefined ? k : first) }; }
+              drawMap();
+            } }, el("option", { value: "" }, "—"), nodes.map(n => el("option", { value: n.id, selected: tg && tg.node === n.id }, nodeLabel(n))));
+            const n = tg && byId[tg.node];
+            const isel = el("select", { disabled: !n, "aria-label": `${t("comfy.key." + k)} ${t("comfy.field")}`, onchange: e => { map[k][i] = { node: tg.node, input: e.target.value }; drawMap(); } },
+              n ? Object.keys(n.inputs).map(x => el("option", { value: x, selected: tg.input === x }, x)) : []);
+            const val = n ? n.inputs[tg.input] : "";
+            return el("tr", {}, el("td", {}, i === 0 ? t("comfy.key." + k) : ""), el("td", {}, nsel), el("td", {}, isel),
+              el("td", { class: "mono tiny wf-val", title: String(val ?? "") }, String(val ?? "").slice(0, 60)),
+              el("td", {}, i === 0 && tg ? el("button", { class: "icon-btn", title: t("comfy.addTarget"), "aria-label": t("comfy.addTarget"),
+                onclick: () => { map[k].push({ node: "", input: "" }); map[k] = map[k].filter(x => x); drawMap(); } }, "+") : null));
+          });
+        }))));
+    };
+    drawMap();
+    const outBox = el("div", { class: "row gap wrap" }, nodes.filter(n => /^(Save|Preview|VHS_VideoCombine)/.test(n.class_type)).map(n => {
+      const cb = el("input", { type: "checkbox", checked: outs.includes(n.id), onchange: e => { outs = e.target.checked ? [...outs, n.id] : outs.filter(x => x !== n.id); } });
+      return el("label", { class: "row gap" }, cb, el("span", { class: "small" }, nodeLabel(n)));
+    }));
+    const capBox = el("div", { class: "row gap wrap" }, ["t2v", "i2v", "image", "upscale", "interpolate"].map(c => {
+      const cb = el("input", { type: "checkbox", checked: caps.has(c), onchange: e => { e.target.checked ? caps.add(c) : caps.delete(c); } });
+      return el("label", { class: "row gap" }, cb, el("span", { class: "small" }, t("comfy.cap." + c)));
+    }));
+    const pin = (pn, k, step) => el("input", { type: "number", class: "narrow", step: step || 1, value: (presets[pn] || {})[k] ?? "",
+      "aria-label": `${pn} ${k}`, oninput: e => { presets[pn] = presets[pn] || {}; presets[pn][k] = e.target.value; } });
+    const preBox = el("table", { class: "mon-table" }, el("thead", {}, el("tr", {}, el("th", {}, ""), ...["width", "height", "length", "fps", "steps"].map(k => el("th", {}, t("comfy.key." + k))))),
+      el("tbody", {}, ["draft", "final"].map(pn => el("tr", {}, el("td", {}, t("ai.presets." + pn)),
+        el("td", {}, pin(pn, "width", 16)), el("td", {}, pin(pn, "height", 16)), el("td", {}, pin(pn, "length", 4)),
+        el("td", {}, pin(pn, "fps", 1)), el("td", {}, pin(pn, "steps", 1))))));
+    const name = el("input", { type: "text", value: d.name || "" });
+    const lic = el("input", { type: "text", value: d.licence || "" });
+    const com = el("input", { type: "checkbox", id: "wfe-com", checked: !!d.commercial });
+    const notes = el("textarea", { rows: 3 }); notes.value = d.notes || "";
+    const vram = el("input", { type: "number", class: "narrow", min: 1, max: 32, step: 0.5, value: d.min_vram_gb ?? 6 });
+    const valBox = el("div", {}, A.validationLine(d.validation));
+    const body = el("div", { class: "wf-editor" },
+      el("p", { class: "muted small" }, t("comfy.editorHelp")),
+      (d.detected && d.detected.notes || []).length ? el("ul", { class: "warn small" }, d.detected.notes.map(n => el("li", {}, n))) : null,
+      el("div", { class: "row gap wrap" }, el("div", { class: "field" }, el("label", {}, t("comfy.name")), name),
+        el("div", { class: "field" }, el("label", {}, t("licence")), lic)),
+      el("label", { class: "row gap", for: "wfe-com" }, com, el("span", {}, t("comfy.commercial"))),
+      el("div", { class: "field" }, el("label", {}, t("comfy.notes")), notes),
+      el("h3", {}, t("comfy.mapping")), mapBox,
+      el("button", { class: "btn small", onclick: () => { Object.keys(map).forEach(k => delete map[k]); Object.assign(map, JSON.parse(JSON.stringify((d.detected || {}).inputs || {}))); drawMap(); } }, "↺ " + t("comfy.redetect")),
+      el("h3", {}, t("comfy.outputs")), outBox,
+      el("h3", {}, t("comfy.caps")), capBox,
+      el("h3", {}, t("comfy.presets")), el("p", { class: "muted tiny" }, t("comfy.presetsHelp")), preBox,
+      el("label", { class: "row gap" }, el("span", {}, t("comfy.minVram")), vram),
+      valBox);
+    U().modal(`${t("comfy.editTitle")} — ${d.name}`, body, [
+      { label: t("cancel"), onClick: () => true },
+      { label: t("comfy.save"), primary: true, onClick: () => {
+        const clean = {};
+        for (const k of keys) { const ts = (map[k] || []).filter(x => x && x.node && x.input); if (ts.length) clean[k] = ts; }
+        api("PUT", `/api/comfy/workflows/${wid}`, { name: name.value, licence: lic.value, commercial: com.checked, notes: notes.value,
+          inputs: clean, outputs: outs, capabilities: [...caps], presets, min_vram_gb: vram.value })
+          .then(r => { toast(t("comfy.saved"), "ok"); onChange && onChange(r); if (!r.validation.ok) toast(t("comfy.savedInvalid"), "warn", 8000); })
+          .catch(e => toast(e.message, "error", 9000));
+        return true;
+      } }]);
+  };
+
   // ---------------------------------------------------------------- portraits
-  A.portraitGrid = (list, { selected, onPick, onDelete } = {}) => (list && list.length
+  A.portraitGrid =(list, { selected, onPick, onDelete } = {}) => (list && list.length
     ? el("div", { class: "portrait-grid", role: onPick ? "radiogroup" : null }, list.map(m => {
       const kids = [el("img", { src: m.url || `/api/library/portraits/${m.id}/thumb.jpg`, alt: m.name || m.id, loading: "lazy" }),
         el("span", { class: "pick-name" }, m.name || m.id),
@@ -365,6 +634,9 @@
     const provBox = el("div", {});
     const musicBox = el("div", {});
     const workBox = el("div", {});
+    const comfyBox = el("div", {});
+    const wfBox = el("div", {});
+    const wfUpBox = el("div", {});
     let images = [];
     const sec = (title, help, ...kids) => el("section", { class: "panel" },
       el("div", { class: "row between" }, el("h2", {}, title), help ? null : null),
@@ -374,11 +646,31 @@
         el("p", { class: "muted" }, t("ai.pageIntro")))),
       el("div", { class: "ai-cols" },
         el("div", { class: "ai-col" }, gpuBox, sec(t("ai.workers"), null, workBox), sec(t("ai.queue"), null, jobsBox),
-          sec(t("ai.generateClip"), null, formBox), sec(t("ai.musicTitle"), null, musicBox),
+          sec(t("ai.generateClip"), null, formBox),
+          el("section", { class: "panel", id: "comfy" }, el("h2", {}, "ComfyUI"), comfyBox),
+          sec(t("comfy.workflows"), t("comfy.workflowsHelp"), wfBox, el("details", { class: "wf-up" }, el("summary", {}, "⇪ " + t("comfy.uploadTitle")), wfUpBox)),
+          sec(t("ai.musicTitle"), null, musicBox),
           sec(t("ai.providers"), t("ai.providersHelp"), provBox), sec(t("ai.licences"), null, licBox)),
         el("div", { class: "ai-col" }, sec(t("ai.library"), t("ai.libraryHelp"), libBox),
           sec(t("ai.portraits"), t("ai.portraitsHelp"), portraitsBox, pForms)))));
     const loadWorkers = async () => { workBox.replaceChildren(A.workersCard(await api("GET", "/api/ai/workers"), loadWorkers)); };
+    let cfSig = "";
+    const loadComfy = async () => {
+      const s = await api("GET", "/api/comfy/status");
+      A.comfy = s;
+      const sig = JSON.stringify([s.state, s.reachable, s.busy, s.queue_running, s.queue_pending, s.vram_mb, s.error, s.last_free && s.last_free.t,
+        s.settings, (s.log || []).length && s.log[s.log.length - 1]]);
+      if (sig !== cfSig) {      // keep open <details> and focus while nothing changed
+        const open = [...comfyBox.querySelectorAll("details")].map(x => x.open);
+        cfSig = sig; comfyBox.replaceChildren(A.comfyCard(s, () => { cfSig = ""; loadComfy(); loadWf(); }));
+        [...comfyBox.querySelectorAll("details")].forEach((x, i) => { if (open[i]) x.open = true; });
+      }
+    };
+    const loadWf = async () => {
+      const d = await api("GET", "/api/comfy/workflows");
+      wfBox.replaceChildren(A.workflowList(d, async () => { await A.loadStatus(); loadWf(); formBox.replaceChildren(A.brollForm({ images, onQueued: () => loadJobs() })); provBox.replaceChildren(A.providerTable(A.status), el("p", { class: "muted small" }, t("ai.cloudNote"))); }),
+        el("p", { class: "muted tiny" }, d.checked ? t("comfy.checkedAgainst") : t("comfy.notCheckedAll")));
+    };
     let alive = true, prev = {};
     const loadLib = async () => {
       const [clips, ports] = await Promise.all([api("GET", "/api/library/broll"), api("GET", "/api/library/portraits")]);
@@ -414,6 +706,9 @@
       formBox.replaceChildren(A.brollForm({ images, onQueued: () => loadJobs() }));
       musicBox.replaceChildren(A.musicForm({ onQueued: () => loadJobs() }));
       loadWorkers().catch(() => {});
+      loadComfy().catch(() => {});
+      loadWf().catch(() => {});
+      wfUpBox.replaceChildren(A.workflowUpload(async () => { await A.loadStatus(); loadWf(); formBox.replaceChildren(A.brollForm({ images, onQueued: () => loadJobs() })); }));
       pForms.replaceChildren(A.portraitUpload({ onDone: () => loadLib() }), A.portraitGenerate({ onQueued: () => loadJobs() }));
       loadLib().catch(e => toast(e.message, "error"));
       loadJobs().catch(() => {});
@@ -421,7 +716,15 @@
     const t1 = setInterval(() => { if (alive) loadJobs().catch(() => {}); }, 2000);
     const t2 = setInterval(() => { if (alive) loadStatus().catch(() => {}); }, 3000);
     const t3 = setInterval(() => { if (alive) loadWorkers().catch(() => {}); }, 4000);
-    return () => { alive = false; clearInterval(t1); clearInterval(t2); clearInterval(t3); };
+    let wfState = "";
+    const t4 = setInterval(() => {
+      if (!alive) return;
+      loadComfy().then(() => {     // re-validate the workflows when ComfyUI comes up or goes down
+        const st = A.comfy ? `${A.comfy.reachable}` : "";
+        if (st !== wfState) { wfState = st; loadWf().catch(() => {}); }
+      }).catch(() => {});
+    }, 3000);
+    return () => { alive = false; clearInterval(t1); clearInterval(t2); clearInterval(t3); clearInterval(t4); };
   };
 
   window.AIUI = A;

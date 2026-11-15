@@ -155,6 +155,7 @@
     const sm = $("#sysmon");
     if (sm) sm.classList.toggle("on", location.hash.startsWith("#/monitor"));
     if (window.MonUI) window.MonUI.initWidget();
+    if (window.AIUI && window.AIUI.initHeader) window.AIUI.initHeader();
     if (m) cleanup = Editor(view, m[1]);
     else if (location.hash.startsWith("#/ai")) cleanup = window.AIUI.page(view);
     else if (location.hash.startsWith("#/monitor")) cleanup = window.MonUI.page(view);

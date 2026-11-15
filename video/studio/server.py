@@ -22,6 +22,8 @@ from fastapi.staticfiles import StaticFiles
 import align
 import brief as B
 import build
+import comfy as CF
+import comfyflows as CFW
 import followup
 import history as HI
 import inbox
@@ -78,7 +80,7 @@ def _warm_ram() -> dict:
 
 
 sampler = sysmon.Sampler(ai_pids=lambda: ai._ai_pids() if ai is not None else set(), activity=_activity,
-                         warm_ram=_warm_ram)
+                         warm_ram=_warm_ram, comfy_pids=lambda: ai.comfy.pids() if ai is not None else set())
 ai = AIJobs(sampler=sampler)
 make = Pipelines(jobs, ai)
 
@@ -100,6 +102,7 @@ def _startup() -> None:
 @app.on_event("shutdown")
 def _shutdown() -> None:
     ai.pool.shutdown()          # warm workers exit with the studio (they also exit when their socket closes)
+    # a managed ComfyUI keeps running (it holds no studio state); the next studio start adopts it
 
 
 @app.exception_handler(StoreError)
@@ -110,6 +113,16 @@ def _store_error(_req, e: StoreError):
 @app.exception_handler(TP.TemplateError)
 def _template_error(_req, e: TP.TemplateError):
     return JSONResponse({"detail": "; ".join(e.errors), "errors": e.errors}, status_code=e.status)
+
+
+@app.exception_handler(CFW.FlowError)
+def _flow_error(_req, e: CFW.FlowError):
+    return JSONResponse({"detail": str(e), "errors": e.errors}, status_code=e.status)
+
+
+@app.exception_handler(CF.ComfyError)
+def _comfy_error(_req, e: CF.ComfyError):
+    return JSONResponse({"detail": str(e)}, status_code=503)
 
 
 @app.exception_handler(B.BriefError)
@@ -692,7 +705,7 @@ async def ai_broll(request: Request):
         raise HTTPException(422, "prompt is too short (describe what the footage shows)")
     provider = d.get("provider") or PV.DEFAULT
     if not PV.exists(provider):
-        raise HTTPException(422, f"unknown provider '{provider}' ({', '.join(PV.PROVIDERS)})")
+        raise HTTPException(422, f"unknown provider '{provider}' ({', '.join(PV.all_providers())})")
     pv = PV.get(provider)
     preset = d.get("preset") if d.get("preset") in pv["presets"] else "draft"
     orient = d.get("orientation") if d.get("orientation") in ("portrait", "landscape") else "portrait"
@@ -703,9 +716,11 @@ async def ai_broll(request: Request):
     params = {"prompt": prompt[:800], "negative": str(d.get("negative") or "").strip()[:800] or None, "seed": seed,
               "orientation": orient, "provider": provider}
     im = d.get("image") if isinstance(d.get("image"), dict) else None
+    if im and "i2v" not in pv["modes"]:
+        raise HTTPException(422, f"{pv['name']} cannot animate an image")
+    if not im and "t2v" not in pv["modes"]:
+        raise HTTPException(422, f"{pv['name']} needs an image to animate (image-to-video only)")
     if im:                       # "animate this image": {project, asset} or {portrait}
-        if "i2v" not in pv["modes"]:
-            raise HTTPException(422, f"{pv['name']} cannot animate an image")
         ref = None
         if im.get("portrait"):
             ref = _portrait_ref(str(im["portrait"]))
@@ -817,6 +832,164 @@ async def ai_workers_release(request: Request):
 def ai_workers_release_gpu():
     """Every idle warm worker gives back its GPU memory; the weights stay in RAM."""
     return {"released": ai.pool.release_gpu(), **ai.pool.view()}
+
+
+# ---------------------------------------------------------------- ComfyUI
+@app.get("/api/comfy/status")
+def comfy_status(fresh: int = 0):
+    """Managed/external ComfyUI: state (running / starting / stopped / error / external), reachable, busy, queue
+    length, version, devices, VRAM of the ComfyUI process (monitor), last /free, settings, log tail."""
+    return JSONResponse(ai.comfy.status(fresh=bool(fresh)), headers=NOCACHE)
+
+
+@app.post("/api/comfy/start")
+def comfy_start():
+    """Start the managed ComfyUI (video/comfyui) on 127.0.0.1:<port>; returns at once (state 'starting')."""
+    return ai.comfy.start()
+
+
+@app.post("/api/comfy/stop")
+def comfy_stop():
+    """Stop the managed ComfyUI (refused while a ComfyUI job runs)."""
+    cur = ai.jobs.get(ai.current) if ai.current else None
+    if cur and ai._is_comfy(cur):
+        raise HTTPException(409, "a ComfyUI job is running — cancel it first")
+    return ai.comfy.stop()
+
+
+@app.post("/api/comfy/free")
+def comfy_free():
+    """POST /free {unload_models, free_memory} to ComfyUI and report its VRAM before/after."""
+    if not ai.comfy.reachable(2.0):
+        raise HTTPException(409, "ComfyUI is not running")
+    return ai.comfy.free(why="manual")
+
+
+@app.put("/api/comfy/settings")
+async def comfy_settings(request: Request):
+    """{mode: managed|external, url, port, autostart, vram_mode: auto|lowvram|novram|highvram, reserve_vram_gb,
+    custom_nodes, extra_args}. A running managed server keeps its flags until it is restarted."""
+    try:
+        return ai.comfy.update(_body(await request.body()))
+    except (TypeError, ValueError) as e:
+        raise HTTPException(422, str(e)) from None
+
+
+def _wf_view(m: dict, oi: dict | None) -> dict:
+    _, g = CFW.load(m["id"])
+    v = CFW.validate(g, m, oi)
+    return {**m, "provider": PV.COMFY + m["id"], "validation": v,
+            "preview_url": f"/api/comfy/workflows/{m['id']}/preview" if CFW.preview_file(m["id"]) else None}
+
+
+@app.get("/api/comfy/workflows")
+def comfy_workflows():
+    """Workflow library (video/comfy-workflows) with validation against the running ComfyUI (when it answers)."""
+    oi = ai.comfy.object_info_cached()
+    return JSONResponse({"workflows": [_wf_view(m, oi) for m in CFW.list_all()], "checked": oi is not None,
+                         "keys": list(CFW.KEYS), "capabilities": list(CFW.CAPS)}, headers=NOCACHE)
+
+
+@app.get("/api/comfy/workflows/{wid}")
+def comfy_workflow(wid: str):
+    """Manifest + validation + the node list (for the mapping editor) + the API graph."""
+    m, g = CFW.load(wid)
+    oi = ai.comfy.object_info_cached()
+    return JSONResponse({**_wf_view(m, oi), "nodes_list": CFW.nodes_view(g), "graph": g, "detected": CFW.detect(g)},
+                        headers=NOCACHE)
+
+
+@app.get("/api/comfy/workflows/{wid}/workflow_api.json")
+def comfy_workflow_file(wid: str):
+    return FileResponse(CFW.folder(wid) / "workflow_api.json", media_type="application/json",
+                        filename=f"{wid}-workflow_api.json")
+
+
+@app.get("/api/comfy/workflows/{wid}/preview")
+def comfy_workflow_preview(wid: str):
+    f = CFW.preview_file(wid)
+    if not f:
+        raise HTTPException(404, "no preview")
+    return FileResponse(f, headers=NOCACHE)
+
+
+async def _read_workflow_upload(request: Request) -> tuple[dict, dict, bytes | None, str]:
+    ctype = request.headers.get("content-type", "")
+    meta, preview, pext = {}, None, ".jpg"
+    if ctype.startswith("multipart/form-data"):
+        form = await request.form(max_files=3, max_fields=12, max_part_size=1024 * 1024)
+        raw = None
+        for key, val in form.multi_items():
+            if isinstance(val, str):
+                if key in ("name", "licence", "notes", "id", "commercial"):
+                    meta[key] = val
+                elif key == "workflow" and val.strip():
+                    raw = val
+                continue
+            data = await val.read(30 * 1024 * 1024)
+            fn = (val.filename or "").lower()
+            if fn.endswith(".json") or key == "workflow":
+                raw = data
+            elif fn.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                preview, pext = data, Path(fn).suffix.replace(".jpeg", ".jpg")
+        if raw is None:
+            raise CFW.FlowError("no workflow file — upload the JSON from ComfyUI's Workflow → Export (API)")
+        meta["commercial"] = str(meta.get("commercial") or "").lower() in ("1", "true", "on", "yes")
+        return CFW.parse(raw), meta, preview, pext
+    body = await request.body()
+    try:
+        d = json.loads(body or b"{}")
+    except ValueError as e:
+        raise CFW.FlowError(f"not valid JSON: {e}") from None
+    if isinstance(d, dict) and "workflow" in d:
+        meta = {k: d.get(k) for k in ("name", "licence", "notes", "id", "commercial") if d.get(k) is not None}
+        return CFW.parse(d["workflow"]), meta, None, pext
+    return CFW.parse(d), meta, None, pext
+
+
+@app.post("/api/comfy/workflows/detect")
+async def comfy_workflow_detect(request: Request):
+    """Dry run of an upload: detected mapping + validation (nothing is saved)."""
+    g, meta, _, _ = await _read_workflow_upload(request)
+    det = CFW.detect(g)
+    m = CFW.new_manifest(g, meta, det)
+    return {"detected": det, "manifest": m, "validation": CFW.validate(g, m, ai.comfy.object_info_cached()),
+            "nodes_list": CFW.nodes_view(g)}
+
+
+@app.post("/api/comfy/workflows", status_code=201)
+async def comfy_workflow_upload(request: Request):
+    """Upload a workflow (multipart: the API-format JSON + name?, licence?, notes?, commercial?, id?, preview image?).
+    The input mapping is auto-detected; correct it with PUT. Custom nodes are never installed."""
+    g, meta, preview, pext = await _read_workflow_upload(request)
+    det = CFW.detect(g)
+    m = CFW.new_manifest(g, meta, det)
+    wid = (meta.get("id") or "").strip().lower() or None
+    m = CFW.save(g, m, wid, preview=preview, preview_ext=pext)
+    return {**_wf_view(m, ai.comfy.object_info_cached()), "detected": det, "nodes_list": CFW.nodes_view(g)}
+
+
+@app.put("/api/comfy/workflows/{wid}")
+async def comfy_workflow_update(wid: str, request: Request):
+    """Edit the manifest: name, licence, notes, commercial, capabilities, inputs {key: [{node, input}]}, outputs,
+    presets {draft|final: {width, height, length, fps, steps?}}, min_vram_gb, ram_gb."""
+    m = CFW.update(wid, _body(await request.body()))
+    return _wf_view(m, ai.comfy.object_info_cached())
+
+
+@app.post("/api/comfy/workflows/{wid}/validate")
+def comfy_workflow_validate(wid: str):
+    m, g = CFW.load(wid)
+    oi = ai.comfy.object_info(force=True) if ai.comfy.reachable(2.0) else None
+    return {"validation": CFW.validate(g, m, oi), "checked": oi is not None}
+
+
+@app.delete("/api/comfy/workflows/{wid}")
+def comfy_workflow_delete(wid: str):
+    if any(PV.COMFY + wid == (j.get("provider") or "") for j in ai.active(kind="broll")):
+        raise HTTPException(409, "a job of this workflow is queued or running")
+    CFW.delete(wid)
+    return {"deleted": wid}
 
 
 # ---------------------------------------------------------------- system monitor

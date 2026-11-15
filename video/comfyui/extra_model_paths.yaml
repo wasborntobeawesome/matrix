@@ -1,0 +1,20 @@
+# ComfyUI model folders for Video Studio (passed with --extra-model-paths-config by the Studio).
+# Models live in video/comfyui/models/, outside the ComfyUI checkout, so re-installing or updating
+# ComfyUI (setup.py) keeps them. base_path is relative to this file.
+#
+# To let an existing ComfyUI elsewhere use the same files, copy this block into that ComfyUI's own
+# extra_model_paths.yaml with an absolute base_path (e.g. C:/.../video/comfyui/models).
+video_studio:
+    base_path: models
+    is_default: true
+    diffusion_models: |
+        diffusion_models
+        unet
+    text_encoders: |
+        text_encoders
+        clip
+    vae: vae
+    loras: loras
+    checkpoints: checkpoints
+    clip_vision: clip_vision
+    upscale_models: upscale_models

@@ -1,0 +1,120 @@
+{
+ "id": "wan22-5b-draft",
+ "name": "ComfyUI · Wan 2.2 5B (draft)",
+ "licence": "Apache-2.0",
+ "commercial": true,
+ "licence_note": "Wan2.2-TI2V-5B (Wan-AI), the UMT5-XXL text encoder and the Wan2.2 VAE are Apache-2.0; the single-file repackage (Comfy-Org/Wan_2.2_ComfyUI_Repackaged) is Apache-2.0 too. You are responsible for generated content.",
+ "notes": "Fast-ish draft clips from the 5B text/image-to-video model: one KSampler (20 steps, uni_pc, cfg 5), Wan22ImageToVideoLatent (optional start image), CreateVideo + SaveVideo (H.264 MP4). Core nodes only. The negative prompt is Wan's own default (Chinese); a Studio job only replaces it when you type one.",
+ "capabilities": [
+  "t2v",
+  "i2v"
+ ],
+ "inputs": {
+  "prompt": [
+   {
+    "node": "6",
+    "input": "text"
+   }
+  ],
+  "negative": [
+   {
+    "node": "7",
+    "input": "text"
+   }
+  ],
+  "seed": [
+   {
+    "node": "3",
+    "input": "seed"
+   }
+  ],
+  "width": [
+   {
+    "node": "55",
+    "input": "width"
+   }
+  ],
+  "height": [
+   {
+    "node": "55",
+    "input": "height"
+   }
+  ],
+  "length": [
+   {
+    "node": "55",
+    "input": "length"
+   }
+  ],
+  "fps": [
+   {
+    "node": "57",
+    "input": "fps"
+   }
+  ],
+  "steps": [
+   {
+    "node": "3",
+    "input": "steps"
+   }
+  ],
+  "image": [
+   {
+    "node": "56",
+    "input": "image"
+   }
+  ]
+ },
+ "outputs": [
+  "58"
+ ],
+ "presets": {
+  "draft": {
+   "width": 480,
+   "height": 832,
+   "length": 81,
+   "fps": 24.0,
+   "steps": 20
+  },
+  "final": {
+   "width": 704,
+   "height": 1280,
+   "length": 121,
+   "fps": 24.0,
+   "steps": 20
+  }
+ },
+ "estimate": {
+  "draft": {
+   "seconds": 70,
+   "vram_gb": 13.1
+  },
+  "final": {
+   "seconds": 300,
+   "vram_gb": 12.2
+  }
+ },
+ "min_vram_gb": 6.0,
+ "ram_gb": 15.0,
+ "speed": "fast",
+ "models": [
+  {
+   "file": "wan2.2_ti2v_5B_fp16.safetensors",
+   "folder": "diffusion_models",
+   "gb": 10.0
+  },
+  {
+   "file": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+   "folder": "text_encoders",
+   "gb": 6.74
+  },
+  {
+   "file": "wan2.2_vae.safetensors",
+   "folder": "vae",
+   "gb": 1.41
+  }
+ ],
+ "source": "builtin",
+ "created": 1794741962.5788324,
+ "estimate_note": "Measured on the RTX 5070 Ti (16 GB) with ComfyUI v0.45.3, cold models, nothing else on the GPU; vram_gb = peak VRAM of the ComfyUI process (dynamic VRAM uses what is free)."
+}

@@ -10,6 +10,7 @@ Sources (all cheap; measured overhead is reported by `overhead()`):
 VRAM and RAM are attributed to owners:
   ovoz    the process listening on the Ovoz port, its descendants, anything running from OVOZ_DIR
   ai      the warm AI workers / AI job subprocesses and their descendants
+  comfy   ComfyUI: the managed server's process tree, or the process listening on a local ComfyUI port
   studio  this server and its other descendants (render.py + headless Chromium)
   other   everything else (desktop, browsers, games …; for VRAM also driver overhead)
 
@@ -98,10 +99,10 @@ class _Pdh:
 
 # ---------------------------------------------------------------- sampler
 class Sampler:
-    def __init__(self, ai_pids=lambda: {}, activity=lambda: [], warm_ram=lambda: {}):
+    def __init__(self, ai_pids=lambda: {}, activity=lambda: [], warm_ram=lambda: {}, comfy_pids=lambda: set()):
         import psutil
         self.ps = psutil
-        self.ai_pids, self.activity, self.warm_ram = ai_pids, activity, warm_ram
+        self.ai_pids, self.activity, self.warm_ram, self.comfy_pids = ai_pids, activity, warm_ram, comfy_pids
         self.me = os.getpid()
         self.hist: collections.deque = collections.deque(maxlen=HISTORY_S + 5)
         self.markers: collections.deque = collections.deque(maxlen=500)
@@ -178,9 +179,11 @@ class Sampler:
             seen += 1
         return False
 
-    def owner(self, pid: int, ai: set) -> str:
+    def owner(self, pid: int, ai: set, comfy: set | None = None) -> str:
         if ai and self._descends(pid, ai):
             return "ai"
+        if comfy and self._descends(pid, comfy):
+            return "comfy"
         if (self._listen and self._descends(pid, self._listen)) or (gpu.OVOZ_DIR and gpu.OVOZ_DIR in self._cmd(pid)):
             return "ovoz"
         if self._descends(pid, {self.me}):
@@ -207,24 +210,28 @@ class Sampler:
         s["rt"], s["ru"] = round(vm.total / 2**30, 1), round((vm.total - vm.available) / 2**30, 2)
         self._refresh_tree()
         ai = set(self.ai_pids() or {})
+        try:
+            comfy = set(self.comfy_pids() or set())
+        except Exception:  # noqa: BLE001
+            comfy = set()
         mem, eng = self.pdh.read() if self.pdh else ({}, {})
-        owners = {"ovoz": 0, "ai": 0, "studio": 0}
+        owners = {"ovoz": 0, "ai": 0, "studio": 0, "comfy": 0}
         rows = []
         for pid, b in mem.items():
             if b < 16 * 2**20 and eng.get(pid, 0) < 1:
                 continue
-            who = self.owner(pid, ai)
+            who = self.owner(pid, ai, comfy)
             mb = b >> 20
             if who in owners:
                 owners[who] += mb
             rows.append({"pid": pid, "name": self._tree.get(pid, (0, "?"))[1], "who": who, "vram_mb": mb,
                          "gpu": round(min(100.0, eng.get(pid, 0.0)), 1)})
         if self.pdh:
-            s.update(vo=owners["ovoz"], va=owners["ai"], vs=owners["studio"])
+            s.update(vo=owners["ovoz"], va=owners["ai"], vs=owners["studio"], vc=owners["comfy"])
         # RAM per owner (working sets of the attributed process trees)
-        ram = {"ovoz": 0.0, "ai": 0.0, "studio": 0.0}
+        ram = {"ovoz": 0.0, "ai": 0.0, "studio": 0.0, "comfy": 0.0}
         for pid in list(self._tree):
-            who = self.owner(pid, ai)
+            who = self.owner(pid, ai, comfy)
             if who == "other":
                 continue
             try:
@@ -235,7 +242,7 @@ class Sampler:
             for r in rows:
                 if r["pid"] == pid:
                     r["ram_gb"] = round(rss / 2**30, 2)
-        s.update(ra=round(ram["ai"], 2), ro=round(ram["ovoz"], 2), rs=round(ram["studio"], 2))
+        s.update(ra=round(ram["ai"], 2), ro=round(ram["ovoz"], 2), rs=round(ram["studio"], 2), rc=round(ram["comfy"], 2))
         wr = self.warm_ram() or {}
         s["rw"] = round(sum(wr.values()), 2)          # RAM held by warm model workers (subset of ra)
         for r in rows:
@@ -318,10 +325,12 @@ class Sampler:
         rows = [{"pid": r["pid"], "name": r["label"], "mb": r["vram_mb"], "who": r["who"]} for r in self.procs]
         return {"ok": True, "name": self.info["gpu"], "total_mb": s["vt"], "used_mb": s["vu"], "free_mb": s["vt"] - s["vu"],
                 "util": s.get("gu"), "ovoz_mb": s.get("vo") if self.pdh else None, "ai_mb": s.get("va") if self.pdh else None,
-                "studio_mb": s.get("vs"), "procs": rows[:12], "checked": s["t"], "temp_c": s.get("tc"), "power_w": s.get("pw")}
+                "studio_mb": s.get("vs"), "comfy_mb": s.get("vc") if self.pdh else None, "procs": rows[:12], "checked": s["t"], "temp_c": s.get("tc"), "power_w": s.get("pw")}
 
 
 def _label(name: str, cmd: str) -> str:
+    if "comfyui" in (cmd or "") and "main.py" in (cmd or ""):
+        return f"{name} ComfyUI"
     m = re.search(r"([\w-]+\.py)(?:\s+--family\s+([\w-]+))?", cmd or "")
     if m:
         return f"{name} {m.group(1)}" + (f" {m.group(2)}" if m.group(2) else "")

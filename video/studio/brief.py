@@ -27,6 +27,23 @@ ON_SCREEN = ("kicker", "headline", "sub", "callout", "button")   # Uzbek apostro
 MUSIC_DEFAULT = {"volume_db": -20.0, "duck": True, "duck_db": -10.0, "fade_in": 1.0, "fade_out": 2.5, "start": 0.0}
 LAYOUTS = ["hero", "chips", "stat", "list", "cta", "screen", "screens", "presenter"]
 BROLL_PROVIDERS = ["wan22-5b", "fastwan-5b", "wan22-a14b"]     # providers.py
+COMFY_PROVIDER = re.compile(r"^comfy:[a-z0-9][a-z0-9_-]{1,40}$")   # a ComfyUI workflow (video/comfy-workflows/<id>)
+_PROVIDER = {"type": "string", "pattern": r"^(wan22-5b|fastwan-5b|wan22-a14b|comfy:[a-z0-9][a-z0-9_-]{1,40})$"}
+
+
+def provider_ok(v: str) -> tuple[bool, str | None]:
+    """(valid, warning): built-in ids, or comfy:<workflow id> (kept with a warning when not installed here)."""
+    if v in BROLL_PROVIDERS:
+        return True, None
+    if COMFY_PROVIDER.match(v):
+        try:
+            import comfyflows
+            if not comfyflows.exists(v.split(":", 1)[1]):
+                return True, f"'{v}': this ComfyUI workflow is not installed in the studio (video/comfy-workflows)"
+        except Exception:  # noqa: BLE001
+            pass
+        return True, None
+    return False, None
 PRESENTER_MODES = ["corner", "full"]
 PRESENTER_QUALITY = ["draft", "final"]
 BG_DIM_DEFAULT = 0.55
@@ -67,8 +84,9 @@ _background = {
             "clip": {**_str, "description": "b-roll library id (set by the studio)"},
             "prompt": {**_str, "description": "Suggested text-to-video prompt: what the background footage shows, "
                                               "no text/logos/people's faces, e.g. 'slow drifting purple light ribbons on dark navy'"},
-            "provider": {"enum": BROLL_PROVIDERS, "description": "Video generator for this scene's clip (default: the "
-                         "project's broll_provider): wan22-5b (original), fastwan-5b (fast drafts), wan22-a14b (best quality)"},
+            "provider": {**_PROVIDER, "description": "Video generator for this scene's clip (default: the "
+                         "project's broll_provider): wan22-5b (original), fastwan-5b (fast drafts), wan22-a14b (best quality), "
+                         "or comfy:<workflow id> = a ComfyUI workflow installed in the studio"},
             "image": {**_str, "description": "Optional: animate this uploaded image asset (image-to-video) instead of "
                                              "generating from text only; 'prompt' then describes the motion"},
             "dim": {"type": "number", "minimum": 0, "maximum": 0.9, "default": BG_DIM_DEFAULT,
@@ -142,8 +160,9 @@ SCHEMA = {
                                                              "duration": {"type": "number", "minimum": 10, "maximum": 240,
                                                                           "description": "seconds (default: the video length)"},
                                                              "seed": {"type": "integer"}}}}},
-        "broll_provider": {"enum": BROLL_PROVIDERS, "default": "wan22-5b",
-                           "description": "Default video generator for scene b-roll (a scene's background.provider wins)"},
+        "broll_provider": {**_PROVIDER, "default": "wan22-5b",
+                           "description": "Default video generator for scene b-roll (a scene's background.provider wins); "
+                                          "also comfy:<workflow id>"},
         "cover": {"type": "object", "description": "Cover image moment (default: the end of the first scene)",
                   "properties": {"scene": _str, "t": {"type": "number", "minimum": 0,
                                                           "description": "seconds from the scene start"}}},
@@ -362,8 +381,11 @@ def normalize(raw, assets: dict | None = None) -> tuple[dict, list[str]]:
                     pass
     if raw.get("broll_provider") not in (None, ""):
         bp = str(raw.get("broll_provider")).strip().lower()
-        if bp in BROLL_PROVIDERS:
+        ok, note = provider_ok(bp)
+        if ok:
             b["broll_provider"] = bp
+            if note:
+                warn.append(f"broll_provider {note} — Make video uses wan22-5b until it is")
         else:
             warn.append(f"broll_provider '{bp}' unknown ({', '.join(BROLL_PROVIDERS)}) — using {BROLL_PROVIDERS[0]}")
     if raw.get("transition") not in (None, ""):
@@ -662,8 +684,11 @@ def _background_norm(v, sid: str, warn: list) -> dict | None:
         o["prompt"] = prompt
     prov = str(v.get("provider") or "").strip().lower()
     if prov:
-        if prov in BROLL_PROVIDERS:
+        ok, note = provider_ok(prov)
+        if ok:
             o["provider"] = prov
+            if note:
+                warn.append(f"scene '{sid}': background.provider {note} — Make video uses the default until it is")
         else:
             warn.append(f"scene '{sid}': background.provider '{prov}' unknown — using the project default")
     img = _text(v.get("image"), 120)

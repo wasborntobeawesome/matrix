@@ -1,7 +1,8 @@
 """GPU job queue for the local generative-AI layers (separate from the render queue).
 
 One GPU job at a time. Kinds:
-  broll      text/image-to-video clip from a provider (providers.py) -> library/broll/<id>/
+  broll      text/image-to-video clip from a provider (providers.py) -> library/broll/<id>/; a `comfy:<id>`
+             provider runs a ComfyUI workflow (comfy.py, comfyflows.py) on the local/external ComfyUI
   portrait   Wan2.2 text-to-image portrait -> library/portraits/<id>/
   presenter  EchoMimicV3 talking head on a project's voice-over -> projects/<id>/presenter/
   music      ACE-Step v1.5 instrumental track -> library/music/<id>/ (music.add_track, source "generated")
@@ -25,6 +26,8 @@ import time
 from pathlib import Path
 
 import build
+import comfy as CF
+import comfyflows as F
 import gpu
 import library as L
 import music as MU
@@ -86,6 +89,13 @@ LICENCES = [
     {"what": "ffmpeg (gyan.dev build, --enable-gpl)", "licence": "GPL-3", "commercial": True,
      "note": "Fine to run as a tool; don't ship it inside a closed product."},
     {"what": "nvidia-ml-py / psutil (system monitor)", "licence": "BSD-3", "commercial": True, "note": ""},
+    {"what": "ComfyUI (comfyanonymous / Comfy Org) — runs ComfyUI workflows", "licence": "GPL-3.0", "commercial": True,
+     "note": "A separate program in video/comfyui; the Studio only talks to it over its HTTP API and never imports or "
+             "ships its code. Each workflow lists the licences of its models; custom nodes have their own licences."},
+    {"what": "Wan2.2 TI2V-5B / T2V-A14B fp8 + UMT5 + VAEs, Comfy-Org single-file repackage — ComfyUI samples",
+     "licence": "Apache-2.0", "commercial": True, "note": "Comfy-Org/Wan_2.2_ComfyUI_Repackaged (model card: Apache-2.0)."},
+    {"what": "LightX2V Wan2.2-Lightning 4-step LoRA v1.1 (lightx2v) — ComfyUI quality sample", "licence": "Apache-2.0",
+     "commercial": True, "note": "Byte-identical to the LoRA the A14B worker uses (hard-linked, not downloaded twice)."},
 ]
 DISCLOSURE = ("A generated or animated presenter is synthetic media: most platforms require an "
               "\"AI-generated\" label. Only animate a real person with their permission.")
@@ -111,6 +121,7 @@ class AIJobs:
         self.timings = self._load_timings()
         WK.kill_leftovers()                  # warm workers a previous studio process left behind
         self.pool = WK.Pool()
+        self.comfy = CF.Comfy(sampler=sampler)
         self.monitor = gpu.Monitor(ai_pids=self._ai_pids, sampler=sampler)
         self._load()
         threading.Thread(target=self._loop, name="ai-gpu-queue", daemon=True).start()
@@ -196,6 +207,14 @@ class AIJobs:
 
     def estimate_broll(self, provider: str, preset: str, i2v: bool = False) -> float:
         pv = P.get(provider)
+        if pv.get("comfy"):
+            key = P.timing_key(provider, preset)
+            warm = self.comfy.last_workflow == pv["workflow"] and self.comfy.state == "running"
+            if not (self.timings.get(key) or {}).get("runs"):
+                seed = (pv.get("estimate_seed") or {}).get(preset) or {}
+                sec = float(seed.get("seconds") or 180)
+                return round(sec * (0.75 if warm else 1.0))
+            return self.estimate("broll", preset, pv["presets"][preset]["steps"] or 1, key=key, warm=warm)
         fam = pv["family"]["i2v" if i2v else "t2v"]
         return self.estimate("broll", preset, pv["presets"][preset]["steps"], key=P.timing_key(provider, preset),
                              warm=self.is_warm(fam, broll_keys(provider, fam)))
@@ -210,7 +229,9 @@ class AIJobs:
                "label": label, "status": "queued", "stage": "queued", "progress": 0.0, "message": "", "error": None,
                "result": None, "created": now(), "started": None, "finished": None, "eta": None, "elapsed": 0,
                "provider": params.get("provider") if kind == "broll" else None, "timing_key": tkey,
-               "estimate": est, "units": units, "need_gb": self.need_gb_key(tkey),
+               "estimate": est, "units": units,
+               "need_gb": (P.get(params.get("provider"))["min_vram_gb"] if P.is_comfy(params.get("provider")) and
+                           kind == "broll" else self.need_gb_key(tkey)),
                "force": False, "waiting": False, "log": [], "pid": None}
         with self.lock:
             self.jobs[job["id"]] = job
@@ -267,6 +288,8 @@ class AIJobs:
         elif j["status"] == "running":
             j["_cancel"] = True             # the warm worker stops at the next step and keeps its weights
             j["message"] = "cancelling…"
+            if j.get("comfy_prompt_id"):      # ComfyUI: delete from its queue + interrupt (the runner also does it)
+                threading.Thread(target=self.comfy.cancel_prompt, args=(j["comfy_prompt_id"],), daemon=True).start()
             proc = self.procs.get(jid)
             if proc and proc.poll() is None:
                 _kill_tree(proc.pid)
@@ -327,10 +350,17 @@ class AIJobs:
                 self.wake.wait(3.0)
                 self.wake.clear()
                 continue
+            is_comfy = self._is_comfy(job)
+            if not is_comfy and self.comfy.holds_vram():
+                # another AI worker needs the GPU: ComfyUI unloads its models first (POST /free)
+                job.update(message="asking ComfyUI to free its GPU memory first…")
+                self.comfy.free(why=f"before {job['kind']} job {job['id']}")
             if not job.get("force") and not self._no_gpu_work(job):
                 snap = self.monitor.get(fresh=True)
                 if snap.get("ok"):
                     free = snap["free_mb"] / 1024
+                    if is_comfy:            # ComfyUI reuses (or unloads) what it already holds
+                        free += (snap.get("comfy_mb") or 0) / 1024
                     if free < job["need_gb"]:
                         ov = snap.get("ovoz_mb")
                         who = (f"Ovoz is using {gpu.gb(ov)} GB" if ov else "other apps are using it") if ov is not None \
@@ -343,6 +373,9 @@ class AIJobs:
                         self.wake.clear()
                         continue
             self._run(job)
+
+    def _is_comfy(self, job: dict) -> bool:
+        return job["kind"] == "broll" and P.is_comfy((job.get("params") or {}).get("provider"))
 
     def _no_gpu_work(self, job: dict) -> bool:
         """A presenter job whose segments are all cached only assembles (CPU): no VRAM check."""
@@ -363,6 +396,8 @@ class AIJobs:
         try:
             runner = {"broll": self._broll, "portrait": self._portrait, "presenter": self._presenter,
                       "music": self._music}[job["kind"]]
+            if self._is_comfy(job):
+                runner = self._comfy_broll
             job["result"] = runner(job)
             job.update(status="done", progress=1.0, stage="done", eta=0, message="")
         except Cancelled:
@@ -569,6 +604,121 @@ class AIJobs:
                 job.setdefault("result_note", f"assigned to scene '{a['scene']}'")
                 return
 
+    def _comfy_broll(self, job: dict) -> dict:
+        """A b-roll clip from a ComfyUI workflow: fill the mapped inputs, POST /prompt, follow the WebSocket,
+        fetch the result from /view, transcode, add it to the library with the workflow's metadata."""
+        prm = job["params"]
+        provider = prm["provider"]
+        wid = provider[len(P.COMFY):]
+        m, g = F.load(wid)
+        pv = P.get(provider)
+        preset = job["preset"] if job["preset"] in pv["presets"] else "draft"
+        pr = pv["presets"][preset]
+        orient = prm.get("orientation", "portrait")
+        w, h = P.size(provider, preset, orient)
+        img = prm.get("image") or None
+        if img and not Path(img["path"]).is_file():
+            raise RuntimeError(f"the image to animate is gone: {img.get('label') or img['path']}")
+        if img and "i2v" not in pv["modes"]:
+            raise RuntimeError(f"{pv['name']} cannot animate an image (no image input in its manifest)")
+        if not img and "t2v" not in pv["modes"]:
+            raise RuntimeError(f"{pv['name']} needs an image to animate (image-to-video only)")
+        cid = P.clip_key(provider, prm["prompt"], prm["seed"], preset, orient, img["sha"] if img else None)
+        if L.broll_get(cid):
+            self._assign_broll(job, cid)
+            return {"clip": cid, "cached": True}
+        t_start = time.time()
+        # warm AI workers give back their GPU memory first (their weights stay in RAM)
+        job.update(stage="starting", message="warm AI workers: releasing GPU memory…", progress=0.01)
+        released = self.pool.release_gpu()
+        cf = self.comfy
+        if not cf.reachable(2.0):
+            job.update(message="starting ComfyUI…" if cf.managed else f"waiting for ComfyUI at {cf.url}…")
+            self._save(force=True)
+        cf.ensure_running()
+        job["worker"] = "comfyui"
+        job.update(message="checking the workflow against ComfyUI (/object_info)…", progress=0.03)
+        v = F.validate(g, m, cf.object_info())
+        if not v["ok"]:
+            raise RuntimeError("the workflow cannot run on this ComfyUI: " + validation_text(v))
+        image_name = None
+        if img:
+            job.update(message="uploading the image to ComfyUI…")
+            image_name = cf.upload_image(Path(img["path"]), f"studio-{img['sha']}{Path(img['path']).suffix.lower() or '.png'}")
+        values = {"prompt": prm["prompt"], "negative": prm.get("negative") or None, "seed": int(prm["seed"]),
+                  "width": w, "height": h, "length": pr["frames"], "fps": pr["fps"],
+                  "steps": pr["steps"] if (m.get("inputs") or {}).get("steps") else None, "image": image_name}
+        graph = F.fill(g, m, values, prefix=f"studio/{job['id']}")
+        steps = sum(x for x in (P._steps_of(n) for n in graph.values() if n["class_type"] in F.SAMPLERS) if x) or 1
+        tkey = P.timing_key(provider, preset)
+        tl = self.timings.get(tkey, {})
+        stepper = self._stepper(job, steps, 0.06, 0.85, tl.get("tail", 20))
+        warm_before = cf.last_workflow == wid
+
+        def on_event(ev: dict) -> None:
+            if ev.get("stage") == "load":
+                ev = {**ev, "warm": warm_before}
+            stepper(ev)
+            self._save()
+        job.update(stage="loading", message="queued in ComfyUI…", progress=0.05)
+        self._save(force=True)
+        t_run = time.time()
+        try:
+            res = cf.run(graph, on_event, lambda: bool(job.get("_cancel")), job=job)
+        except CF.Cancelled:
+            raise Cancelled() from None
+        files = CF.output_files(res["outputs"], [str(x) for x in m.get("outputs") or []]) or CF.output_files(res["outputs"])
+        vids = [f for f in files if Path(f["filename"]).suffix.lower() in (".mp4", ".webm", ".mov", ".mkv", ".webp", ".gif",
+                                                                           ".png")]
+        if not vids:
+            raise RuntimeError(f"ComfyUI finished but the output node(s) {m.get('outputs')} produced no video "
+                               f"(outputs: {', '.join(f['filename'] for f in files) or 'none'})")
+        job.update(stage="library", message="fetching the result (/view) and adding it to the library (VP9 + thumbnail)…",
+                   progress=0.95)
+        self._save(force=True)
+        t_tail = time.time()
+        TMP.mkdir(parents=True, exist_ok=True)
+        src = cf.download(vids[0], TMP / f"{job['id']}-comfy{Path(vids[0]['filename']).suffix.lower()}")
+        mp4 = TMP / f"{job['id']}.mp4"
+        to_mp4(src, mp4, pr["fps"])
+        if src != mp4:
+            src.unlink(missing_ok=True)
+        peak = _peak(self.monitor.sampler, t_run, "vc")
+        tlm = res.get("timeline") or {}
+        meta = L.broll_add(mp4, {"id": cid, "prompt": prm["prompt"], "negative": prm.get("negative"),
+                                 "seed": prm["seed"], "steps": steps, "width": w, "height": h, "frames": pr["frames"],
+                                 "fps": pr["fps"], "preset": preset, "source": "generated", "provider": provider,
+                                 "model": m.get("name") or wid, "licence": m.get("licence") or "unknown",
+                                 "licence_note": m.get("licence_note") or "", "commercial": m.get("commercial"),
+                                 "mode": "i2v" if img else "t2v", "image": (img or {}).get("label"),
+                                 "image_sha": (img or {}).get("sha"),
+                                 "comfy": {"workflow": wid, "workflow_sha": F.graph_sha(g), "prompt_id": res["prompt_id"],
+                                           "url": cf.url, "inputs": {k: v for k, v in values.items() if v is not None and
+                                                                     (m.get("inputs") or {}).get(k)},
+                                           "models": [x.get("file") for x in F.models_of(graph)],
+                                           "output": vids[0]["filename"], "timeline": tlm,
+                                           "comfyui_version": (cf.status().get("version"))},
+                                 "gen_seconds": res.get("seconds"), "load_seconds": tlm.get("load_s"),
+                                 "denoise_seconds": tlm.get("denoise_s"), "decode_seconds": tlm.get("decode_s"),
+                                 "job_seconds": round(time.time() - job["started"]), "warm": warm_before,
+                                 "peak_vram_comfy_gb": round(peak / 1024, 2) if peak else None,
+                                 "released_workers": released}, move=True)
+        post = time.time() - t_tail
+        cf.last_workflow = wid
+        if tlm.get("denoise_s"):
+            self._learn(tkey, (tlm.get("load_s") or 0) + (tlm.get("queue_s") or 0), tlm["denoise_s"] / steps,
+                        (tlm.get("decode_s") or 0) + (tlm.get("encode_s") or 0) + post, None, warm=warm_before)
+        if not F.preview_file(wid):
+            try:
+                F.set_preview(wid, L.BROLL / cid / "thumb.jpg")
+            except (OSError, F.FlowError):
+                pass
+        self._assign_broll(job, cid)
+        return {"clip": cid, "provider": provider, "workflow": wid, "seconds": meta.get("duration"),
+                "gen_seconds": res.get("seconds"), "load_seconds": tlm.get("load_s"), "denoise_seconds": tlm.get("denoise_s"),
+                "decode_seconds": tlm.get("decode_s"), "warm": warm_before, "comfy_prompt_id": res["prompt_id"],
+                "peak_vram_comfy_gb": round(peak / 1024, 2) if peak else None, "job_seconds": round(time.time() - t_start)}
+
     def _portrait(self, job: dict) -> dict:
         prm = job["params"]
         TMP.mkdir(parents=True, exist_ok=True)
@@ -706,6 +856,59 @@ def _need(res: dict, full_gpu) -> float | None:
     if full_gpu or not res.get("peak_vram_reserved_gb"):
         return None
     return res["peak_vram_reserved_gb"] + 0.5
+
+
+def validation_text(v: dict) -> str:
+    parts = []
+    if v.get("missing_nodes"):
+        parts.append("missing nodes: " + ", ".join(v["missing_nodes"]) + " (custom nodes? install them yourself — "
+                     "the Studio never installs custom nodes)")
+    if v.get("missing_models"):
+        parts.append("missing model files: " + ", ".join(f"{x['file']} ({x.get('folder') or '?'})" for x in v["missing_models"]))
+    if v.get("mapping_errors"):
+        parts.append("mapping: " + "; ".join(v["mapping_errors"]))
+    return " · ".join(parts) or "unknown problem"
+
+
+def _peak(sampler, since: float, key: str) -> float | None:
+    if sampler is None:
+        return None
+    vals = [s.get(key) for s in sampler.history(since) if s.get(key) is not None]
+    return max(vals) if vals else None
+
+
+def to_mp4(src: Path, dest: Path, fps: float) -> None:
+    """Any ComfyUI video output -> H.264 MP4 for the library. ffmpeg cannot decode animated WebP/PNG, so those
+    are read frame by frame with Pillow and piped into ffmpeg."""
+    ext = src.suffix.lower()
+    if ext == ".mp4" and src != dest:
+        src.replace(dest)
+        return
+    if ext in (".webm", ".mov", ".mkv", ".gif"):
+        r = subprocess.run([L.FFMPEG, "-y", "-v", "error", "-i", str(src),
+                            "-an", "-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p", str(dest)],
+                           capture_output=True, text=True, timeout=900, creationflags=NOWIN)
+        if r.returncode != 0:
+            raise RuntimeError(f"could not convert {src.name}: {r.stderr[-300:]}")
+        return
+    from PIL import Image, ImageSequence
+    with Image.open(src) as im:
+        frames = [f.convert("RGB") for f in ImageSequence.Iterator(im)]
+        dur = im.info.get("duration")
+    if len(frames) < 2:
+        raise RuntimeError(f"{src.name} is a still image, not a video")
+    if dur:
+        fps = 1000.0 / float(dur)
+    w, h = frames[0].size
+    p = subprocess.Popen([L.FFMPEG, "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
+                          "-r", f"{fps:.3f}", "-i", "-", "-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p",
+                          "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", str(dest)],
+                         stdin=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=NOWIN)
+    for f in frames:
+        p.stdin.write(f.tobytes())
+    p.stdin.close()
+    if p.wait(600) != 0:
+        raise RuntimeError(f"could not convert {src.name}: {p.stderr.read()[-300:]!r}")
 
 
 def _kill_tree(pid: int) -> None:

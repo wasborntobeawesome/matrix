@@ -9,7 +9,8 @@ captions, `.srt`/`.vtt` subtitles and a cover image per video. The look comes fr
 [`../templates/TEMPLATES.md`](../templates/TEMPLATES.md)). The editor has undo/redo, a version history, a
 follow-up message for the source AI, and an English / Uzbek interface. A live system monitor (header widget +
 monitor page) shows GPU, VRAM by owner, CPU and RAM; optional local AI layers (b-roll from three video generators,
-image-to-video, a talking-head presenter, AI music) run in warm model workers. Everything is free/open source: FastAPI,
+image-to-video, a talking-head presenter, AI music) run in warm model workers, and any ComfyUI workflow can be a
+video generator through a managed local ComfyUI (HTTP API only). Everything is free/open source: FastAPI,
 Playwright Chromium, FFmpeg, faster-whisper, numpy, NVML/psutil and plain HTML/JS.
 
 ## Run
@@ -87,7 +88,9 @@ video/
     inbox.py            shared-folder watcher
     aijobs.py           GPU job queue for the AI layers (b-roll, portrait, presenter, music) — runs them in warm workers
     workers.py          warm AI model workers (one video/ai/worker.py per model family): RAM budget, idle timeout, release
-    providers.py        b-roll video generators (wan22-5b, fastwan-5b, wan22-a14b): licences, presets, estimates
+    providers.py        b-roll video generators (wan22-5b, fastwan-5b, wan22-a14b, comfy:<workflow>): licences, presets, estimates
+    comfy.py            ComfyUI: managed server (start/stop/adopt, flags, log), HTTP + WebSocket client, /free, cancel
+    comfyflows.py       ComfyUI workflow library: API-format parsing, mapping auto-detection, /object_info validation, fill
     sysmon.py           1 Hz system sampler (NVML + psutil + PDH per-process GPU counters), 30-min history, stage markers
     gpu.py              VRAM status for the AI queue (reads the sampler; nvidia-smi + PowerShell fallback)
     library.py          shared b-roll + portrait library (video/library/)
@@ -106,6 +109,8 @@ video/
   library/              (gitignored) broll/<id>/, portraits/<id>/, music/<id>/, align/<hash>.json,
                         ai-jobs.json, ai-timings.json
   ai/                   local generative-AI scripts + their own venv (see ai/README.md)
+  comfyui/              setup.py (tracked) + the local ComfyUI install, venv, models, logs (gitignored)
+  comfy-workflows/<id>/ workflow_api.json + manifest.json + preview.jpg per ComfyUI workflow; README.md (guide)
 ```
 
 - **Voice cache.** Each line's clip is `build/voice/<sha1(text, model, voice, rate, language, style)>.wav`
@@ -555,6 +560,150 @@ AI-queue job (`generate`).
 - **Old projects:** every existing brief normalises exactly as with the committed code; `nimbo-ade8` (uz
   9:16) rendered again: 39.36 s, PSNR 56.9 dB against its earlier render (encoder noise). The renderer and
   `build.py` are unchanged.
+
+## ComfyUI provider (v2 phase 4)
+
+Any ComfyUI workflow can be a b-roll video generator. The Studio runs a local ComfyUI (or uses one you
+already run) and talks to it **only over its HTTP / WebSocket API** — ComfyUI is GPL-3.0 and is never
+imported, linked or shipped; it is a separate program in `video/comfyui/`. Full guide (building, exporting,
+mapping, custom-node risks, licences, troubleshooting): [`../comfy-workflows/README.md`](../comfy-workflows/README.md).
+
+### Install
+`py -3.12 video/comfyui/setup.py` — clones ComfyUI at the pinned tag **v0.45.3** into `video/comfyui/ComfyUI`
+(core nodes only, no Manager), makes `video/comfyui/.venv` (Python 3.12, **torch 2.8.0 + CUDA 12.8**, works on
+the RTX 5070 Ti / sm_120), installs ComfyUI's requirements (the web UI's template *JSON* only; `--templates full`
+adds ~670 MB of template preview media) and downloads the models of both samples into `video/comfyui/models/`
+(outside the checkout; `extra_model_paths.yaml` points ComfyUI there). Downloads resume and are checked
+against Hugging Face's SHA-256. Re-running it is a no-op (8 s). Only `setup.py`, `extra_model_paths.yaml` and a
+README are tracked by git; the install is ignored.
+
+| Downloaded (Comfy-Org/Wan_2.2_ComfyUI_Repackaged, Apache-2.0) | Size |
+|---|---|
+| `wan2.2_ti2v_5B_fp16` (draft sample) | 10.0 GB |
+| `wan2.2_t2v_high_noise_14B_fp8_scaled` + `…low_noise…` (quality sample) | 2 × 14.3 GB |
+| `umt5_xxl_fp8_e4m3fn_scaled` (both) | 6.7 GB |
+| `wan2.2_vae` / `wan_2.1_vae` | 1.4 / 0.25 GB |
+| **total downloaded** | **47.0 GB** (≈ 20 min at 25–30 MB/s, two streams) |
+| `wan2.2_t2v_lightx2v_4steps_lora_v1.1_{high,low}_noise` | 2 × 1.2 GB — **hard-linked**, byte-identical (SHA-256) to the LightX2V LoRAs the A14B worker already has |
+
+The diffusers folders in `video/ai/.models` can't be shared otherwise (ComfyUI loads single-file checkpoints).
+
+### Managed server
+- AI page → **ComfyUI**: state (running / busy / starting / stopped / error / external), URL, version, queue
+  (running + waiting), VRAM it holds, last `/free`, **Start / Stop / Free GPU memory / Open ComfyUI**, settings,
+  log tail (`video/comfyui/comfyui.log`). The header has a **ComfyUI** pill (state + queue length).
+- Command: `main.py --listen 127.0.0.1 --port 8188 --extra-model-paths-config … --output/input/temp/user-directory
+  video/comfyui/… --disable-auto-launch --preview-method none --disable-partner-nodes --reserve-vram 1.0
+  --disable-all-custom-nodes`. Output goes to the log file (not a pipe), so ComfyUI survives a studio restart
+  and the next studio process **adopts** it. Stop kills its process tree.
+- **Flags measured** (Wan 2.2 14B fp8 + LightX2V, 480×832×81): ComfyUI v0.45's default **dynamic VRAM**
+  (comfy-aimdo) streams the 14.3 GB experts through 16 GB without trouble: **89 s** cold, peak 11.6 GB
+  VRAM, ~32 GB RAM. With `--disable-dynamic-vram` (the old estimate-based loading) the same job loaded the
+  high-noise expert *partially* (7.7 GB on the GPU, 5.9 GB offloaded, lowvram patches) and had not finished
+  step 1 after 10 minutes → cancelled. `--lowvram` / `--normalvram` do nothing while dynamic VRAM is on, so
+  the default is **auto + `--reserve-vram 1`** (headroom for the desktop / Ovoz). VRAM mode, reserve, custom
+  nodes and extra flags are settings (`library/comfy-settings.json`).
+- **External mode**: give the URL of a ComfyUI you run yourself; the Studio never starts/stops it, the monitor
+  attributes the process that listens on that (local) port.
+
+### Workflows = providers
+- `video/comfy-workflows/<id>/` = `workflow_api.json` (Export (API) format) + `manifest.json` (name, licence,
+  commercial, notes, capabilities t2v / i2v / image / upscale / interpolate, **input mapping** node + input for
+  prompt, negative, seed, width, height, length, fps, steps, image; output nodes; draft/final sizes; estimated
+  time and VRAM) + `preview.jpg`. Each is the provider **`comfy:<id>`** everywhere a provider can be chosen (AI
+  page form, editor scene background, project default, `background.provider` / `broll_provider` in briefs).
+- **Upload** (AI page → *ComfyUI workflows* → *Upload a workflow*): the mapping is auto-detected (prompt /
+  negative by following the samplers' positive/negative links back to the text encoders, through
+  pass-through nodes; seed, steps, sizes, length, fps, input image, outputs; values driven by `Primitive*`
+  nodes are mapped to the primitive) and shown before saving, with what could not be mapped; then a small
+  **mapping editor** (node + input per value, several targets per value, outputs, capabilities, sizes,
+  licence). Every workflow is **validated against the running ComfyUI's `/object_info`**: missing node types
+  (custom nodes), missing model files (with the folder they belong in), mapping errors. **Custom nodes are
+  never installed**; the UI warns that they are third-party code with full access to the PC.
+- Samples (core nodes only, Apache-2.0 models): `wan22-5b-draft` (Wan 2.2 TI2V-5B, 20 steps; text **and** image
+  to video — the `LoadImage` is dropped for text-to-video) and `wan22-14b-lightx2v` (Wan 2.2 T2V-A14B fp8 high +
+  low noise, LightX2V 4-step LoRA, 2 + 2 steps).
+
+### A ComfyUI job
+In the one-at-a-time AI GPU queue like every other AI job: warm workers release their GPU memory → ComfyUI is
+auto-started if needed → validation → image upload (`/upload/image`) for image-to-video → mapped inputs filled,
+output prefix `studio/<job id>` → `POST /prompt` → progress from the WebSocket (loading → step x/y with ETA →
+decoding → encoding; `/history` polling as fallback) → result via `/view` → H.264 + VP9 WebM + thumbnail in the
+b-roll library with metadata (workflow id + graph hash, filled inputs, seed, prompt id, models, licence,
+timings, peak ComfyUI VRAM). **Cancel** = `POST /queue {"delete"}` + `POST /interrupt {"prompt_id"}` (measured:
+stopped 4.5 s after the click, ComfyUI queue empty). Library ids include the graph hash.
+
+### GPU coordination
+- Before the **voice stage** of Make video and before **any other AI worker job**, the Studio sends ComfyUI
+  `POST /free {"unload_models": true, "free_memory": true}` and waits until the monitor shows its VRAM dropped;
+  after a Make-video AI stage that ran ComfyUI jobs it frees it again. A ComfyUI job's VRAM gate counts what
+  ComfyUI already holds as available.
+- **Measured** `/free` (monitor counters, ComfyUI process / whole GPU): manual after jobs **3.6 → 0.36 GB**,
+  GPU 5.8 → 2.3 GB in 1.4 s; before a FastWan worker job **5.8 → 0.4 GB** (GPU 8.2 → 2.6 GB, 0.8 s); after the
+  Make-video AI stage **6.4 → 0.4 GB** and **5.6 → 0.4 GB** (GPU 8.7 → 2.6 / 8.0 → 2.6 GB, 0.9 s). What stays is
+  ComfyUI's CUDA context (~0.37 GB).
+- **Monitor**: new owner **ComfyUI** (pink, `#c75bb5`, validated with the dataviz palette script against the
+  other owners on the dark surface — all pairs pass) in the VRAM and RAM charts, tiles, header tooltip and the
+  process table (`python.exe ComfyUI`, owner COMFYUI). Sample keys `vc` (VRAM MB) and `rc` (RAM GB).
+
+### Timings (RTX 5070 Ti 16 GB, 128 GB RAM, ComfyUI v0.45.3, same prompt, nothing else on the GPU)
+
+| Workflow · preset | Size | Job time | Denoise | Peak VRAM (ComfyUI) | RAM | Compare (diffusers workers, phase 3) |
+|---|---|---|---|---|---|---|
+| `comfy:wan22-5b-draft` · draft (t2v) | 480×832×81 @24 | **68 s** | 54.7 s (2.7 s/step) | 13.1 GB | 4 GB | wan22-5b draft 115–129 s |
+| `comfy:wan22-5b-draft` · draft (**i2v**, portrait) | 480×832×81 | **68 s** | 55.2 s | 12.6 GB | 4 GB | |
+| `comfy:wan22-5b-draft` · final | 704×1280×121 @24 | 295 s | 261 s | 12.2 GB | 14 GB | |
+| `comfy:wan22-14b-lightx2v` · draft | 480×832×81 @16 | **89 s** | 80.2 s | 11.6 GB | 25 GB | wan22-a14b draft 165 s warm / 257 s cold |
+| `comfy:wan22-14b-lightx2v` · final | 720×1280×81 @16 | 298 s | 280 s | 12.4 GB | 32 GB | |
+| uploaded template (Wan 2.2 14B T2V, Lightning on) | 640×640×81 | 93 s | 82.7 s | 10.8 GB | 24 GB | |
+
+Frames: `preview/v2-phase4-compare-same-prompt.png` (top 5B draft — dark bokeh; bottom 14B — sharp, detailed
+ribbons, though orange instead of teal), `v2-phase4-frames-draft-i2v.png` (the library portrait smiles and
+nods; the face drifts a little by the end), `…-draft-wf-final-preset.png`, `…-quality-final-preset.png`,
+`…-uploaded-workflow.png`. The 5B at 480×832 stays the "fast draft" (as in phase 3, the 5B is weak at low
+resolution); the 14B LightX2V sample is faster in ComfyUI than the diffusers worker.
+
+### API (v2 phase 4)
+
+| Method & path | What it does |
+|---|---|
+| `GET /api/comfy/status` | state, reachable, busy, queue, version, devices, VRAM held, last /free, settings, log tail |
+| `POST /api/comfy/start` · `/stop` · `/free` | start / stop the managed server; `/free` with VRAM before/after |
+| `PUT /api/comfy/settings` | `{mode, url, port, autostart, vram_mode, reserve_vram_gb, custom_nodes, extra_args}` |
+| `GET /api/comfy/workflows` | library + validation against `/object_info` |
+| `GET /api/comfy/workflows/{id}` | manifest, validation, node list, graph, detected mapping |
+| `POST /api/comfy/workflows/detect` | dry run of an upload: detected mapping + validation |
+| `POST /api/comfy/workflows` | upload (multipart: JSON + name, licence, commercial, notes, preview image) |
+| `PUT /api/comfy/workflows/{id}` · `DELETE …` · `POST …/validate` · `GET …/workflow_api.json` · `GET …/preview` | edit mapping/manifest, delete (not the samples), re-check, download, preview |
+| `POST /api/ai/broll` | `provider: "comfy:<id>"` (+ `image` for i2v workflows) |
+
+### Verified (2026-11-15, test server on :8013, API + Playwright)
+- **Fresh setup** by `setup.py` (code + venv 191 s once the downloads had finished, models 47 GB, LoRAs
+  hard-linked), re-run = no-op; ComfyUI started **from the Studio** (ready in 6–14 s), adopted after studio restarts.
+- Both samples end to end as Studio jobs with the same prompt, plus image-to-video and both final presets
+  (table above), frames inspected. **Cancel** during a running 14B final job: cancelled in 4.5 s, ComfyUI queue
+  empty; a job stuck loading (dynamic VRAM off) cancelled in ~10 s.
+- **Upload through the UI**: ComfyUI's own template `video_wan2_2_14B_t2v` (a subgraph with primitives,
+  switches and a math expression) loaded in ComfyUI's web UI and exported in API format, then uploaded on the
+  AI page — prompt, negative, both seeds, width/height and fps (from a `PrimitiveFloat`) auto-detected,
+  steps/length reported as not mappable; validated OK; ran as a job (93 s; with the ribbon prompt this graph
+  drew ribbons over a face, with "a red vintage sports car … coastal road at sunset" exactly that —
+  `v2-phase4-frames-uploaded-workflow-car.png`; the test upload was deleted again afterwards — same models as the quality sample)
+  (`v2-phase4-upload-detected.png`, `…-mapping-editor.png`, `…-workflows.png`). A graph with `VHS_VideoCombine`
+  and an unknown LoRA reports *Missing nodes: VHS_VideoCombine* and *Missing model files:
+  some_style_lora.safetensors → models/loras* (`…-upload-missing-nodes.png`).
+- **Make video** on `nimbo-c2de` (2 scenes, uz, local Ovoz voice `navoiy`, hook background
+  `comfy:wan22-5b-draft`): ① voice (ComfyUI `/free` first) 17 s → ② Ovoz unload 2.9 → 0.0 GB → ③ ComfyUI clip
+  66 s, then `/free` 5.6 → 0.4 GB → ④ render 14 s; 105 s total (`v2-phase4-monitor-make-comfy.png`,
+  `…-monitor-vram-comfy-ai-stage.png`: ComfyUI 11.8 GB during ③, Ovoz 0; `…-make-render-frames.png`).
+- **Coordination**: a FastWan job after a ComfyUI job → `/free` 5.8 → 0.4 GB first; a ComfyUI job after a warm
+  FastWan worker → `released_workers: ["wan"]`.
+- **Old features**: FastWan provider job (60 s), every existing brief normalises exactly as with the committed
+  code, the old providers keep their library ids. UI EN + OʻZ (key parity checked), 1600 px and 420 px, no
+  console errors, no horizontal overflow (`v2-phase4-ai-*`, `v2-phase4-editor-scene.png`).
+- Known: the header pill is hidden below 600 px; a workflow whose length comes from a math node keeps its own
+  length (the Studio's frame count is a label only); ComfyUI's dynamic VRAM decides how much it keeps after a
+  job (3–6 GB) until the next `/free`.
 
 ## "Make video" (one button, voice first, then video)
 

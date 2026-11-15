@@ -1,0 +1,124 @@
+{
+ "id": "wan22-14b-lightx2v",
+ "name": "ComfyUI · Wan 2.2 14B + LightX2V (quality)",
+ "licence": "Apache-2.0",
+ "commercial": true,
+ "licence_note": "Wan2.2-T2V-A14B high/low-noise experts (Wan-AI, fp8_scaled repackage by Comfy-Org), the LightX2V Wan2.2-Lightning 4-step LoRA v1.1 (lightx2v), UMT5-XXL and the Wan2.1 VAE: all Apache-2.0.",
+ "notes": "Two 14B experts in fp8 with the 4-step LightX2V distillation LoRA: KSamplerAdvanced high noise (steps 0-2) then low noise (steps 2-4), cfg 1, euler. 16 fps. Steps are not mapped (the 2-stage split is part of the graph). Core nodes only. The negative prompt is Wan's own default (Chinese); a Studio job only replaces it when you type one.",
+ "capabilities": [
+  "t2v"
+ ],
+ "inputs": {
+  "prompt": [
+   {
+    "node": "6",
+    "input": "text"
+   }
+  ],
+  "negative": [
+   {
+    "node": "7",
+    "input": "text"
+   }
+  ],
+  "seed": [
+   {
+    "node": "57",
+    "input": "noise_seed"
+   },
+   {
+    "node": "58",
+    "input": "noise_seed"
+   }
+  ],
+  "width": [
+   {
+    "node": "59",
+    "input": "width"
+   }
+  ],
+  "height": [
+   {
+    "node": "59",
+    "input": "height"
+   }
+  ],
+  "length": [
+   {
+    "node": "59",
+    "input": "length"
+   }
+  ],
+  "fps": [
+   {
+    "node": "60",
+    "input": "fps"
+   }
+  ]
+ },
+ "outputs": [
+  "61"
+ ],
+ "presets": {
+  "draft": {
+   "width": 480,
+   "height": 832,
+   "length": 81,
+   "fps": 16.0
+  },
+  "final": {
+   "width": 720,
+   "height": 1280,
+   "length": 81,
+   "fps": 16.0
+  }
+ },
+ "estimate": {
+  "draft": {
+   "seconds": 90,
+   "vram_gb": 11.6
+  },
+  "final": {
+   "seconds": 300,
+   "vram_gb": 12.4
+  }
+ },
+ "min_vram_gb": 8.0,
+ "ram_gb": 32.0,
+ "speed": "slow",
+ "models": [
+  {
+   "file": "wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors",
+   "folder": "diffusion_models",
+   "gb": 14.29
+  },
+  {
+   "file": "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors",
+   "folder": "diffusion_models",
+   "gb": 14.29
+  },
+  {
+   "file": "wan2.2_t2v_lightx2v_4steps_lora_v1.1_high_noise.safetensors",
+   "folder": "loras",
+   "gb": 1.23
+  },
+  {
+   "file": "wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors",
+   "folder": "loras",
+   "gb": 1.23
+  },
+  {
+   "file": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+   "folder": "text_encoders",
+   "gb": 6.74
+  },
+  {
+   "file": "wan_2.1_vae.safetensors",
+   "folder": "vae",
+   "gb": 0.25
+  }
+ ],
+ "source": "builtin",
+ "created": 1794741963.5788364,
+ "estimate_note": "Measured on the RTX 5070 Ti (16 GB) with ComfyUI v0.45.3, cold models, nothing else on the GPU; vram_gb = peak VRAM of the ComfyUI process (dynamic VRAM uses what is free)."
+}

@@ -12,7 +12,7 @@
   const api = (...a) => U().api(...a);
 
   // owner colours (validated for the dark surface: lightness band, chroma, CVD separation); "other" is a neutral
-  const C = { ovoz: "#b87d15", ai: "#8b6cff", studio: "#1aa883", other: "#5a6488", line: "#8b6cff", limit: "#8b94b2",
+  const C = { ovoz: "#b87d15", ai: "#8b6cff", studio: "#1aa883", comfy: "#c75bb5", other: "#5a6488", line: "#8b6cff", limit: "#8b94b2",
     grid: "rgba(139,148,178,.14)", axis: "#8b94b2", text: "#e8ecf8", surface: "#121725" };
   const MARK = { "stage-voice": "rgba(184,125,21,.16)", "stage-unload": "rgba(139,148,178,.16)", "stage-ai": "rgba(139,108,255,.16)",
     "stage-render": "rgba(26,168,131,.16)", render: "rgba(26,168,131,.10)", voice: "rgba(184,125,21,.10)" };
@@ -48,7 +48,7 @@
     if (s.vt) {
       parts.push(item("sm-gpu", "GPU", `${s.gu}%`, lvl(s.gu, 60, 90), t("mon.tipGpu")));
       parts.push(item("sm-vram", "VRAM", `${gb(s.vu)}/${gb(s.vt)}`, lvl(s.vu / s.vt * 100, 75, 92), t("mon.tipVram",
-        { o: gb(s.vo || 0), a: gb(s.va || 0), s: gb(s.vs || 0) })));
+        { o: gb(s.vo || 0), a: gb(s.va || 0), s: gb(s.vs || 0), c: gb(s.vc || 0) })));
       parts.push(item("sm-temp", "", `${s.tc}° ${Math.round(s.pw)}W`, lvl(s.tc, 70, 82), t("mon.tipTemp")));
     }
     parts.push(item("sm-cpu", "CPU", `${Math.round(s.cpu)}%`, lvl(s.cpu, 60, 90), t("mon.tipCpu")));
@@ -200,14 +200,16 @@
     const vramSeries = [
       { key: "vo", label: t("mon.ownOvoz"), color: C.ovoz, get: s => s.vo },
       { key: "va", label: t("mon.ownAi"), color: C.ai, get: s => s.va },
+      { key: "vc", label: t("mon.ownComfy"), color: C.comfy, get: s => s.vc || 0 },
       { key: "vs", label: t("mon.ownStudio"), color: C.studio, get: s => s.vs },
-      { key: "vx", label: t("mon.ownOther"), color: C.other, get: s => (s.vu == null ? null : Math.max(0, s.vu - (s.vo || 0) - (s.va || 0) - (s.vs || 0))) }];
+      { key: "vx", label: t("mon.ownOther"), color: C.other, get: s => (s.vu == null ? null : Math.max(0, s.vu - (s.vo || 0) - (s.va || 0) - (s.vs || 0) - (s.vc || 0))) }];
     const ramSeries = [
       { key: "rw", label: t("mon.ramWarm"), color: C.ai, get: s => s.rw || 0 },
       { key: "ra", label: t("mon.ramAiOther"), color: "#5b46b8", get: s => Math.max(0, (s.ra || 0) - (s.rw || 0)) },
+      { key: "rc", label: t("mon.ownComfy"), color: C.comfy, get: s => s.rc || 0 },
       { key: "ro", label: t("mon.ownOvoz"), color: C.ovoz, get: s => s.ro || 0 },
       { key: "rs", label: t("mon.ownStudio"), color: C.studio, get: s => s.rs || 0 },
-      { key: "rx", label: t("mon.ownOther"), color: C.other, get: s => Math.max(0, s.ru - (s.ra || 0) - (s.ro || 0) - (s.rs || 0)) }];
+      { key: "rx", label: t("mon.ownOther"), color: C.other, get: s => Math.max(0, s.ru - (s.ra || 0) - (s.ro || 0) - (s.rs || 0) - (s.rc || 0)) }];
     const charts = [
       new Chart({ title: t("mon.gpuUtil"), series: [{ label: "GPU", color: C.line, get: s => s.gu }], max: 100, fmt: v => `${v}%`,
         fmtTip: v => `${v}%`, now: s => (s.gu == null ? "" : `${s.gu}%`), onHover }),
@@ -250,10 +252,10 @@
       if (!s) return;
       nowBox.replaceChildren(
         tile("GPU", s.gu == null ? "–" : `${s.gu}%`, info.gpu || ""),
-        tile("VRAM", s.vt ? `${mb(s.vu)} / ${mb(s.vt)}` : "–", s.vt ? `Ovoz ${mb(s.vo)} · AI ${mb(s.va)} · ${t("mon.ownStudio")} ${mb(s.vs)}` : ""),
+        tile("VRAM", s.vt ? `${mb(s.vu)} / ${mb(s.vt)}` : "–", s.vt ? `Ovoz ${mb(s.vo)} · AI ${mb(s.va)} · ComfyUI ${mb(s.vc || 0)} · ${t("mon.ownStudio")} ${mb(s.vs)}` : ""),
         tile(t("mon.tempShort"), s.tc == null ? "–" : `${s.tc} °C`, s.pw == null ? "" : `${Math.round(s.pw)} W / ${info.power_limit_w || "?"} W`),
         tile("CPU", `${Math.round(s.cpu)}%`, info.cpu ? `${info.cpu} · ${info.cpu_threads} ${t("mon.threads")}` : ""),
-        tile("RAM", `${s.ru.toFixed(1)} / ${Math.round(s.rt)} GB`, `${t("mon.ramWarm")} ${(s.rw || 0).toFixed(1)} GB`));
+        tile("RAM", `${s.ru.toFixed(1)} / ${Math.round(s.rt)} GB`, `${t("mon.ramWarm")} ${(s.rw || 0).toFixed(1)} GB` + (s.rc ? ` · ComfyUI ${s.rc.toFixed(1)} GB` : "")));
       const open = markers.filter(m => !m.t1);
       actBox.replaceChildren(el("b", {}, t("mon.now") + ": "), ...(open.length ? open.map(m => el("span", { class: `mon-chip ${m.cat}` }, m.label)) : [el("span", { class: "muted" }, t("mon.idle"))]));
     }

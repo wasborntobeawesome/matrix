@@ -184,12 +184,18 @@ generates and approves.
 "background": { "type": "broll", "prompt": "slow drifting violet light ribbons on dark navy, soft bokeh", "dim": 0.55, "blur": 0 }
 "background": { "type": "broll", "clip": "b-a328a9b1a9", "dim": 0.55, "blur": 4 }   // a clip id from the studio library
 "background": { "type": "broll", "prompt": "...", "provider": "wan22-a14b" }     // which video generator (optional)
+"background": { "type": "broll", "prompt": "...", "provider": "comfy:wan22-5b-draft" }  // a ComfyUI workflow of the studio
 "background": { "type": "broll", "image": "hero.png", "prompt": "slow push-in, light flickers" }  // animate this image
 ```
 
 - `provider` (optional): `wan22-5b` (the original model), `fastwan-5b` (fast drafts) or `wan22-a14b`
   (best quality, slower). Default: the project's top-level `"broll_provider"`, else `wan22-5b`. All are
   local and free for commercial use.
+- `provider: "comfy:<workflow id>"` runs a ComfyUI workflow installed in the studio
+  (`video/comfy-workflows/<id>/`; the AI page lists them). Samples: `comfy:wan22-5b-draft` (fast drafts,
+  text or image to video) and `comfy:wan22-14b-lightx2v` (quality, text to video). The studio runs it on its
+  local ComfyUI; a workflow id that is not installed is kept with a warning and "Make video" uses the
+  default generator instead. A source AI should only use a `comfy:` id the studio user asked for.
 - `image` (optional): an uploaded image asset (a still background, a product photo, a portrait) that the
   clip starts from (image-to-video); `prompt` then describes the motion. Leave it out for text-to-video.
 
@@ -286,7 +292,7 @@ Fields:
   optional per scene: pad (seconds of silence after the line, default 0.4), duration (minimum seconds),
     background {type: "broll", prompt, dim?, blur?, provider?, image?}   (AI b-roll suggestion; default = brand gradient)
   optional top level: music {mood} or music {generate: {prompt, genre?, mood?, bpm?}},
-    broll_provider ("wan22-5b" | "fastwan-5b" | "wan22-a14b"; leave out if unsure),
+    broll_provider ("wan22-5b" | "fastwan-5b" | "wan22-a14b" | "comfy:<workflow id>"; leave out if unsure),
     presenter {enabled, mode: "corner"|"full", scenes: "all"|[ids], portrait_prompt},
     template ("aurora" | "clean" | "bold"; the studio user usually picks it — leave out if unsure)
 

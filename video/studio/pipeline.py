@@ -1,7 +1,8 @@
 """"Make video": one button / one API call from brief to MP4, each step with the whole GPU.
 
 Stages, strictly in order, one pipeline at a time:
-  1. voice   the warm AI workers first give back their GPU memory (weights stay in RAM), then every
+  1. voice   the warm AI workers first give back their GPU memory (weights stay in RAM) and ComfyUI unloads
+             its models (POST /free, when it is running), then every
              missing/changed voice-over line is generated (Ovoz may use the whole GPU; no AI GPU job may
              start meanwhile)
   2. unload  POST {OVOZ}/api/unload, then confirm with the GPU counters that Ovoz's VRAM dropped
@@ -9,8 +10,10 @@ Stages, strictly in order, one pipeline at a time:
   3. ai      every AI job the project still needs: generated music (music.generate without a track),
              a presenter portrait (from portrait_prompt), b-roll for scenes that ask for one (each with
              its provider: background.provider or the project's broll_provider), the presenter video;
-             quality = the pipeline's (default "final"). Jobs run one after another in the warm workers.
-             The studio's own voice requests wait during this stage.
+             quality = the pipeline's (default "final"). Jobs run one after another in the warm workers
+             or, for `comfy:<workflow>` providers, in ComfyUI (the AI queue frees ComfyUI's VRAM before a
+             worker job and the workers' VRAM before a ComfyUI job). After the stage ComfyUI frees its
+             memory again. The studio's own voice requests wait during this stage.
   4. render  the MP4 (the normal render queue)
 
 Pipelines are stored in library/pipelines.json. A failed or cancelled pipeline can be retried:
@@ -265,9 +268,15 @@ class Pipelines:
         self._save(force=True)
         before = self.ai.monitor.refresh()
         released = self.ai.pool.release_gpu()
-        after = self.ai.monitor.refresh() if released else before
+        comfy_free = None
+        if self.ai.comfy.reachable(1.5):            # ComfyUI unloads its models too (POST /free)
+            st["message"] = "ComfyUI: unloading its models (POST /free)…"
+            self._save(force=True)
+            comfy_free = self.ai.comfy.free(why="before the voice-over")
+        after = self.ai.monitor.refresh() if released or comfy_free else before
         st["detail"]["released"] = {"workers": released, "ai_mb_before": before.get("ai_mb"),
-                                    "ai_mb_after": after.get("ai_mb"), "warm_ram_gb": self.ai.pool.view()["ram_gb"]}
+                                    "ai_mb_after": after.get("ai_mb"), "warm_ram_gb": self.ai.pool.view()["ram_gb"],
+                                    "comfy": comfy_free}
         brief = p.brief
         langs = build.langs_of(brief)
         todo = build.todo_lines(p)
@@ -408,6 +417,9 @@ class Pipelines:
                 self._notice(it, f"scene '{s['id']}': clip {bg['clip']} is missing and there is no prompt — brand gradient")
                 continue
             provider = bg.get("provider") or brief.get("broll_provider") or P.DEFAULT
+            if not P.exists(provider):
+                self._notice(it, f"scene '{s['id']}': video generator '{provider}' is not installed — using {P.DEFAULT}")
+                provider = P.DEFAULT
             orient = "landscape" if fmt == "16:9" else "portrait"
             img = None
             if bg.get("image"):
@@ -439,6 +451,10 @@ class Pipelines:
                                           label=f"{brief.get('title')} · {q}", units=pl["missing_seconds"], preset=q)["id"])
         if ids:
             jobs_done += self._wait_jobs(it, st, ids, base)
+        if any(P.is_comfy(j.get("provider")) for j in jobs_done) and self.ai.comfy.reachable(1.5):
+            st["message"] = "ComfyUI: freeing its GPU memory after the AI stage…"
+            self._save(force=True)
+            st["detail"]["comfy_free"] = self.ai.comfy.free(why="after the AI stage")
         st["detail"]["jobs"] = [{"id": j["id"], "kind": j["kind"], "status": j["status"], "elapsed": j.get("elapsed"),
                                  "result": j.get("result")} for j in jobs_done]
         st["message"] = (f"{len(jobs_done)} AI job(s) done" if jobs_done else "nothing to generate — everything is cached")
