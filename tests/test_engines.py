@@ -32,3 +32,29 @@ def test_navoiy_listed_as_commercial():
     models = {m["id"]: m for m in TestClient(app).get("/api/models").json()}
     assert models["navoiy"]["license"] == "Apache-2.0"
     assert models["navoiy"]["commercial"] is True
+
+
+def test_unload_frees_loaded_local_models():
+    from fastapi.testclient import TestClient
+
+    import engines
+    from app import app
+
+    engine = engines.get("mms")
+    engine.model = object()  # pretend it is loaded; no GPU needed
+    try:
+        res = TestClient(app, base_url="http://localhost").post("/api/unload")
+        assert res.status_code == 200
+        assert "mms" in res.json()["unloaded"]
+        assert not engine.loaded
+    finally:
+        engine.model = None
+
+
+def test_unload_rejects_other_websites():
+    from fastapi.testclient import TestClient
+
+    from app import app
+
+    res = TestClient(app, base_url="http://localhost").post("/api/unload", headers={"Origin": "https://evil.example"})
+    assert res.status_code == 403

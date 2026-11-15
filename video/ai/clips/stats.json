@@ -1,0 +1,50 @@
+[
+  {
+    "name": "waves",
+    "prompt": "Abstract glowing sound waves flowing smoothly through dark space, luminous ribbons of purple and teal light undulating like an audio waveform, soft particles and bokeh, deep navy black background, cinematic, elegant motion graphics, high detail, slow camera drift",
+    "seed": 42,
+    "steps": 30,
+    "guidance": 5.0,
+    "size": "704x1280",
+    "frames": 121,
+    "fps": 24,
+    "offload": "group",
+    "gen_seconds": 1402.3,
+    "load_seconds": 6.6,
+    "peak_vram_allocated_gb": 8.65,
+    "peak_vram_reserved_gb": 10.98,
+    "torch": "2.8.0+cu128"
+  },
+  {
+    "name": "phone",
+    "prompt": "A modern smartphone lying on a dark wooden desk at night, its screen shows a bright glowing purple and teal audio waveform animating, soft reflections, shallow depth of field, moody cinematic lighting, slow dolly-in camera movement, photorealistic",
+    "seed": 42,
+    "steps": 30,
+    "guidance": 5.0,
+    "size": "704x1280",
+    "frames": 121,
+    "fps": 24,
+    "offload": "group",
+    "gen_seconds": 1386.5,
+    "load_seconds": 6.6,
+    "peak_vram_allocated_gb": 8.65,
+    "peak_vram_reserved_gb": 10.98,
+    "torch": "2.8.0+cu128"
+  },
+  {
+    "name": "mic",
+    "prompt": "Close-up of a professional studio microphone with a pop filter in a dark recording studio, soft purple and teal bokeh lights in the background, gentle haze, cinematic lighting, slow orbiting camera, photorealistic, shallow depth of field",
+    "seed": 42,
+    "steps": 30,
+    "guidance": 5.0,
+    "size": "704x1280",
+    "frames": 121,
+    "fps": 24,
+    "offload": "group",
+    "gen_seconds": 1385.5,
+    "load_seconds": 6.6,
+    "peak_vram_allocated_gb": 8.65,
+    "peak_vram_reserved_gb": 10.98,
+    "torch": "2.8.0+cu128"
+  }
+]

@@ -1,0 +1,68 @@
+# One promo video, described once. Every renderer under video/ reads the
+# timeline.json that make_shared.py builds from this file, so all options
+# render the same scenes, voice-over and captions and can be compared fairly.
+#
+# Content: the real "Ovoz" release (commit 263176d).
+
+title: Ovoz yangilandi
+language: uz
+width: 1080
+height: 1920          # 9:16 for Reels / Stories / Shorts
+fps: 30
+
+voice:
+  api: http://localhost:8000     # the running Ovoz app
+  model: edge                    # any Ovoz model id, e.g. navoiy, omnivoice
+  voice: uz-UZ-MadinaNeural
+  rate: 0
+
+brand:
+  name: Ovoz
+  background: "#0B1020"
+  surface: "#151B30"
+  primary: "#7C5CFF"
+  accent: "#22D3A6"
+  text: "#F5F7FF"
+  muted: "#9AA3C0"
+  font: "Inter"
+
+# Each scene: the voice-over line plus what appears on screen.
+#   layout: hero | chips | stat | list | cta
+#   pad: seconds of silence after the voice-over line
+scenes:
+  - id: hook
+    layout: hero
+    say: "Ovoz yangilandi! Matnni bir zumda jonli ovozga aylantiring."
+    kicker: "YANGILANISH"
+    headline: "Ovoz yangilandi"
+    sub: "Matn → jonli ovoz, bir zumda"
+    pad: 0.4
+
+  - id: languages
+    layout: chips
+    say: "Endi to'rt tilda gapiradi: o'zbek, rus, ingliz va arab tillarida."
+    headline: "4 til"
+    items: ["Oʻzbekcha", "Русский", "English", "العربية"]
+    pad: 0.4
+
+  - id: models
+    layout: stat
+    say: "To'qqizta ovoz modeli, jumladan kompyuteringizda bepul ishlaydigan modellar."
+    stat: "9"
+    headline: "ovoz modeli"
+    sub: "Bepul lokal modellar — GPU’da ishlaydi"
+    pad: 0.4
+
+  - id: emotions
+    layout: list
+    say: "Navoiy modeli bilan o'nta his-tuyg'u: quvonch, hayrat, sokinlik va boshqalar."
+    headline: "10 ta his-tuyg‘u"
+    items: ["😊 Quvonch", "😮 Hayrat", "😌 Sokinlik", "🎙️ Va boshqalar"]
+    pad: 0.4
+
+  - id: cta
+    layout: cta
+    say: "Hoziroq sinab ko'ring!"
+    headline: "Hoziroq sinab ko‘ring"
+    sub: "Ovoz — oʻzbek tilida birinchi"
+    pad: 1.0

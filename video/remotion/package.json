@@ -1,0 +1,23 @@
+{
+  "name": "ovoz-promo-remotion",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Ovoz promo reel rendered with Remotion from ../shared/build/timeline.json",
+  "scripts": {
+    "prepare-assets": "node scripts/prepare.mjs",
+    "studio": "npm run prepare-assets && remotion studio",
+    "render": "npm run prepare-assets && remotion render src/index.ts Promo ../out/remotion.mp4 --codec=h264 --audio-codec=aac --crf=18 --concurrency=8 --overwrite",
+    "still": "npm run prepare-assets && remotion still src/index.ts Promo preview/still.png"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.543",
+    "@remotion/media-utils": "4.0.543",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "remotion": "4.0.543"
+  },
+  "devDependencies": {
+    "@types/react": "19.1.8",
+    "typescript": "5.8.3"
+  }
+}
