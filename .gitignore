@@ -7,3 +7,20 @@ __pycache__/
 static/compare/audio/
 static/compare/index.html
 static/compare/results.json
+# video pipeline
+video/bin/
+video/shared/build/
+video/out/
+video/**/node_modules/
+video/**/.models/
+video/**/preview/
+video/ai/clips/*.mp4
+
+# video studio runtime data
+video/projects/
+video/inbox/
+video/studio/.server.log
+
+# video studio AI library (generated clips, portraits, job state)
+video/library/
+video/studio/.server.err.log

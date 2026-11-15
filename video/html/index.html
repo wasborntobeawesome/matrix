@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<title>Promo renderer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<!-- 1080x1920 stage. Every visual property is computed from time t by
+     window.seek(t) in app.js, so render.py can capture any frame exactly. -->
+<div id="stage">
+  <div id="bg">
+    <div class="blob" id="blobA"></div>
+    <div class="blob" id="blobB"></div>
+    <div class="blob" id="blobC"></div>
+    <div id="grid"></div>
+    <div id="particles"></div>
+    <div id="vignette"></div>
+  </div>
+  <div id="brand">
+    <div class="logo"><div class="logo-bars"></div></div>
+    <div class="brand-name"></div>
+  </div>
+  <div id="scenes"></div>
+  <div id="captions"></div>
+  <div id="progress"></div>
+</div>
+<div id="play-hint">click to play</div>
+<!-- data.js (window.TIMELINE + window.AUDIO) is written by render.py. Default
+     build/data.js; ?data=<url> loads another one (e.g. a studio project's build);
+     ?embed loads nothing and waits for window.loadTimeline() (studio live preview). -->
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  if (q.has("embed")) return;
+  var src = (q.get("data") || "build/data.js").replace(/["<>]/g, "");
+  document.write('<script src="' + src + '"><\/script>');
+})();
+</script>
+<script src="app.js"></script>
+</body>
+</html>

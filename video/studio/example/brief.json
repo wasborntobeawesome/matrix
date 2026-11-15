@@ -1,0 +1,115 @@
+{
+  "title": "Nimbo launch promo",
+  "product": "Nimbo",
+  "language": "en",
+  "format": "9:16",
+  "brand": {
+    "primary": "#3D7BFF",
+    "accent": "#34D399",
+    "background": "#0A1024"
+  },
+  "voice": {
+    "model": "edge",
+    "voice": "en-US-AvaNeural",
+    "rate": 0
+  },
+  "scenes": [
+    {
+      "id": "hook",
+      "layout": "hero",
+      "say": "Meet Nimbo, the budgeting app that finally makes money feel calm.",
+      "kicker": "NEW APP",
+      "headline": "Meet Nimbo",
+      "sub": "Budgeting that feels calm"
+    },
+    {
+      "id": "dashboard",
+      "layout": "screen",
+      "device": "phone",
+      "asset": "home.png",
+      "focus": {
+        "x": 0.05,
+        "y": 0.135,
+        "w": 0.9,
+        "h": 0.215
+      },
+      "callout": "All accounts in one place",
+      "headline": "Everything at a glance",
+      "say": "See every account and card in one simple dashboard."
+    },
+    {
+      "id": "add",
+      "layout": "screen",
+      "device": "phone",
+      "asset": "add-expense.mp4",
+      "headline": "Add expenses in seconds",
+      "say": "Log a purchase in two taps, and Nimbo sorts it for you."
+    },
+    {
+      "id": "goals",
+      "layout": "screens",
+      "device": "phone",
+      "headline": "Save with a plan",
+      "items": [
+        {
+          "asset": "goals.png",
+          "label": "Goals"
+        },
+        {
+          "asset": "insights.png",
+          "label": "Insights"
+        }
+      ],
+      "say": "Set goals, check your insights, and watch your savings grow."
+    },
+    {
+      "id": "web",
+      "layout": "screen",
+      "device": "browser",
+      "asset": "web-dashboard.png",
+      "url": "app.nimbo.example",
+      "focus": {
+        "x": 0.18,
+        "y": 0.235,
+        "w": 0.48,
+        "h": 0.36
+      },
+      "callout": "Plan the whole month",
+      "headline": "Big plans, big screen",
+      "say": "On a laptop? Plan the whole month on the web."
+    },
+    {
+      "id": "everywhere",
+      "layout": "chips",
+      "headline": "Everywhere",
+      "items": [
+        "iPhone",
+        "Android",
+        "Web",
+        "Shared budgets"
+      ],
+      "say": "It syncs between iPhone, Android and the web, with shared budgets for two.",
+      "background": {
+        "type": "broll",
+        "prompt": "Slow drifting ribbons of violet and teal light over a dark navy background, soft bokeh, cinematic",
+        "dim": 0.6
+      }
+    },
+    {
+      "id": "cta",
+      "layout": "cta",
+      "headline": "Try Nimbo free",
+      "sub": "No card needed",
+      "button": "Get Nimbo",
+      "url": "nimbo.example",
+      "say": "Try Nimbo free today.",
+      "pad": 1.0
+    }
+  ],
+  "presenter": {
+    "enabled": false,
+    "mode": "corner",
+    "scenes": "all",
+    "portrait_prompt": "Friendly fictional presenter in her 30s, navy blazer, warm smile"
+  }
+}
