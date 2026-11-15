@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import socket
 import subprocess
 import threading
@@ -61,7 +62,11 @@ def kill_tree(pid: int) -> None:
 class Worker:
     def __init__(self, family: str, warm: bool):
         self.family, self.warm = family, warm
-        env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+        # the worker's localhost port is announced on stdout: the first line on the socket must carry this
+        # secret, so no other program (or a web page racing to the port) can drive the worker
+        self.token = secrets.token_hex(16)
+        env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1",
+               "STUDIO_WORKER_TOKEN": self.token}
         self.proc = subprocess.Popen([str(AI_PY), "worker.py", "--family", family], cwd=str(AI),
                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
                                      creationflags=NOWIN | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
@@ -95,6 +100,7 @@ class Worker:
         try:
             s = socket.create_connection(("127.0.0.1", int(port)), timeout=10)
             s.settimeout(None)
+            s.sendall((json.dumps({"op": "hello", "token": self.token}) + "\n").encode())
             self.sock = s
         except (OSError, TypeError, ValueError) as e:
             self.log.append(f"could not connect to the worker: {e}")

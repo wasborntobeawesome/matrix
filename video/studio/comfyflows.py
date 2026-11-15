@@ -28,8 +28,10 @@ import threading
 import time
 from pathlib import Path
 
+import paths
+
 VIDEO = Path(__file__).resolve().parent.parent
-WF = VIDEO / "comfy-workflows"
+WF = paths.WORKFLOWS
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,40}$")
 PREVIEWS = ("preview.jpg", "preview.png", "preview.webp")
 KEYS = ("prompt", "negative", "seed", "width", "height", "length", "fps", "steps", "image")
@@ -53,6 +55,10 @@ LOADER_FOLDERS = {"UNETLoader": {"unet_name": "diffusion_models"}, "CLIPLoader":
                   "LoraLoader": {"lora_name": "loras"}, "CheckpointLoaderSimple": {"ckpt_name": "checkpoints"},
                   "CLIPVisionLoader": {"clip_name": "clip_vision"}, "UpscaleModelLoader": {"model_name": "upscale_models"}}
 _lock = threading.RLock()
+MAX_NODES = 1500
+MAX_INPUTS = 200                       # per node
+NODE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")     # "6", "58:12" (subgraphs)
+CLASS_RE = re.compile(r"^[^\x00-\x1f]{1,200}$")
 
 
 class FlowError(Exception):
@@ -131,12 +137,22 @@ def parse(raw) -> dict:
                         "and upload that file instead.")
     if not isinstance(raw, dict) or not raw:
         raise FlowError("expected a ComfyUI API workflow: an object {node id: {class_type, inputs}}")
+    if len(raw) > MAX_NODES:
+        raise FlowError(f"too many nodes ({len(raw)}; limit {MAX_NODES})")
     g = {}
     for nid, n in raw.items():
+        if not NODE_ID.match(str(nid)):
+            raise FlowError(f"node id '{str(nid)[:40]}' is not a ComfyUI node id")
         if not isinstance(n, dict) or not isinstance(n.get("class_type"), str) or not isinstance(n.get("inputs", {}), dict):
             raise FlowError(f"node '{nid}' is not an API-format node (needs class_type and inputs)")
-        g[str(nid)] = {"class_type": n["class_type"], "inputs": n.get("inputs") or {},
-                       **({"_meta": n["_meta"]} if isinstance(n.get("_meta"), dict) else {})}
+        if not CLASS_RE.match(n["class_type"]):
+            raise FlowError(f"node '{nid}': bad class_type")
+        if len(n.get("inputs") or {}) > MAX_INPUTS:
+            raise FlowError(f"node '{nid}': too many inputs")
+        meta = n.get("_meta") if isinstance(n.get("_meta"), dict) else None
+        if meta is not None:
+            meta = {k: str(v)[:200] for k, v in meta.items() if k == "title"}
+        g[str(nid)] = {"class_type": n["class_type"], "inputs": n.get("inputs") or {}, **({"_meta": meta} if meta else {})}
     return g
 
 
@@ -152,11 +168,11 @@ def _title(g: dict, nid: str) -> str:
 
 
 # ---------------------------------------------------------------- detection
-def _trace_text(g: dict, link, want: str, seen=None) -> list[str]:
+def _trace_text(g: dict, link, want: str, seen=None, depth: int = 0) -> list[str]:
     """Follow a conditioning link back to the text encoder node(s) that make it."""
-    seen = seen or set()
+    seen = seen if seen is not None else set()
     lk = _link(link)
-    if not lk or lk[0] in seen or lk[0] not in g:
+    if not lk or lk[0] in seen or lk[0] not in g or depth > 200:     # 200: far deeper than any real graph
         return []
     nid, out = lk
     seen.add(nid)
@@ -169,11 +185,11 @@ def _trace_text(g: dict, link, want: str, seen=None) -> list[str]:
     # pass-through nodes with positive/negative pairs (WanImageToVideo, InstructPix2Pix…): out 0 = positive
     if "positive" in inp and "negative" in inp:
         key = "positive" if out == 0 else "negative" if out == 1 else want
-        return _trace_text(g, inp.get(key), want, seen)
+        return _trace_text(g, inp.get(key), want, seen, depth + 1)
     res = []
     for k, v in inp.items():
         if k.startswith("conditioning") or k in ("cond", want):
-            res += _trace_text(g, v, want, seen)
+            res += _trace_text(g, v, want, seen, depth + 1)
     return res
 
 
@@ -314,8 +330,12 @@ OPTIONAL_IMAGE_INPUTS = {"Wan22ImageToVideoLatent": "start_image", "WanImageToVi
                          "WanFirstLastFrameToVideo": "start_image", "WanVaceToVideo": "reference_image"}
 
 
-def _image_optional(g: dict, image_node: str, oi: dict | None = None) -> bool:
+def _image_optional(g: dict, image_node: str, oi: dict | None = None, seen: set | None = None) -> bool:
     """True when every input fed by the LoadImage node (directly or through image-only helper nodes) is optional."""
+    seen = set() if seen is None else seen
+    if image_node in seen or len(seen) > MAX_NODES:
+        return True
+    seen.add(image_node)
     users = _consumers(g, image_node)
     if not users:
         return True
@@ -325,13 +345,13 @@ def _image_optional(g: dict, image_node: str, oi: dict | None = None) -> bool:
             if inp in ((oi[ct].get("input") or {}).get("required") or {}):
                 # an image helper (resize, crop…) in between: look at its consumers instead
                 if ct.startswith("Image") or "Resize" in ct or "Scale" in ct or "Crop" in ct:
-                    if not _image_optional(g, nid, oi):
+                    if not _image_optional(g, nid, oi, seen):
                         return False
                     continue
                 return False
         elif OPTIONAL_IMAGE_INPUTS.get(ct) != inp:
             if ct.startswith("Image") or "Resize" in ct or "Scale" in ct:
-                if not _image_optional(g, nid, oi):
+                if not _image_optional(g, nid, oi, seen):
                     return False
                 continue
             return False
@@ -530,8 +550,9 @@ def new_manifest(g: dict, meta: dict, det: dict | None = None) -> dict:
     base = {"width": w, "height": h, "length": length, "fps": fps}
     if v.get("steps"):
         base["steps"] = int(v["steps"])
-    return {"name": (meta.get("name") or "Uploaded workflow")[:80], "licence": (meta.get("licence") or "").strip()[:200],
-            "commercial": bool(meta.get("commercial")), "notes": (meta.get("notes") or "")[:2000],
+    return {"name": str(meta.get("name") or "Uploaded workflow").strip()[:80] or "Uploaded workflow",
+            "licence": str(meta.get("licence") or "").strip()[:200],
+            "commercial": bool(meta.get("commercial")), "notes": str(meta.get("notes") or "")[:2000],
             "capabilities": det["capabilities"], "inputs": det["inputs"], "outputs": det["outputs"],
             "presets": {"draft": dict(base), "final": dict(base)},
             "estimate": {"draft": {"seconds": None, "vram_gb": None}, "final": {"seconds": None, "vram_gb": None}},
@@ -566,6 +587,18 @@ def save(g: dict, manifest: dict, wid: str | None = None, replace: bool = False,
 def update(wid: str, patch: dict) -> dict:
     m, g = load(wid)
     errs = []
+    if not isinstance(patch, dict):
+        raise FlowError("expected a JSON object")
+    for k, typ in (("capabilities", list), ("inputs", dict), ("outputs", list), ("presets", dict)):
+        if k in patch and patch[k] is not None and not isinstance(patch[k], typ):
+            raise FlowError(f"'{k}' must be a{'n object' if typ is dict else ' list'}")
+    try:
+        return _update(wid, m, g, patch, errs)
+    except (TypeError, ValueError, OverflowError) as e:
+        raise FlowError(f"invalid value: {e}") from None
+
+
+def _update(wid: str, m: dict, g: dict, patch: dict, errs: list) -> dict:
     if "name" in patch:
         m["name"] = str(patch["name"] or m["name"]).strip()[:80] or m["name"]
     for k in ("licence", "notes"):
@@ -598,6 +631,8 @@ def update(wid: str, patch: dict) -> dict:
         pr = {}
         for name in ("draft", "final"):
             src = (patch["presets"] or {}).get(name) or m.get("presets", {}).get(name) or {}
+            if not isinstance(src, dict):
+                raise ValueError(f"presets.{name} must be an object")
             p = {}
             for k in ("width", "height", "length", "steps"):
                 if src.get(k) not in (None, ""):
@@ -615,7 +650,9 @@ def update(wid: str, patch: dict) -> dict:
         if k in patch and patch[k] not in (None, ""):
             m[k] = round(float(patch[k]), 1)
     if "estimate" in patch and isinstance(patch["estimate"], dict):
-        m["estimate"] = patch["estimate"]
+        m["estimate"] = {k: {kk: (float(vv) if vv not in (None, "") else None) for kk, vv in v.items()
+                             if kk in ("seconds", "vram_gb")}
+                         for k, v in patch["estimate"].items() if k in ("draft", "final") and isinstance(v, dict)}
     if errs:
         raise FlowError("; ".join(errs), errors=errs)
     v = validate(g, m, None)

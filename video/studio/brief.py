@@ -27,6 +27,7 @@ ON_SCREEN = ("kicker", "headline", "sub", "callout", "button")   # Uzbek apostro
 MUSIC_DEFAULT = {"volume_db": -20.0, "duck": True, "duck_db": -10.0, "fade_in": 1.0, "fade_out": 2.5, "start": 0.0}
 LAYOUTS = ["hero", "chips", "stat", "list", "cta", "screen", "screens", "presenter"]
 BROLL_PROVIDERS = ["wan22-5b", "fastwan-5b", "wan22-a14b"]     # providers.py
+DEFAULT_BROLL = "fastwan-5b"   # providers.DEFAULT (wan22-5b is kept as a legacy choice: its draft clips came out near-black)
 COMFY_PROVIDER = re.compile(r"^comfy:[a-z0-9][a-z0-9_-]{1,40}$")   # a ComfyUI workflow (video/comfy-workflows/<id>)
 _PROVIDER = {"type": "string", "pattern": r"^(wan22-5b|fastwan-5b|wan22-a14b|comfy:[a-z0-9][a-z0-9_-]{1,40})$"}
 
@@ -85,7 +86,7 @@ _background = {
             "prompt": {**_str, "description": "Suggested text-to-video prompt: what the background footage shows, "
                                               "no text/logos/people's faces, e.g. 'slow drifting purple light ribbons on dark navy'"},
             "provider": {**_PROVIDER, "description": "Video generator for this scene's clip (default: the "
-                         "project's broll_provider): wan22-5b (original), fastwan-5b (fast drafts), wan22-a14b (best quality), "
+                         "project's broll_provider): fastwan-5b (default, fast), wan22-a14b (best quality), wan22-5b (legacy), "
                          "or comfy:<workflow id> = a ComfyUI workflow installed in the studio"},
             "image": {**_str, "description": "Optional: animate this uploaded image asset (image-to-video) instead of "
                                              "generating from text only; 'prompt' then describes the motion"},
@@ -160,7 +161,7 @@ SCHEMA = {
                                                              "duration": {"type": "number", "minimum": 10, "maximum": 240,
                                                                           "description": "seconds (default: the video length)"},
                                                              "seed": {"type": "integer"}}}}},
-        "broll_provider": {**_PROVIDER, "default": "wan22-5b",
+        "broll_provider": {**_PROVIDER, "default": DEFAULT_BROLL,
                            "description": "Default video generator for scene b-roll (a scene's background.provider wins); "
                                           "also comfy:<workflow id>"},
         "cover": {"type": "object", "description": "Cover image moment (default: the end of the first scene)",
@@ -385,9 +386,9 @@ def normalize(raw, assets: dict | None = None) -> tuple[dict, list[str]]:
         if ok:
             b["broll_provider"] = bp
             if note:
-                warn.append(f"broll_provider {note} — Make video uses wan22-5b until it is")
+                warn.append(f"broll_provider {note} — Make video uses {DEFAULT_BROLL} until it is")
         else:
-            warn.append(f"broll_provider '{bp}' unknown ({', '.join(BROLL_PROVIDERS)}) — using {BROLL_PROVIDERS[0]}")
+            warn.append(f"broll_provider '{bp}' unknown ({', '.join(BROLL_PROVIDERS)}) — using {DEFAULT_BROLL}")
     if raw.get("transition") not in (None, ""):
         tr = _transition_norm(raw.get("transition"), "transition", warn)
         if tr:
@@ -414,7 +415,10 @@ def normalize(raw, assets: dict | None = None) -> tuple[dict, list[str]]:
             b["presenter"] = pr
     # keep extra top-level keys an AI may add (notes etc.), but not ours twice
     for k, v in raw.items():
-        if k not in b and k not in ("name", "template", "template_options", "transition") and isinstance(k, str) and len(k) < 40:
+        # (fields normalised above that were dropped as invalid must not sneak back in verbatim)
+        if k not in b and k not in ("name", "template", "template_options", "transition", "broll_provider", "music",
+                                    "cover", "presenter") and isinstance(k, str) \
+                and len(k) < 40 and not k.startswith("_"):
             b[k] = copy.deepcopy(v)
     if len(b["languages"]) > 1:
         miss = missing_translations(b)
@@ -455,10 +459,12 @@ def _scene(s: dict, i: int, seen: set, warn: list, assets) -> dict:
         v = _num(s.get(k), lo, hi)
         if v is not None:
             o[k] = round(v, 3)
-    # keep unknown keys (forward compatible), but never overwrite normalized ones
+    # keep unknown keys (forward compatible), but never overwrite normalized ones, nor the timeline's own
+    # per-scene fields (start, end, voiced …) or internal "_" keys
     for k, v in s.items():
-        skip = ("items", "focus", "device", "asset", "stat", "voiceover", "vo", "background", "transition")
-        if k not in o and k not in skip and isinstance(k, str):
+        skip = ("items", "focus", "device", "asset", "stat", "voiceover", "vo", "background", "transition",
+                "start", "end", "speech_end", "voiced", "timing")
+        if k not in o and k not in skip and isinstance(k, str) and len(k) < 40 and not k.startswith("_"):
             o[k] = copy.deepcopy(v)
     if "background" in s:
         bg = _background_norm(s.get("background"), sid, warn)

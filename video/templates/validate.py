@@ -35,7 +35,9 @@ HERE = Path(__file__).resolve().parent
 VIDEO = HERE.parent
 sys.path.insert(0, str(VIDEO / "studio"))
 sys.path.insert(0, str(VIDEO / "shared"))
+sys.path.insert(0, str(VIDEO / "html"))
 
+import render as R  # noqa: E402  (the renderer's isolated browser: virtual origin, no file:// access, no network)
 import templates as T  # noqa: E402
 import voicelib as V  # noqa: E402
 
@@ -213,20 +215,26 @@ async def render_checks(info: dict, langs: list[str], sheet_dir: Path | None, pr
             fams.add(f["family"])
     shots: dict = {}
     async with async_playwright() as p:
-        browser = await p.chromium.launch(args=["--force-color-profile=srgb", "--hide-scrollbars", "--font-render-hinting=none",
-                                                "--disable-lcd-text", "--allow-file-access-from-files", "--disable-gpu"])
+        # the template's code runs in the same sandbox as in a real render: only the renderer, its fonts, the
+        # example assets and the template folder are readable, and there is no network
+        mounts = R.Mounts()
+        mounts.add(R.HERE)
+        mounts.add(VIDEO / "shared" / "fonts")
+        browser, ctx = await R.open_context(p, 1080, 1920, mounts)
         tmp = Path(__file__).resolve().parent / ".validate-tmp"
         tmp.mkdir(exist_ok=True)
 
         async def page_for(tl, name):
             W, H = tl["width"], tl["height"]
-            data = tmp / f"{name}.js"
-            data.write_text("window.TIMELINE = " + json.dumps(tl, ensure_ascii=False) + ";\nwindow.AUDIO = null;\n", encoding="utf-8")
-            pg = await browser.new_page(viewport={"width": W, "height": H}, device_scale_factor=1)
+            tl = mounts.rewrite(tl)
+            mounts.mem[f"/__validate/{name}.js"] = (("window.TIMELINE = " + json.dumps(tl, ensure_ascii=False) +
+                                                    ";\nwindow.AUDIO = null;\n").encode("utf-8"), "text/javascript")
+            pg = await ctx.new_page()
+            await pg.set_viewport_size({"width": W, "height": H})
             errs = []
             pg.on("pageerror", lambda e: errs.append(f"page error: {e}"))
             pg.on("console", lambda m: errs.append(f"console: {m.text}") if m.type == "error" else None)
-            await pg.goto(RENDERER.as_uri() + "?render&data=" + data.resolve().as_uri())
+            await pg.goto(mounts.url_of(RENDERER) + "?render&data=" + R.VIRT + f"/__validate/{name}.js")
             await pg.wait_for_function("window.__ready === true", timeout=60000)
             return pg, errs
 

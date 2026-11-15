@@ -15,14 +15,20 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 import shutil
+import stat
+import struct
 import subprocess
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 
+import paths
+
 VIDEO = Path(__file__).resolve().parent.parent
-ROOT = VIDEO / "templates"
+ROOT = paths.TEMPLATES
 DEFAULT = "aurora"
 BUILTIN = ("aurora", "clean", "bold")
 KINDS = ("theme", "full")
@@ -43,6 +49,14 @@ IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif"}
 MAX_ZIP_BYTES = 40 * 1024 * 1024       # uncompressed
 MAX_FILES = 300
 MAX_FILE = 15 * 1024 * 1024
+MAX_DEPTH = 6                          # folders inside the template
+MAX_TOKENS_JSON = 32 * 1024
+TEXT_LIMITS = {"name": 80, "description": 600, "author": 200, "version": 40, "licence": 300}
+KNOWN_KEYS = {"id", "name", "description", "author", "version", "licence", "kind", "formats", "layouts", "css", "js",
+              "default_transition", "transitions", "previews", "options", "tokens", "$schema", "notes", "homepage"}
+# Windows device names cannot be files (CON.css would write to the console device)
+RESERVED = re.compile(r"^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$)(\..*)?$", re.I)
+_install_lock = threading.RLock()
 SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$id": "video-studio/template-manifest.schema.json",
@@ -204,6 +218,15 @@ def check_manifest(m: dict, d: Path | None = None) -> tuple[list[str], list[str]
             E.append(f"'{k}' must be a string")
         elif k not in m:
             W.append(f"'{k}' is missing")
+    for k, n in TEXT_LIMITS.items():
+        if isinstance(m.get(k), str) and len(m[k]) > n:
+            E.append(f"'{k}' is too long (max {n} characters)")
+    extra = sorted(k for k in m if k not in KNOWN_KEYS)
+    if extra:
+        W.append(f"unknown manifest keys ignored: {', '.join(map(str, extra[:8]))}")
+    for k, n in (("transitions", 20), ("options", 40), ("previews", 6)):
+        if isinstance(m.get(k), list) and len(m[k]) > n:
+            E.append(f"'{k}': at most {n} entries")
     kind = m.get("kind")
     if kind not in KINDS:
         E.append("kind must be \"theme\" or \"full\"")
@@ -231,6 +254,9 @@ def check_manifest(m: dict, d: Path | None = None) -> tuple[list[str], list[str]
     if not isinstance(tk, dict):
         E.append("tokens must be an object")
         tk = {}
+    elif len(json.dumps(tk)) > MAX_TOKENS_JSON:
+        E.append(f"tokens: too large (max {MAX_TOKENS_JSON // 1024} KB)")
+        tk = {}
     if tk.get("tone", "dark") not in ("dark", "light"):
         E.append("tokens.tone must be \"dark\" or \"light\"")
     cols = tk.get("colors", {})
@@ -254,9 +280,15 @@ def check_manifest(m: dict, d: Path | None = None) -> tuple[list[str], list[str]
         if k in fonts and not (isinstance(fonts[k], int) and 100 <= fonts[k] <= 900):
             E.append(f"tokens.fonts.{k} must be 100..900")
     families = {"Inter", "Noto Sans Arabic"}
+    if not isinstance(fonts.get("files") or [], list) or len(fonts.get("files") or []) > 12:
+        E.append("tokens.fonts.files must be a list of at most 12 fonts")
+        fonts = {**fonts, "files": []}
     for i, f in enumerate(fonts.get("files") or []):
         if not isinstance(f, dict) or not f.get("family") or not f.get("src"):
             E.append(f"tokens.fonts.files[{i}] needs family and src")
+            continue
+        if not isinstance(f["family"], str) or not re.match(r"^[\w .-]{1,60}$", f["family"]):
+            E.append(f"tokens.fonts.files[{i}].family must be a font family name")
             continue
         families.add(f["family"])
         src = f["src"]
@@ -346,20 +378,30 @@ def check_manifest(m: dict, d: Path | None = None) -> tuple[list[str], list[str]
             E.append(f"options.{o['key']}: type must be one of {', '.join(OPTION_TYPES)}")
         if o.get("type") == "select":
             ch = o.get("choices")
-            if not isinstance(ch, list) or not ch or any(not isinstance(c, dict) or "value" not in c for c in ch):
-                E.append(f"options.{o['key']}: select needs choices [{{value, label}}]")
+            if not isinstance(ch, list) or not ch or len(ch) > 50 or any(not isinstance(c, dict) or "value" not in c for c in ch):
+                E.append(f"options.{o['key']}: select needs choices [{{value, label}}] (at most 50)")
+        for lk in ("label", "help"):
+            lv = o.get(lk)
+            if lv is not None and not (isinstance(lv, str) and len(lv) <= 200 or isinstance(lv, dict) and all(
+                    isinstance(x, str) and len(x) <= 200 for x in lv.values())):
+                E.append(f"options.{o['key']}.{lk} must be text (or {{\"en\": ..., \"uz\": ...}})")
         if "default" not in o:
             W.append(f"options.{o['key']}: no default")
     return E, W
 
 
 def _safe_rel(p: str) -> bool:
+    """A relative path inside the template folder: no absolute / drive / UNC paths, no '..', no Windows
+    device names or names Windows silently changes (trailing dot or space), no control characters."""
     if not isinstance(p, str) or not p or len(p) > 160:
         return False
-    if p.startswith(("/", "\\")) or ":" in p or "\\" in p:
+    if p.startswith(("/", "\\")) or ":" in p or "\\" in p or re.search(r'[\x00-\x1f<>"|?*]', p):
         return False
     parts = p.split("/")
-    return all(x not in ("", ".", "..") for x in parts)
+    if len(parts) > MAX_DEPTH + 1:
+        return False
+    return all(x not in ("", ".", "..") and not x.endswith((".", " ")) and not x.startswith(" ")
+               and not RESERVED.match(x) for x in parts)
 
 
 # ------------------------------------------------------------------ per-project settings
@@ -437,9 +479,12 @@ def fill_urls(info: dict | None, mode: str) -> dict | None:
 def import_zip(src: Path, replace: bool = False) -> tuple[dict, list[str]]:
     """Validate and install a template zip. Returns (public manifest, warnings). Raises TemplateError
     with every problem found (so the UI can list them all at once)."""
+    n = _zip_entries(src)
+    if n is not None and n > MAX_FILES * 4:
+        raise TemplateError(f"too many files ({n}; limit {MAX_FILES})")
     try:
         zf = zipfile.ZipFile(src)
-    except (zipfile.BadZipFile, OSError):
+    except (zipfile.BadZipFile, OSError, ValueError):
         raise TemplateError("not a zip file") from None
     with zf, tempfile.TemporaryDirectory(prefix="studio-tpl-") as tmp:
         infos = [i for i in zf.infolist() if not i.is_dir()]
@@ -461,6 +506,8 @@ def import_zip(src: Path, replace: bool = False) -> tuple[dict, list[str]]:
             prefix = cands[0][: -len("manifest.json")]
         root = Path(tmp) / "t"
         root.mkdir()
+        seen: set[str] = set()
+        written = 0
         for i, n in zip(infos, names):
             if "__MACOSX/" in n or n.split("/")[-1] in (".DS_Store", "Thumbs.db"):
                 continue
@@ -471,16 +518,31 @@ def import_zip(src: Path, replace: bool = False) -> tuple[dict, list[str]]:
             if not _safe_rel(rel):
                 errs.append(f"{n}: unsafe path")
                 continue
+            if stat.S_ISLNK(i.external_attr >> 16):
+                errs.append(f"{rel}: symbolic links are not allowed")
+                continue
+            if rel.lower() in seen:                    # Windows file names are case-insensitive
+                errs.append(f"{rel}: duplicate file name")
+                continue
+            seen.add(rel.lower())
             if Path(rel).suffix.lower() not in FILE_EXT:
                 errs.append(f"{rel}: file type not allowed (allowed: {', '.join(sorted(FILE_EXT))})")
                 continue
             if i.file_size > MAX_FILE:
                 errs.append(f"{rel}: too large ({i.file_size / 1e6:.0f} MB)")
                 continue
+            if errs:
+                continue                               # report everything, extract nothing more
             dest = root / rel
+            if root.resolve() not in dest.resolve().parents:
+                errs.append(f"{n}: unsafe path")
+                continue
             dest.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(i) as fsrc, open(dest, "wb") as fdst:
-                shutil.copyfileobj(fsrc, fdst, 1 << 20)
+            try:
+                with zf.open(i) as fsrc, open(dest, "wb") as fdst:
+                    written += _copy_limited(fsrc, fdst, min(MAX_FILE, MAX_ZIP_BYTES - written))
+            except (zipfile.BadZipFile, OSError, ValueError, EOFError, RuntimeError, NotImplementedError) as e:
+                errs.append(f"{rel}: cannot be unpacked ({e})")
         if errs:
             raise TemplateError(errs)
         m = read_manifest(root)
@@ -495,14 +557,59 @@ def import_zip(src: Path, replace: bool = False) -> tuple[dict, list[str]]:
             e2 += js_syntax(js)
         if e2:
             raise TemplateError(e2)
+        _install(root, tid, replace)
+    return public(load(tid)), warns
+
+
+def _install(src: Path, tid: str, replace: bool) -> None:
+    """Copy next to the target first, then swap folders, so a failed copy never leaves half a template and two
+    imports of the same id cannot interleave."""
+    with _install_lock:
         dest = ROOT / tid
         if dest.exists() and not replace:
             raise TemplateError(f"a template with id '{tid}' is already installed — tick “replace” to update it", 409)
         ROOT.mkdir(parents=True, exist_ok=True)
-        if dest.exists():
-            shutil.rmtree(dest)
-        shutil.copytree(root, dest)
-    return public(load(tid)), warns
+        tag = secrets.token_hex(4)
+        new, old = ROOT / f".new-{tid}-{tag}", ROOT / f".old-{tid}-{tag}"
+        try:
+            shutil.copytree(src, new)
+            if dest.exists():
+                dest.rename(old)
+            new.rename(dest)
+        finally:
+            shutil.rmtree(new, ignore_errors=True)
+            shutil.rmtree(old, ignore_errors=True)
+
+
+def _zip_entries(src: Path) -> int | None:
+    """The entry count from the end-of-central-directory record, read before zipfile parses the whole central
+    directory (a 50 MB zip can declare a million empty entries)."""
+    try:
+        with open(src, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 66000))
+            tail = f.read()
+    except OSError:
+        return None
+    k = tail.rfind(b"PK\x05\x06")
+    if k < 0 or len(tail) < k + 22:
+        return None
+    total = struct.unpack("<H", tail[k + 10:k + 12])[0]
+    return None if total == 0xFFFF else total          # zip64: zipfile checks it
+
+
+def _copy_limited(fsrc, fdst, limit: int) -> int:
+    """Copy at most `limit` bytes (the declared sizes in a zip can lie; zipfile also stops at the declared size)."""
+    n = 0
+    while True:
+        chunk = fsrc.read(1 << 20)
+        if not chunk:
+            return n
+        n += len(chunk)
+        if n > limit:
+            raise ValueError("larger than declared / allowed")
+        fdst.write(chunk)
 
 
 def js_syntax(js: Path) -> list[str]:
@@ -527,5 +634,6 @@ def js_syntax(js: Path) -> list[str]:
 def delete(tid: str) -> None:
     if tid in BUILTIN:
         raise TemplateError("built-in templates can't be deleted", 409)
-    d = folder(tid)
-    shutil.rmtree(d)
+    with _install_lock:
+        d = folder(tid)
+        shutil.rmtree(d)

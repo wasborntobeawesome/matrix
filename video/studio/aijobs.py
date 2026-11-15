@@ -119,7 +119,8 @@ class AIJobs:
         self.hold = None   # callable -> str | None: a reason why no GPU job may start now ("Make video" voice stage)
         self._saved = 0.0
         self.timings = self._load_timings()
-        WK.kill_leftovers()                  # warm workers a previous studio process left behind
+        if os.environ.get("STUDIO_KEEP_LEFTOVERS") != "1":   # tests / a second instance must not touch them
+            WK.kill_leftovers()              # warm workers a previous studio process left behind
         self.pool = WK.Pool()
         self.comfy = CF.Comfy(sampler=sampler)
         self.monitor = gpu.Monitor(ai_pids=self._ai_pids, sampler=sampler)
@@ -222,8 +223,8 @@ class AIJobs:
     # ------------------------------------------------------------ public API
     def submit(self, kind: str, params: dict, project: str | None = None, label: str = "", units: float = 0,
                preset: str | None = None) -> dict:
-        tkey = P.timing_key(params.get("provider") or P.DEFAULT, preset or "draft") if kind == "broll" else _key(kind, preset)
-        est = (self.estimate_broll(params.get("provider") or P.DEFAULT, preset or "draft", bool(params.get("image")))
+        tkey = P.timing_key(params.get("provider") or P.ORIGINAL, preset or "draft") if kind == "broll" else _key(kind, preset)
+        est = (self.estimate_broll(params.get("provider") or P.ORIGINAL, preset or "draft", bool(params.get("image")))
                if kind == "broll" else self.estimate(kind, preset, units, warm=self.is_warm(*_family_keys(kind))))
         job = {"id": secrets.token_hex(6), "kind": kind, "project": project, "params": params, "preset": preset,
                "label": label, "status": "queued", "stage": "queued", "progress": 0.0, "message": "", "error": None,
@@ -262,21 +263,26 @@ class AIJobs:
             v["position"] = 0
         return v
 
+    def _all(self) -> list[dict]:
+        """A snapshot: API threads iterate while the queue thread adds / removes jobs."""
+        with self.lock:
+            return list(self.jobs.values())
+
     def queued(self) -> list[str]:
-        return [j["id"] for j in sorted(self.jobs.values(), key=lambda j: j["created"]) if j["status"] == "queued"]
+        return [j["id"] for j in sorted(self._all(), key=lambda j: j["created"]) if j["status"] == "queued"]
 
     def get(self, jid: str) -> dict | None:
         j = self.jobs.get(jid)
         return self.view(j) if j else None
 
     def list(self, project: str | None = None, limit: int = 60) -> list[dict]:
-        js = sorted(self.jobs.values(), key=lambda j: j["created"], reverse=True)
+        js = sorted(self._all(), key=lambda j: j["created"], reverse=True)
         if project:
             js = [j for j in js if j.get("project") == project]
         return [self.view(j) for j in js[:limit]]
 
     def active(self, project: str | None = None, kind: str | None = None) -> list[dict]:
-        return [self.view(j) for j in self.jobs.values() if j["status"] in ("queued", "running")
+        return [self.view(j) for j in self._all() if j["status"] in ("queued", "running")
                 and (project is None or j.get("project") == project) and (kind is None or j["kind"] == kind)]
 
     def cancel(self, jid: str) -> dict | None:
@@ -410,6 +416,7 @@ class AIJobs:
             job["pid"] = None
             self.current = None
             self._save(force=True)
+            _clean_tmp(job["id"])
 
     # ------------------------------------------------------------ subprocess
     def _proc(self, job: dict, cmd: list[str], on_progress) -> dict:
@@ -533,7 +540,7 @@ class AIJobs:
     # ------------------------------------------------------------ runners
     def _broll(self, job: dict) -> dict:
         prm = job["params"]
-        provider = prm.get("provider") or P.DEFAULT
+        provider = prm.get("provider") or P.ORIGINAL   # records from before providers existed
         pv = P.get(provider)
         preset = job["preset"] if job["preset"] in pv["presets"] else "draft"
         pr = pv["presets"][preset]
@@ -909,6 +916,16 @@ def to_mp4(src: Path, dest: Path, fps: float) -> None:
     p.stdin.close()
     if p.wait(600) != 0:
         raise RuntimeError(f"could not convert {src.name}: {p.stderr.read()[-300:]!r}")
+
+
+def _clean_tmp(jid: str) -> None:
+    """Intermediate files of a finished / failed / cancelled job (library/tmp/<job id>*)."""
+    try:
+        for f in TMP.glob(f"{jid}*"):
+            if f.is_file():
+                f.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _kill_tree(pid: int) -> None:

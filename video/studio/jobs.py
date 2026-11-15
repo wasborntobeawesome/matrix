@@ -24,6 +24,22 @@ from store import Project, now
 VIDEO = Path(__file__).resolve().parent.parent
 PY = sys.executable
 RENDER = VIDEO / "html" / "render.py"
+NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def kill_tree(proc: subprocess.Popen) -> None:
+    """Stop render.py together with its headless Chromium and ffmpeg: proc.kill() alone left chrome.exe and
+    ffmpeg.exe running on Windows."""
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, creationflags=NOWIN)
+    else:
+        proc.kill()
+    try:
+        proc.wait(10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 class Cancelled(Exception):
@@ -31,24 +47,30 @@ class Cancelled(Exception):
 
 
 class Queue:
-    def __init__(self, name: str, runner):
-        self.name, self.runner = name, runner
+    def __init__(self, name: str, runner, lock):
+        self.name, self.runner, self.lock = name, runner, lock
         self.q: queue.Queue = queue.Queue()
         self.pending: list[str] = []
         threading.Thread(target=self._loop, name=f"jobs-{name}", daemon=True).start()
 
     def put(self, job: dict) -> None:
-        self.pending.append(job["id"])
+        with self.lock:
+            self.pending.append(job["id"])
         self.q.put(job)
+
+    def position(self, jid: str) -> int:
+        with self.lock:
+            return self.pending.index(jid) + 1 if jid in self.pending else 0
 
     def _loop(self) -> None:
         while True:
             job = self.q.get()
-            if job["id"] in self.pending:
-                self.pending.remove(job["id"])
-            if job["status"] == "cancelled":
-                continue
-            job.update(status="running", started=now(), stage="starting")
+            with self.lock:            # a cancel between "queued" and "running" must not be lost
+                if job["id"] in self.pending:
+                    self.pending.remove(job["id"])
+                if job["status"] == "cancelled":
+                    continue
+                job.update(status="running", started=now(), stage="starting")
             try:
                 job["result"] = self.runner(job)
                 job.update(status="done", progress=1.0, stage="done")
@@ -63,7 +85,9 @@ class Jobs:
     def __init__(self):
         self.jobs: dict[str, dict] = {}
         self.procs: dict[str, subprocess.Popen] = {}
-        self.queues = {"voice": Queue("voice", self._voice), "render": Queue("render", self._render)}
+        self.lock = threading.RLock()       # self.jobs is read by API threads while the queues add / prune
+        self.queues = {"voice": Queue("voice", self._voice, self.lock),
+                       "render": Queue("render", self._render, self.lock)}
         self.gate = None   # callable -> str | None: why voice synthesis must wait now ("Make video" AI stage)
 
     def _wait_gate(self, job: dict) -> None:
@@ -79,15 +103,19 @@ class Jobs:
         job = {"id": secrets.token_hex(6), "kind": kind, "project": project, "params": params,
                "status": "queued", "stage": "queued", "progress": 0.0, "message": "", "error": None,
                "result": None, "created": now(), "started": None, "finished": None}
-        self.jobs[job["id"]] = job
+        with self.lock:
+            self.jobs[job["id"]] = job
         self.queues[kind].put(job)
         self._prune()
         return self.view(job)
 
+    def _all(self) -> list[dict]:
+        with self.lock:
+            return list(self.jobs.values())
+
     def view(self, job: dict) -> dict:
-        v = {k: val for k, val in job.items()}
-        q = self.queues[job["kind"]]
-        v["position"] = q.pending.index(job["id"]) + 1 if job["id"] in q.pending else 0
+        v = dict(job)
+        v["position"] = self.queues[job["kind"]].position(job["id"])
         return v
 
     def get(self, jid: str) -> dict | None:
@@ -95,32 +123,39 @@ class Jobs:
         return self.view(j) if j else None
 
     def for_project(self, pid: str) -> list[dict]:
-        return [self.view(j) for j in sorted(self.jobs.values(), key=lambda j: j["created"], reverse=True)
+        return [self.view(j) for j in sorted(self._all(), key=lambda j: j["created"], reverse=True)
                 if j["project"] == pid][:20]
 
     def cancel(self, jid: str) -> dict | None:
         j = self.jobs.get(jid)
         if not j:
             return None
-        if j["status"] == "queued":
-            j["status"] = "cancelled"
-        elif j["status"] == "running":
-            j["cancel"] = True
-            proc = self.procs.get(jid)
-            if proc and proc.poll() is None:
-                proc.kill()
+        with self.lock:
+            if j["status"] == "queued":
+                j.update(status="cancelled", stage="cancelled", finished=now())
+            elif j["status"] == "running":
+                j["cancel"] = True
+        proc = self.procs.get(jid)
+        if j.get("cancel") and proc:
+            kill_tree(proc)
         return self.view(j)
 
+    def shutdown(self) -> None:
+        """Server stopping: no render.py / Chromium / ffmpeg may outlive it."""
+        for proc in list(self.procs.values()):
+            kill_tree(proc)
+
     def busy(self, pid: str, kind: str) -> dict | None:
-        for j in self.jobs.values():
+        for j in self._all():
             if j["project"] == pid and j["kind"] == kind and j["status"] in ("queued", "running"):
                 return self.view(j)
         return None
 
     def _prune(self) -> None:
-        done = [j for j in self.jobs.values() if j["status"] in ("done", "error", "cancelled")]
-        for j in sorted(done, key=lambda j: j["created"])[:-200]:
-            self.jobs.pop(j["id"], None)
+        with self.lock:
+            done = [j for j in self.jobs.values() if j["status"] in ("done", "error", "cancelled")]
+            for j in sorted(done, key=lambda j: j["created"])[:-200]:
+                self.jobs.pop(j["id"], None)
 
     # ---------- runners ----------
     def _voice(self, job: dict) -> dict:
@@ -201,14 +236,16 @@ class Jobs:
                    "--out", str(out), "--progress", "--workers", str(prm.get("workers") or 8),
                    "--cover", str(cover_t), "--cover-out", str(cover_png)]
             t0 = time.time()
-            rc, tail = self._run_render(job, cmd, tag, done_frames, total_frames, t_all)
-            if job.get("cancel"):
-                out.unlink(missing_ok=True)
+            try:
+                rc, tail = self._run_render(job, cmd, tag, done_frames, total_frames, t_all)
+                if job.get("cancel"):
+                    raise Cancelled()
+                if rc != 0 or not out.exists():
+                    raise RuntimeError(f"render {lg} {f} failed: " + " | ".join(tail[-5:]))
+            except BaseException:
+                out.unlink(missing_ok=True)          # no half-written MP4 / cover left in build/
                 cover_png.unlink(missing_ok=True)
-                raise Cancelled()
-            if rc != 0 or not out.exists():
-                out.unlink(missing_ok=True)
-                raise RuntimeError(f"render {lg} {f} failed: " + " | ".join(tail[-5:]))
+                raise
             done_frames += tl["frames"]
             final = p.renders_dir / f"{base}.mp4"
             (p.renders_dir / f"{base}.srt").write_text(exports.srt(tl), encoding="utf-8")
@@ -233,9 +270,10 @@ class Jobs:
         env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
         job.update(stage="frames", message=f"{tag}: starting browser")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                encoding="utf-8", errors="replace", env=env,
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                encoding="utf-8", errors="replace", env=env, creationflags=NOWIN)
         self.procs[job["id"]] = proc
+        if job.get("cancel"):                     # cancelled while the process was starting
+            kill_tree(proc)
         tail: list[str] = []
         try:
             for line in proc.stdout:
@@ -259,6 +297,7 @@ class Jobs:
                     tail = (tail + [line])[-15:]
             rc = proc.wait()
         finally:
+            kill_tree(proc)                        # an exception above must not orphan Chromium / ffmpeg
             self.procs.pop(job["id"], None)
         return rc, tail
 

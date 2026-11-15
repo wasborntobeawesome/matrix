@@ -16,20 +16,30 @@ VRAM and RAM are attributed to owners:
 
 Stage markers (the "Make video" stages, AI jobs, renders, voice jobs) are recorded as time spans from
 an `activity()` callback that reports what is running right now.
+
+History survives a restart: every FLUSH_S seconds the new samples are appended to a ring file
+(library/monitor-history.jsonl, one compact JSON line per sample, ~150 bytes) and the markers are saved
+(library/monitor-markers.json). The file is rewritten with only the last 30 minutes once it holds about an
+hour. On start the last 30 minutes are loaded back; markers that were still open are closed at the last
+saved sample.
 """
 from __future__ import annotations
 
 import collections
 import ctypes
+import json
 import os
 import re
 import threading
 import time
+from pathlib import Path
 
 import gpu
 
 HISTORY_S = 30 * 60
 NOWIN = 0
+FLUSH_S = 15                   # how often new samples are appended to the ring file
+COMPACT_LINES = 2 * HISTORY_S  # rewrite the file (last 30 min only) once it holds about an hour
 
 
 # ---------------------------------------------------------------- PDH (Windows performance counters)
@@ -99,9 +109,14 @@ class _Pdh:
 
 # ---------------------------------------------------------------- sampler
 class Sampler:
-    def __init__(self, ai_pids=lambda: {}, activity=lambda: [], warm_ram=lambda: {}, comfy_pids=lambda: set()):
+    def __init__(self, ai_pids=lambda: {}, activity=lambda: [], warm_ram=lambda: {}, comfy_pids=lambda: set(),
+                 persist: Path | None = None, start: bool = True):
         import psutil
         self.ps = psutil
+        self.persist = Path(persist) if persist else None    # ring file of samples (None = memory only)
+        self._flushed_t = 0.0
+        self._flush_at = time.time() + FLUSH_S
+        self._lines = 0
         self.ai_pids, self.activity, self.warm_ram, self.comfy_pids = ai_pids, activity, warm_ram, comfy_pids
         self.me = os.getpid()
         self.hist: collections.deque = collections.deque(maxlen=HISTORY_S + 5)
@@ -136,7 +151,80 @@ class Sampler:
             self.pdh = None
             self.err["pdh"] = str(e)
         psutil.cpu_percent(None)
-        threading.Thread(target=self._loop, name="sysmon", daemon=True).start()
+        self.restore()
+        if start:
+            threading.Thread(target=self._loop, name="sysmon", daemon=True).start()
+
+    # ------------------------------------------------------------ persistence (history survives a restart)
+    def _marker_file(self) -> Path:
+        return self.persist.with_name(self.persist.stem.replace("history", "markers") + ".json")
+
+    def restore(self) -> int:
+        """Load the last 30 minutes of samples (+ markers) saved by a previous run. Returns the sample count."""
+        if not self.persist:
+            return 0
+        cut = time.time() - HISTORY_S
+        rows = []
+        try:
+            with open(self.persist, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue                       # a torn last line after a crash
+                    if isinstance(d, dict) and isinstance(d.get("t"), (int, float)) and d["t"] > cut:
+                        rows.append(d)
+        except OSError:
+            rows = []
+        rows.sort(key=lambda d: d["t"])
+        with self.cond:
+            for d in rows:
+                if not self.hist or d["t"] > self.hist[-1]["t"]:
+                    self.hist.append(d)
+        self._flushed_t = rows[-1]["t"] if rows else 0.0
+        last = self._flushed_t
+        try:
+            ms = json.loads(self._marker_file().read_text(encoding="utf-8"))
+            for m in ms if isinstance(ms, list) else []:
+                if not isinstance(m, dict) or not isinstance(m.get("t0"), (int, float)):
+                    continue
+                m = {"key": str(m.get("key")), "label": str(m.get("label") or ""), "cat": m.get("cat"),
+                     "t0": m["t0"], "t1": m.get("t1") or (last or m["t0"])}     # still open when the server stopped
+                if m["t1"] > cut:
+                    self.markers.append(m)
+        except (OSError, ValueError):
+            pass
+        self._lines = len(rows)
+        return len(rows)
+
+    def flush(self, force: bool = False) -> int:
+        """Append the samples newer than the last flush; compact the file when it grows. Returns lines written."""
+        if not self.persist or (not force and time.time() < self._flush_at):
+            return 0
+        self._flush_at = time.time() + FLUSH_S
+        new = [x for x in list(self.hist) if x["t"] > self._flushed_t]
+        try:
+            self.persist.parent.mkdir(parents=True, exist_ok=True)
+            if self._lines + len(new) > COMPACT_LINES:
+                keep = self.history()
+                tmp = self.persist.with_suffix(".tmp")
+                tmp.write_text("".join(json.dumps(x, separators=(",", ":")) + "\n" for x in keep), encoding="utf-8")
+                tmp.replace(self.persist)
+                self._lines = len(keep)
+            elif new:
+                with open(self.persist, "a", encoding="utf-8") as f:
+                    f.write("".join(json.dumps(x, separators=(",", ":")) + "\n" for x in new))
+                self._lines += len(new)
+            if new:
+                self._flushed_t = new[-1]["t"]
+            mf = self._marker_file()
+            tmp = mf.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.marker_list(), separators=(",", ":")), encoding="utf-8")
+            tmp.replace(mf)
+        except OSError as e:
+            self.err["persist"] = str(e)
+            return 0
+        return len(new)
 
     # ------------------------------------------------------------ process tree
     def _refresh_tree(self) -> None:
@@ -292,6 +380,10 @@ class Sampler:
                 self.hist.append(s)
                 self.latest = s
                 self.cond.notify_all()
+            try:
+                self.flush()
+            except Exception as e:  # noqa: BLE001 - persistence is a convenience
+                self.err["persist"] = repr(e)
 
     # ------------------------------------------------------------ API helpers
     def wait_next(self, after: float, timeout: float = 5.0) -> dict:

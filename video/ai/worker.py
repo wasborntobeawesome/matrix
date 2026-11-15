@@ -679,13 +679,43 @@ def main():
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.bind(("127.0.0.1", 0))
-    srv.listen(1)
+    srv.listen(4)
     port = srv.getsockname()[1]
+    token = os.environ.get("STUDIO_WORKER_TOKEN") or ""
+
+    def accept():
+        """The studio's connection. With STUDIO_WORKER_TOKEN set (the studio sets it), the first line must be
+        {"op": "hello", "token": ...}; any other client is dropped and the worker keeps waiting."""
+        while True:
+            conn, _ = srv.accept()
+            if not token:
+                return conn, b""
+            conn.settimeout(10)
+            buf = b""
+            try:
+                while b"\n" not in buf and len(buf) < 4096:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+            except OSError:
+                buf = b""
+            first, _, rest = buf.partition(b"\n")
+            try:
+                ok = json.loads(first.decode("utf-8", "replace")).get("token") == token
+            except (ValueError, AttributeError):
+                ok = False
+            if ok:
+                conn.settimeout(None)
+                return conn, rest
+            try:
+                conn.close()
+            except OSError:
+                pass
 
     def lines():
-        conn, _ = srv.accept()
+        conn, buf = accept()
         srv.close()
-        buf = b""
         while True:
             try:
                 chunk = conn.recv(65536)

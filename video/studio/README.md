@@ -61,7 +61,7 @@ Example assets for a fictional app ("Nimbo") are in [`example/`](example/). Clic
 ```
 video/
   html/                 renderer (shared with the original HTML option)
-    index.html          stage; ?data=<data.js url> | ?embed (live preview, waits for loadTimeline)
+    index.html          stage; ?data=<same-origin data.js url> | ?embed (live preview, driven by postMessage)
     transitions.js      scene transitions (lift, fade, slide, zoom, wipe, blur, cut), shared with the studio UI
     app.js              mount(timeline) -> seek(t) is a pure function of t; templates (tokens -> CSS variables,
                         template.css, template.js layouts/transitions/hooks, run with a frozen clock); layouts hero, chips,
@@ -121,9 +121,10 @@ video/
 - **Recordings** are transcoded on import to VP9 WebM (no audio, 30 fps, long side ≤ 1600, GOP 30)
   because Playwright's Chromium has no H.264 decoder. In render mode `seek(t)` sets `currentTime`,
   waits for `seeked` plus two animation frames, and only then is the screenshot taken.
-- **Live preview** is the same renderer page in an iframe (`/renderer/index.html?embed`). The editor
-  calls `loadTimeline(tl)` after each autosave and `seek(t)` on every animation frame, driven by the
-  voice-over `<audio>` clock (or a wall clock before voice exists).
+- **Live preview** is the same renderer page in a *sandboxed* iframe (`/renderer/index.html?embed`,
+  `sandbox="allow-scripts"`: an opaque origin, so template code cannot touch the editor or the API). The
+  editor posts `{type: "load", tl}` after each autosave and `{type: "seek", t}` on every animation frame,
+  driven by the voice-over `<audio>` clock (or a wall clock before voice exists).
 - **Renders** run `html/render.py --project <dir> --progress` as a subprocess. Progress lines become
   job progress, a cancel kills the process, and the MP4 is moved into `renders/` only when complete.
 
@@ -168,7 +169,7 @@ Interactive docs: http://127.0.0.1:8001/docs
 | `GET /templates/{id}/{file}` | template files for the preview (never cached: hot reload) |
 | `GET /api/projects/{id}/timeline?template=<id>` | preview another template without saving it (the picker's live preview) |
 | `GET /api/projects/{id}/history` · `GET …/history/{n}` · `POST …/history/{n}/restore` | version list (newest first: `{id, created, updated, kind, summary, scenes}`) · one snapshot with its brief · restore (saved as a new version) |
-| `GET /api/projects/{id}/followup[?format=text]` | ready-to-send English message for the source AI + `issues`, `counts`, `ok` |
+| `GET /api/projects/{id}/followup[?format=text][&lang=uz]` | ready-to-send message for the source AI (English, or Uzbek with `lang=uz`) + `issues`, `counts`, `ok` |
 
 Render jobs go through one queue, so only one render runs at a time and the others wait. Voice jobs
 use their own queue. A render first generates any missing voice lines. If Ovoz fails it errors,
@@ -348,8 +349,9 @@ language, 23–36 words each; error = |aligned word start − true start|):
   animations are paused and seeked; full templates render without compositor hints so a frame never
   depends on the seek order. `video/templates/validate.py` checks manifests, renders every layout × format
   × en/ar/ru/uz, flags overflow / safe-zone / caption collisions / fonts and compares double renders.
-- render.py starts Chromium with `--allow-file-access-from-files` so template.js can be an ES module from
-  `file://`. Only import templates you trust: they run JavaScript.
+- Template code is sandboxed (see *Security* below): render.py serves the page from a virtual origin that
+  only exposes the folders the render needs, with no network; the live preview is a sandboxed iframe. A
+  template still runs JavaScript inside the render page, so it can draw anything into *its own* video.
 
 ### Transitions
 `lift` (the original), `fade`, `slide`, `zoom`, `wipe`, `blur`, `cut` (`video/html/transitions.js`) plus
@@ -374,8 +376,12 @@ screen recording). Copy button in the dialog.
 ### English / Oʻzbek interface
 EN / OʻZ switch in the top bar, remembered per browser (`localStorage`). Every UI string is in
 `static/strings.js` (English) and `static/strings-uz.js` (Uzbek Latin with oʻ gʻ ʼ, keys checked to match);
-buttons and tabs wrap instead of overflowing. Server messages (warnings, errors, history summaries, the
-follow-up) stay in English.
+buttons and tabs wrap instead of overflowing. Server messages follow the UI language too: the UI sends
+`X-UI-Lang: en|uz` with every API call (or `?ui_lang=uz`), and the server translates brief warnings, upload
+errors, error details, history summaries, job / AI-job / "Make video" stage messages, errors and notices
+(`i18n.py`: English regex → Uzbek template; anything without a translation stays English). The follow-up
+message for the source AI stays **English by default** (AIs work best in it); the dialog has a *Message
+language* switch and the API takes `?lang=uz`.
 
 ### Verified (2026-11-15, test server on :8011, Playwright + API)
 
@@ -444,6 +450,10 @@ follow-up) stay in English.
 - **Overhead (measured):** 2.7 ms CPU per 1 s sample in steady state = 0.27 % of one core (0.017 % of the
   16-thread CPU), ~6 ms wall time, max 24 ms; the first samples read every process's command line once.
   The page shows the live figure at the bottom.
+- **History survives a restart:** every 15 s the new samples are appended to `library/monitor-history.jsonl`
+  (one ~150-byte JSON line per sample) and the markers saved to `library/monitor-markers.json`; once the file
+  holds about an hour it is rewritten with the last 30 minutes. On start the last 30 minutes are loaded back
+  (a torn last line after a crash is skipped; markers still open are closed at the last saved sample).
 
 ### Warm AI model workers (128 GB RAM)
 - One `video/ai/worker.py --family <f>` process per model family (`workers.py`): `wan` (Wan2.2-TI2V-5B,
@@ -475,13 +485,15 @@ AI-queue job (`generate`).
 
 | id | Model | Licence | Modes | Draft / final | Use |
 |---|---|---|---|---|---|
-| `wan22-5b` | Wan2.2-TI2V-5B (unchanged) | Apache-2.0 | t2v, i2v | 480×832 / 704×1280, 24 fps, 3.4 / 5 s | the original |
-| `fastwan-5b` | FastWan2.2-TI2V-5B (FastVideo, 3-step DMD) | Apache-2.0 | t2v, i2v | same sizes, 3 steps | **fast drafts** (20 s warm) |
+| `fastwan-5b` | FastWan2.2-TI2V-5B (FastVideo, 3-step DMD) | Apache-2.0 | t2v, i2v | 480×832 / 704×1280, 24 fps, 3 steps | **the default** (drafts 20 s warm) |
+| `wan22-5b` | Wan2.2-TI2V-5B (unchanged) | Apache-2.0 | t2v, i2v | same sizes, 20 / 30 steps | *legacy* (the original; draft clips came out near-black) |
 | `wan22-a14b` | Wan2.2-T2V/I2V-A14B + Wan2.2-Lightning 4-step LoRA | Apache-2.0 | t2v, i2v | 480×832 / 720×1280, 16 fps, 5 s | **quality** |
 
 - Same 3 prompts at draft settings (frames in `preview/v2-phase3-providers-compare.png`, full table and
   judgement in `../ai/README.md`): A14B is clearly best (detail, natural motion), FastWan is good and 6× faster
-  than the 5B, the original 5B draft was nearly black on 2 of 3 prompts.
+  than the 5B, the original 5B draft was nearly black on 2 of 3 prompts. So **`fastwan-5b` is the default**
+  (a project without `broll_provider`, the b-roll form, "Make video"); `wan22-5b` stays selectable and is
+  marked *legacy* in the UI. Old jobs / clips without a provider still count as `wan22-5b`.
 - **Animate an image (image-to-video):** the b-roll form (AI page and the scene form) has *Animate this image*:
   a project image or a library portrait; the prompt then describes the motion
   (`preview/v2-phase3-i2v-portrait.png`): Wan2.2-I2V-A14B keeps the face and background (264 s cold); FastWan is
@@ -505,6 +517,13 @@ AI-queue job (`generate`).
   energies and spectral flux (dB change of 24 log bands per 0.5 s: a sine 0.0, noise 2.0, music 4–6, the
   builtin tracks 3–12). Fails on silence, noise-like spectra or a static drone. Tested on a sine and white
   noise (both rejected) and every generated track (passed).
+- **Tone shaping** (generated tracks only — ACE-Step output is bass-heavy): when `music.add_track` stores a
+  `source: "generated"` track it keeps the untouched take as `original.<ext>` and writes `track.<ext>` through
+  `highpass=38 Hz (12 dB/oct)` + `lowshelf 120 Hz −3 dB (Q 0.7)` + make-up gain back to the original's
+  integrated loudness (limiter at −1 dBFS). `meta.tone` records the settings and ffmpeg measurements
+  (loudness, sub-bass < 60 Hz and bass 60–250 Hz RMS before/after). On the three generated library tracks:
+  loudness −9.7 → −9.9, −17.4 → −17.4, −11.6 → −11.6 LUFS; sub-bass RMS −2.9 / −1.9 / −1.0 dB; energy below
+  30 Hz −5.8 / −8.4 / −16.8 dB; spectral centroid up 26–112 Hz. Uploads and builtin tracks are not touched.
 - UI: **Generate music** on the AI page and in the editor's Music tab (generate now, or *Generate during
   “Make video”*, which stores `music.generate` in the brief).
 
@@ -552,7 +571,7 @@ AI-queue job (`generate`).
   nobody listened to them.
 - **Monitor:** `v2-phase3-monitor-running-warm-job.png` (a warm FastWan job: *Running now* chip, warm RAM
   tile 23.9 GB = the chart band = the worker table), `…-hover.png` (crosshair tooltip with the stage list).
-  History lives in the server process: a restart starts a new 30 minutes.
+  History is saved every 15 s and reloaded after a restart (see *Live system monitor*).
 - **UI:** AI page (providers, image-to-video, Generate music, warm models), editor scene background (provider
   pre-selected from the scene), Music tab (*Generate music*, *Generate during “Make video”*), AI tab (project
   default provider) — EN and OʻZ at 1600 / 1280 / 420 px, no console errors, no horizontal overflow
@@ -948,6 +967,63 @@ presenters. The UI shows the licences and this disclosure on the AI page and in 
   headline, captions or progress bar. This was the 9:16 overlap bug. A focus that already spans almost the
   full screenshot width gets little extra magnification; the ring and the dimming carry it.
 
+## Security
+
+A local tool, but a web page: anything open in the same browser can send requests to `127.0.0.1`, and
+templates / workflows / briefs come from other people or AIs. The v2 hardening review is in
+[`SECURITY-REVIEW.md`](SECURITY-REVIEW.md) (finding → fix → test). In short:
+
+- **Requests** (`security.py`, ASGI middleware): the Host must be a loopback name (DNS rebinding) unless
+  `STUDIO_ALLOWED_HOSTS` lists it; POST/PUT/PATCH/DELETE with an `Origin` from another site, `Origin: null` or
+  `Sec-Fetch-Site: cross-site` get 403 (tools without Origin, like curl, still work — the same rule as Ovoz);
+  per-route body limits (uploads 1.5 GB, music 64 MB, templates 52 MB, workflows 16 MB, everything else 2 MB),
+  enforced while streaming; `nosniff`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy`.
+- **Templates:** the zip import refuses path traversal, absolute / drive / UNC paths, symlinks, Windows device
+  names, case-duplicates, other file types, bombs (declared and real size, entry count before parsing) and
+  installs atomically. Template files are served with `Content-Security-Policy: sandbox`. Template code runs
+  in a sandboxed preview iframe and, when rendering, on a virtual origin that exposes only the needed folders
+  (no `--allow-file-access-from-files`, no network). `templates/validate.py` uses the same sandbox.
+- **ComfyUI:** an external ComfyUI must be on loopback unless `STUDIO_COMFY_HOSTS=host1,host2` (or `*`)
+  allows it; `extra_args` cannot change `--listen`, ports, folders or CORS; uploaded workflows are size- and
+  shape-checked (≤ 1500 nodes, node ids, class names) and previews must be real images.
+- **Warm workers** accept commands only after a secret handshake (`STUDIO_WORKER_TOKEN`, set by the studio).
+- **Processes:** cancelling a render kills render.py with its Chromium and ffmpeg (process tree); the server
+  does the same on shutdown; failed renders and AI jobs leave no temp files.
+
+Verified (2026-11-15, test instance on :8014 with its own data folder, Playwright): every page clicked
+through with no console errors (`preview/v2-harden-*.png`); from inside the sandboxed preview `parent.document`
+and `localStorage` throw and API calls are blocked while the Bold template (template.js + fonts) renders; an
+imported template whose module tries `window.top` / a POST ran only in the preview frame and changed nothing;
+`/renderer/index.html?data=https://…` loads no foreign script; a render cancelled at frame 0 left none of its 12
+processes; a full 30.8 s render took 30.1 s; the monitor showed the previous 8 minutes after a hard kill and
+restart; `render.py` with no arguments still renders the Ovoz promo (641 frames, 21.37 s).
+
+## Tests
+
+```sh
+video/.venv/Scripts/python -m pip install pytest          # once
+video/.venv/Scripts/python -m pytest video/studio/tests   # 148 tests, ~8–10 s, offline: no GPU, no Ovoz, no network
+video/.venv/Scripts/python -m pytest video/studio/tests -m slow   # + the real renderer: a 2 s video and the sandbox probe
+```
+
+The suite runs in-process (FastAPI `TestClient`) against a throw-away data folder: `tests/conftest.py`
+sets `STUDIO_DATA_DIR`, `STUDIO_TEMPLATES_DIR` and `STUDIO_WORKFLOWS_DIR` (see `paths.py`) and
+`STUDIO_KEEP_LEFTOVERS=1` before importing the studio, so it never touches real projects, job state or the
+warm workers of a running studio; Ovoz points at a closed port and faster-whisper is mocked. Covered: brief
+normalisation (old briefs, languages, formats, injected internal keys), Uzbek apostrophes, caption chunks and
+the alignment fallback, follow-up messages (EN/UZ), history snapshots / coalescing / restore, template
+manifests and zip import with malicious zips, ComfyUI mapping detection on both sample workflows and upload
+validation, music mix (loudness, peak, ducking) and tone shaping, monitor history persistence, i18n, and API
+smoke tests (example project, update, history, same-origin / Host rejection, upload and body limits, ids in
+URLs, security headers, render-process cleanup).
+
+A second studio for manual testing next to the real one (own data, never touches its jobs or workers):
+
+```sh
+set STUDIO_DATA_DIR=C:\temp\studio-test & set STUDIO_KEEP_LEFTOVERS=1
+video/.venv/Scripts/python -m uvicorn server:app --app-dir video/studio --port 8014
+```
+
 ## Verified (2026-11-15)
 
 - `studio/preview/ui-*.png`: projects page, AI-request dialog, editor (scene form, focus picker,
@@ -975,4 +1051,5 @@ presenters. The UI shows the licences and this disclosure on the AI page and in 
   table); it helps more on local voices with uneven pacing and on lines with pauses.
 - Music levels in the editor preview are approximate (HTML audio volume, the duck envelope sampled at
   10 Hz); the render's mix is the reference.
-- No authentication: keep it on 127.0.0.1.
+- No authentication: keep it on 127.0.0.1. Reads (GET) are not origin-checked: other sites cannot read the
+  answers (no CORS), but a page could still trigger a cheap GET such as a timeline preview.

@@ -1626,6 +1626,28 @@
 
   if (window.TIMELINE) window.loadTimeline(window.TIMELINE, window.AUDIO);
 
+  // ---------- studio live preview: postMessage bridge ----------
+  // The studio shows this page in a sandboxed iframe (an opaque origin), so template.js cannot reach the
+  // studio's page, cookies or API. The parent drives the preview with messages instead of calling
+  // window.loadTimeline / seek / setPlaying directly (those stay for render.py and older studio pages).
+  if (embed && window.parent !== window) {
+    const reply = msg => { try { window.parent.postMessage(msg, "*"); } catch { /* parent gone */ } };
+    addEventListener("message", e => {
+      if (e.source !== window.parent || !e.data || typeof e.data !== "object") return;
+      const d = e.data;
+      if (d.type === "load" && d.tl) {
+        window.loadTimeline(d.tl).then(() => reply({ type: "loaded", seq: d.seq }),
+          err => reply({ type: "loaded", seq: d.seq, error: String((err && err.message) || err) }));
+      } else if (d.type === "seek") {
+        lastT = +d.t || 0;
+        if (window.__ready) window.seek(lastT);
+      } else if (d.type === "play") {
+        window.setPlaying(!!d.on);
+      }
+    });
+    reply({ type: "hello" });
+  }
+
   // ---------- standalone live preview (open index.html in a browser, click to play) ----------
   if (!renderMode && !embed && window.TIMELINE) {
     const audio = new Audio(window.TIMELINE.audio_url || "../shared/build/voiceover.wav");

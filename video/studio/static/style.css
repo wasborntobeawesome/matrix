@@ -507,3 +507,5 @@ table.lic td { overflow-wrap: anywhere; }
 .wf-map-t select { max-width: 280px; }
 .wf-val { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 600px) { .wf-map-t select { max-width: 150px; } .top-right .comfy-pill { display: none; } }
+.legacy-tag { display: inline-block; margin-left: 6px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  padding: 0 5px; border-radius: 5px; border: 1px solid currentColor; opacity: .7; vertical-align: middle; }

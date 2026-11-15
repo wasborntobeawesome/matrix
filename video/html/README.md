@@ -110,9 +110,14 @@ The renderer is also the engine of [`video/studio`](../studio/README.md):
   `assets/`, output `renders/<timestamp>.mp4`). `--progress` prints `@@PROGRESS {json}` lines, and
   `--stills-dir` sets where `--stills` writes. A timeline without `audio` renders with a silent track.
   The no-argument CLI is unchanged.
-- `index.html?data=<url>` loads any data.js. `?embed` loads nothing and waits for
-  `window.loadTimeline(tl)` (live preview inside the studio). `app.js` can re-mount with a new
-  timeline without reloading.
+- `index.html?data=<url>` loads a data.js of the same origin (never another site's script). `?embed`
+  loads nothing and waits for a timeline from the parent page: `postMessage({type: "load", tl})`, then
+  `{type: "seek", t}` / `{type: "play", on}` (the studio's sandboxed live preview); `window.loadTimeline(tl)`
+  still works for same-origin callers. `app.js` can re-mount with a new timeline without reloading.
+- render.py opens the page from a virtual origin (`http://render.studio.local`, answered by a Playwright
+  route from the renderer, its fonts and the folders the timeline's `file://` URIs name), not from
+  `file://`; every other request is aborted and Chromium has a dead proxy and no DNS. Template code can
+  therefore neither read other files on the disk nor send anything out.
 - New layouts: `screen` (phone / browser / no frame, Ken-Burns scroll, camera zoom into `focus`,
   highlight ring + spotlight, callout pill with arrow, screen recordings via `<video>`) and
   `screens` (2–3 devices side by side or cascaded, labels synced to speech).

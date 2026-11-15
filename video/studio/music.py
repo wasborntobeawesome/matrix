@@ -27,13 +27,15 @@ import time
 import wave
 from pathlib import Path
 
+import paths
+
 import numpy as np
 
 from store import FFMPEG, StoreError, now, probe
 
 STUDIO = Path(__file__).resolve().parent
 VIDEO = STUDIO.parent
-MUSIC = VIDEO / "library" / "music"
+MUSIC = paths.LIB / "music"
 EXTS = (".mp3", ".wav", ".ogg", ".m4a")
 MAX_BYTES = 60 * 1024 * 1024
 MAX_SECONDS = 20 * 60
@@ -44,11 +46,15 @@ VOICE_REF = -20.0      # LUFS the voice is matched to before mixing
 MUSIC_REF = -12.0      # LUFS the track is matched to before volume_db
 TARGET = -14.0         # final mix, integrated LUFS
 TRUE_PEAK = -1.5
-MIX_VERSION = 3
+MIX_VERSION = 4          # 4: ducking look-ahead / hold no longer swapped
 DUCK_ATTACK = 0.08     # s to go down
 DUCK_RELEASE = 0.45    # s to come back up
 DUCK_LOOKAHEAD = 0.15  # s before a word starts
 DUCK_HOLD = 0.30       # s after speech before releasing
+# Tone shaping of generated tracks (ACE-Step output is bass-heavy): a gentle high-pass under the audible bass,
+# a mild low-shelf cut, then make-up gain back to the track's own loudness. The original is kept.
+TONE = {"highpass_hz": 38.0, "shelf_hz": 120.0, "shelf_db": -3.0, "shelf_q": 0.7}
+TONE_VERSION = 1
 _lock = threading.RLock()
 
 
@@ -90,6 +96,52 @@ def loudness(path: Path) -> float | None:
     return v if v > -70 else None
 
 
+def tone_filter(t: dict | None = None) -> str:
+    t = {**TONE, **(t or {})}
+    return (f"highpass=f={t['highpass_hz']}:poles=2,"
+            f"lowshelf=f={t['shelf_hz']}:g={t['shelf_db']}:t=q:w={t['shelf_q']}")
+
+
+def band_rms_db(path: Path, lo: float | None, hi: float | None) -> float | None:
+    """RMS level (dBFS, ffmpeg astats) of one frequency band: e.g. (None, 60) = sub-bass, (60, 250) = bass."""
+    af = ",".join(x for x in (f"highpass=f={lo}:poles=2" if lo else "", f"lowpass=f={hi}:poles=2" if hi else "",
+                              "astats=metadata=0:measure_perchannel=none:measure_overall=RMS_level") if x)
+    r = subprocess.run([FFMPEG, "-hide_banner", "-nostats", "-i", str(path), "-ac", "1", "-af", af, "-f", "null", "-"],
+                       capture_output=True, text=True, errors="replace", creationflags=NOWIN)
+    m = re.findall(r"RMS level dB:\s+(-?[\d.]+|-inf)", r.stderr)
+    return None if not m or m[-1] == "-inf" else round(float(m[-1]), 2)
+
+
+def shape_generated(src: Path, dest: Path, lufs_in: float | None = None) -> dict:
+    """Tone shaping for a generated track: high-pass ~38 Hz + a mild low-shelf cut, then make-up gain so the
+    integrated loudness stays at the original's (a limiter at -1 dBFS catches the few peaks the gain raises).
+    Writes `dest` (same container as `src`); returns the measurements."""
+    src, dest = Path(src), Path(dest)
+    lufs_in = lufs_in if lufs_in is not None else loudness(src)
+    filt = tone_filter()
+    # pass 1: loudness after the EQ alone
+    r = subprocess.run([FFMPEG, "-hide_banner", "-nostats", "-i", str(src), "-af", filt + ",ebur128=framelog=quiet",
+                        "-f", "null", "-"], capture_output=True, text=True, errors="replace", creationflags=NOWIN)
+    m = re.findall(r"I:\s+(-?[\d.]+|-inf) LUFS", r.stderr)
+    eq_lufs = float(m[-1]) if m and m[-1] != "-inf" else None
+    gain = round(max(-6.0, min(6.0, (lufs_in - eq_lufs) if (lufs_in is not None and eq_lufs is not None) else 0.0)), 2)
+    codec = {".ogg": ["-c:a", "libvorbis", "-q:a", "6"], ".mp3": ["-c:a", "libmp3lame", "-q:a", "2"],
+             ".m4a": ["-c:a", "aac", "-b:a", "192k"], ".wav": ["-c:a", "pcm_s16le"]}.get(src.suffix.lower(),
+                                                                                      ["-c:a", "libvorbis", "-q:a", "6"])
+    tmp = dest.with_name(dest.stem + ".shaping" + dest.suffix)
+    r2 = subprocess.run([FFMPEG, "-y", "-v", "error", "-i", str(src), "-af",
+                         f"{filt},volume={gain}dB,alimiter=limit=0.891:level=0:latency=1", "-ar", str(SR),
+                         *codec, str(tmp)], capture_output=True, text=True, errors="replace", creationflags=NOWIN)
+    if r2.returncode != 0 or not tmp.exists():
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError("tone shaping failed: " + r2.stderr.strip()[-300:])
+    tmp.replace(dest)
+    return {**TONE, "version": TONE_VERSION, "makeup_gain_db": gain, "lufs_before": lufs_in,
+            "lufs_after": loudness(dest),
+            "sub_db_before": band_rms_db(src, None, 60), "sub_db_after": band_rms_db(dest, None, 60),
+            "bass_db_before": band_rms_db(src, 60, 250), "bass_db_after": band_rms_db(dest, 60, 250)}
+
+
 def write_wav(path: Path, x: np.ndarray) -> None:
     x = np.clip(x, -1, 1)
     pcm = (x * 32767).astype("<i2")
@@ -129,7 +181,9 @@ def track_file(tid: str) -> Path:
 def add_track(src: Path, meta: dict, move: bool = False) -> dict:
     """Add an audio file to the library. meta: title, artist, licence, source, mood?, bpm?, prompt?, id?.
 
-    Checks that ffmpeg can decode it, measures duration + loudness. Returns the stored meta."""
+    Checks that ffmpeg can decode it, measures duration + loudness. Returns the stored meta.
+    A generated track (source "generated") is tone-shaped (shape_generated: less sub-bass / boom, same
+    loudness); the untouched original is kept next to it as original.<ext> (meta "tone" has the numbers)."""
     src = Path(src)
     ext = src.suffix.lower()
     if ext not in EXTS:
@@ -152,15 +206,28 @@ def add_track(src: Path, meta: dict, move: bool = False) -> dict:
     d = MUSIC / tid
     with _lock:
         d.mkdir(parents=True, exist_ok=True)
-        for old in d.glob("track.*"):
+        for old in [*d.glob("track.*"), *d.glob("original.*")]:
             old.unlink()
-        (shutil.move if move else shutil.copy2)(str(src), d / f"track{ext}")
+        tone = None
+        if meta.get("source") == "generated" and meta.get("tone") is not False:
+            (shutil.move if move else shutil.copy2)(str(src), d / f"original{ext}")
+            try:
+                tone = shape_generated(d / f"original{ext}", d / f"track{ext}", lufs)
+                tone["original"] = f"original{ext}"
+                lufs = tone["lufs_after"] if tone.get("lufs_after") is not None else lufs
+            except (RuntimeError, OSError) as e:     # never lose a generated track over the EQ
+                shutil.copy2(d / f"original{ext}", d / f"track{ext}")
+                tone = {"error": str(e)[:300]}
+        else:
+            (shutil.move if move else shutil.copy2)(str(src), d / f"track{ext}")
         m = {"id": tid, "title": str(meta.get("title") or src.stem)[:80], "artist": str(meta.get("artist") or "")[:80],
              "licence": str(meta["licence"]).strip()[:160], "source": meta.get("source") or "upload",
              "duration": round(dur, 2), "created": meta.get("created") or now(), "lufs": round(lufs, 1), "ext": ext}
         for k in ("mood", "bpm", "prompt", "original_name", "genre", "seed", "model", "gen_seconds", "check", "key"):
             if meta.get(k) not in (None, ""):
                 m[k] = meta[k]
+        if tone:
+            m["tone"] = tone
         _write(d / "meta.json", m)
     return m
 
@@ -500,7 +567,9 @@ def speech_gate(voice: np.ndarray, hop: float = 0.01) -> tuple[np.ndarray, float
     on = (db > max(top - 38, -60)).astype(np.float64)
     pre, hold = int(DUCK_LOOKAHEAD / hop), int(DUCK_HOLD / hop)
     k = np.convolve(on, np.ones(pre + hold + 1), mode="full")
-    gate = (k[hold: hold + n] > 0).astype(np.float64)
+    # gate[i] = speech anywhere in [i - hold, i + pre]: down `pre` before a word, up `hold` after it
+    # (it was k[hold:], which swapped the two: 0.30 s look-ahead and only 0.15 s hold)
+    gate = (k[pre: pre + n] > 0).astype(np.float64)
     return gate, hop
 
 

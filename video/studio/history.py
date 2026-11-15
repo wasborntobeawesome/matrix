@@ -8,6 +8,7 @@ version saves it as a new snapshot ("restore"), so a restore can itself be undon
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -40,7 +41,7 @@ def _write_index(p, idx: list[dict]) -> None:
 
 
 def _read(p, sid: str) -> dict | None:
-    if not sid.isdigit():
+    if not isinstance(sid, str) or not re.fullmatch(r"[0-9]{1,8}", sid):   # ASCII digits only ("²".isdigit() is True)
         return None
     try:
         return json.loads((_dir(p) / f"{sid}.json").read_text(encoding="utf-8"))

@@ -27,14 +27,19 @@
 </div>
 <div id="play-hint">click to play</div>
 <!-- data.js (window.TIMELINE + window.AUDIO) is written by render.py. Default
-     build/data.js; ?data=<url> loads another one (e.g. a studio project's build);
-     ?embed loads nothing and waits for window.loadTimeline() (studio live preview). -->
+     build/data.js; ?data=<url> loads another one of the same origin (render.py serves it);
+     ?embed loads nothing and waits for a timeline from the parent page (studio live preview:
+     postMessage, see the bridge at the end of app.js). -->
 <script>
 (function () {
   var q = new URLSearchParams(location.search);
   if (q.has("embed")) return;
-  var src = (q.get("data") || "build/data.js").replace(/["<>]/g, "");
-  document.write('<script src="' + src + '"><\/script>');
+  // only a same-origin data script: /renderer/index.html?data=https://elsewhere/x.js must never run
+  // someone else's code on the studio's origin
+  var u;
+  try { u = new URL(q.get("data") || "build/data.js", location.href); } catch (e) { return; }
+  if (u.origin !== location.origin || !/^(https?|file):$/.test(u.protocol)) return;
+  document.write('<script src="' + u.href.replace(/["<>]/g, "") + '"><\/script>');
 })();
 </script>
 <script src="transitions.js"></script>

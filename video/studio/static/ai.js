@@ -145,7 +145,7 @@
     pr.value = prompt;
     const neg = el("textarea", { rows: 2 });
     const seed = el("input", { type: "number", class: "narrow", value: Math.floor(Math.random() * 100000), min: 0, step: 1 });
-    let preset = "draft", orient = orientation, prov = provider || (st && st.default_provider) || "wan22-5b";
+    let preset = "draft", orient = orientation, prov = provider || (st && st.default_provider) || "fastwan-5b";
     let img = image || "";
     const est = el("div", { class: "muted small" });
     const presetBox = el("div", { class: "seg", role: "radiogroup", "aria-label": t("ai.preset") });
@@ -159,6 +159,7 @@
         "aria-checked": p.id === prov ? "true" : "false", title: `${p.model}\n${t("licence")}: ${p.licence} — ${p.licence_note}`,
         onclick: () => { prov = p.id; onProvider && onProvider(p.id); draw(); } },
         el("b", {}, p.name), el("span", { class: `speed sp-${p.speed}` }, t("ai.speed." + p.speed)),
+        p.legacy ? el("span", { class: "legacy-tag", title: t("ai.legacyHelp") }, t("ai.legacy")) : null,
         el("span", { class: "muted tiny" }, `${p.licence} · ${p.modes.includes("i2v") ? t("ai.t2vI2v") : t("ai.t2v")}`))));
       presetBox.replaceChildren(...["draft", "final"].map(k => el("button", { type: "button", class: `seg-btn ${k === preset ? "on" : ""}`,
         role: "radio", "aria-checked": k === preset ? "true" : "false", onclick: () => { preset = k; draw(); } }, t("ai.presets." + k))));
@@ -288,7 +289,8 @@
 
   // providers table (licences + capabilities)
   A.providerTable = st => el("table", { class: "lic" }, el("tbody", {}, ((st && st.providers) || []).map(p => el("tr", {},
-    el("td", {}, el("b", {}, p.name), el("div", { class: "muted tiny" }, p.model)),
+    el("td", {}, el("b", {}, p.name), p.legacy ? el("span", { class: "legacy-tag", title: t("ai.legacyHelp") }, t("ai.legacy")) : null,
+      el("div", { class: "muted tiny" }, p.model)),
     el("td", {}, el("b", {}, p.licence), el("div", { class: "muted tiny" }, p.licence_note)),
     el("td", { class: "muted small" }, `${p.modes.map(m => m.toUpperCase()).join(" + ")} · ${p.presets.draft.portrait.join("×")} / ${p.presets.final.portrait.join("×")} · ${p.presets.final.fps} fps · ≤ ${p.max_seconds} s · RAM ~${Math.round(p.ram_gb)} GB`)))));
 

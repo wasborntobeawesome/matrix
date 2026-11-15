@@ -10,6 +10,8 @@ import threading
 import time
 from pathlib import Path
 
+import paths
+
 from PIL import Image
 
 import brief as B
@@ -17,7 +19,7 @@ import history
 
 STUDIO = Path(__file__).resolve().parent
 VIDEO = STUDIO.parent
-PROJECTS = VIDEO / "projects"
+PROJECTS = paths.PROJECTS
 FFMPEG = str(VIDEO / "bin" / "ffmpeg.exe")
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp"}

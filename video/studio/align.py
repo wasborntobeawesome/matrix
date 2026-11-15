@@ -31,12 +31,14 @@ import time
 import unicodedata
 from pathlib import Path
 
+import paths
+
 STUDIO = Path(__file__).resolve().parent
 VIDEO = STUDIO.parent
 sys.path.insert(0, str(VIDEO / "shared"))
 import voicelib as V  # noqa: E402
 
-CACHE = VIDEO / "library" / "align"
+CACHE = paths.LIB / "align"
 MODEL = os.environ.get("STUDIO_WHISPER_MODEL", "small")
 THREADS = int(os.environ.get("STUDIO_WHISPER_THREADS", "8"))
 VERSION = 3          # bump when the alignment algorithm changes (invalidates the cache)

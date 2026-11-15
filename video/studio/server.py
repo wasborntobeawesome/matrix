@@ -18,6 +18,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import align
 import brief as B
@@ -26,11 +27,13 @@ import comfy as CF
 import comfyflows as CFW
 import followup
 import history as HI
+import i18n as I
 import inbox
 import library as L
 import music as MU
 import presenter as PR
 import providers as PV
+import security
 import sysmon
 import templates as TP
 from aijobs import AI_PY, DISCLOSURE, LICENCES, AIJobs
@@ -45,6 +48,7 @@ MAX_REQUEST = 1536 * 1024 * 1024
 
 app = FastAPI(title="Video Studio", version="1.0",
               description="Promo videos from screenshots, recordings and an AI-written brief.")
+app.add_middleware(security.Guard)     # loopback Host, same-origin writes, body limits, security headers
 jobs = Jobs()
 try:
     L.import_existing()   # first start: the 3 existing Wan2.2 clips + the generated presenter portrait
@@ -80,7 +84,8 @@ def _warm_ram() -> dict:
 
 
 sampler = sysmon.Sampler(ai_pids=lambda: ai._ai_pids() if ai is not None else set(), activity=_activity,
-                         warm_ram=_warm_ram, comfy_pids=lambda: ai.comfy.pids() if ai is not None else set())
+                         warm_ram=_warm_ram, comfy_pids=lambda: ai.comfy.pids() if ai is not None else set(),
+                         persist=L.LIB / "monitor-history.jsonl")   # the last 30 min survive a restart
 ai = AIJobs(sampler=sampler)
 make = Pipelines(jobs, ai)
 
@@ -101,13 +106,21 @@ def _startup() -> None:
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
+    jobs.shutdown()             # running renders: render.py + its Chromium + ffmpeg (process tree)
+    sampler.flush(force=True)   # monitor history: the last seconds too
     ai.pool.shutdown()          # warm workers exit with the studio (they also exit when their socket closes)
     # a managed ComfyUI keeps running (it holds no studio state); the next studio start adopts it
 
 
 @app.exception_handler(StoreError)
-def _store_error(_req, e: StoreError):
-    return JSONResponse({"detail": str(e)}, status_code=e.status)
+def _store_error(req, e: StoreError):
+    return JSONResponse({"detail": I.tr(str(e), I.ui_lang(req))}, status_code=e.status)
+
+
+@app.exception_handler(StarletteHTTPException)
+def _http_error(req, e: StarletteHTTPException):
+    detail = I.tr(e.detail, I.ui_lang(req)) if isinstance(e.detail, str) else e.detail
+    return JSONResponse({"detail": detail}, status_code=e.status_code, headers=getattr(e, "headers", None))
 
 
 @app.exception_handler(TP.TemplateError)
@@ -126,8 +139,9 @@ def _comfy_error(_req, e: CF.ComfyError):
 
 
 @app.exception_handler(B.BriefError)
-def _brief_error(_req, e: B.BriefError):
-    return JSONResponse({"detail": "invalid brief", "errors": e.errors}, status_code=422)
+def _brief_error(req, e: B.BriefError):
+    lang = I.ui_lang(req)
+    return JSONResponse({"detail": I.tr("invalid brief", lang), "errors": I.tr_list(e.errors, lang)}, status_code=422)
 
 
 NOCACHE = {"Cache-Control": "no-store"}
@@ -138,9 +152,9 @@ NOCACHE = {"Cache-Control": "no-store"}
 def health():
     try:
         models = build.V.models(build.OVOZ, timeout=3)
-        return {"studio": True, "ovoz": True, "ovoz_url": build.OVOZ, "ovoz_models": len(models)}
+        return {"studio": True, "ovoz": True, "ovoz_url": build.OVOZ, "ovoz_models": len(models), "preview_sandbox": True}
     except build.V.TTSError as e:
-        return {"studio": True, "ovoz": False, "ovoz_url": build.OVOZ, "ovoz_error": str(e)}
+        return {"studio": True, "ovoz": False, "ovoz_url": build.OVOZ, "ovoz_error": str(e), "preview_sandbox": True}
 
 
 @app.get("/api/voices")
@@ -257,11 +271,11 @@ async def create_project(request: Request):
                 raw = B.blank(str(raw.get("product") or "My product")[:60], lang, fmt, langs, fmts)
             files, source = [], request.query_params.get("source", "api")
         p, warnings = import_project(raw, files, source if source in ("api", "ui", "inbox") else "api")
-    return {**p.summary(), "warnings": warnings, "url": f"/#/p/{p.id}"}
+    return {**p.summary(), "warnings": I.tr_list(warnings, I.ui_lang(request)), "url": f"/#/p/{p.id}"}
 
 
 @app.post("/api/projects/example", status_code=201)
-def create_example(format: str = "9:16"):
+def create_example(request: Request, format: str = "9:16"):
     """New project from video/studio/example (fictional app)."""
     raw = json.loads((EXAMPLE / "brief.json").read_text(encoding="utf-8"))
     if format in B.FORMATS:
@@ -275,24 +289,25 @@ def create_example(format: str = "9:16"):
                 shutil.copy2(f, t)
                 files.append((t, f.name))
         p, warnings = import_project(raw, files, "ui")
-    return {**p.summary(), "warnings": warnings}
+    return {**p.summary(), "warnings": I.tr_list(warnings, I.ui_lang(request))}
 
 
-def _detail(p: Project) -> dict:
+def _detail(p: Project, lang: str = "en") -> dict:
     d = p.read()
     brief = d["brief"]
     by_lang = build.voiced_map(p, brief)
     voiced = by_lang.get(brief.get("language")) or {}
     _, warnings = B.normalize(brief, p.assets())
     return {**d, "assets": p.assets(), "renders": p.renders(), "voiced": voiced, "voiced_by_lang": by_lang,
-            "missing": B.missing_translations(brief), "warnings": warnings,
-            "jobs": jobs.for_project(p.id), "ai_jobs": ai.active(project=p.id), "make": make.latest(p.id),
-            "presenter_state": _presenter_state(p)}
+            "missing": B.missing_translations(brief), "warnings": I.tr_list(warnings, lang),
+            "jobs": [I.tr_job(j, lang) for j in jobs.for_project(p.id)],
+            "ai_jobs": [I.tr_job(j, lang) for j in ai.active(project=p.id)],
+            "make": I.tr_job(make.latest(p.id), lang), "presenter_state": _presenter_state(p)}
 
 
 @app.get("/api/projects/{pid}")
-def get_project(pid: str):
-    return _detail(Project.get(pid))
+def get_project(pid: str, request: Request):
+    return _detail(Project.get(pid), I.ui_lang(request))
 
 
 @app.put("/api/projects/{pid}")
@@ -303,14 +318,17 @@ async def update_project(pid: str, request: Request):
     raw = body.get("brief") if isinstance(body, dict) and isinstance(body.get("brief"), dict) else body
     clean, warnings = B.normalize(raw, p.assets())
     snap = p.save_brief(clean)
-    return {"brief": clean, "warnings": warnings, "updated": p.read()["updated"], "snapshot": snap}
+    lang = I.ui_lang(request)
+    if snap:
+        snap = I.tr_history([snap], lang)[0]
+    return {"brief": clean, "warnings": I.tr_list(warnings, lang), "updated": p.read()["updated"], "snapshot": snap}
 
 
 # ---------------------------------------------------------------- version history
 @app.get("/api/projects/{pid}/history")
-def project_history(pid: str):
+def project_history(pid: str, request: Request):
     """Snapshots of the brief, newest first: [{id, created, updated, kind: base|import|edit|restore, summary, scenes}]."""
-    return JSONResponse(HI.listing(Project.get(pid)), headers=NOCACHE)
+    return JSONResponse(I.tr_history(HI.listing(Project.get(pid)), I.ui_lang(request)), headers=NOCACHE)
 
 
 @app.get("/api/projects/{pid}/history/{sid}")
@@ -322,7 +340,7 @@ def project_history_get(pid: str, sid: str):
 
 
 @app.post("/api/projects/{pid}/history/{sid}/restore")
-def project_history_restore(pid: str, sid: str):
+def project_history_restore(pid: str, sid: str, request: Request):
     """Make snapshot `sid` the current brief. This is saved as a new snapshot, so it can be undone."""
     p = Project.get(pid)
     snap = HI.get(p, sid)
@@ -332,16 +350,19 @@ def project_history_restore(pid: str, sid: str):
     when = datetime.fromtimestamp(snap.get("updated") or snap["created"]).strftime("%d %b %H:%M:%S")
     clean, warnings = B.normalize(snap["brief"], p.assets())
     meta = p.save_brief(clean, kind="restore", label=f"Restored the version from {when}")
-    return {"brief": clean, "warnings": warnings, "snapshot": meta, "updated": p.read()["updated"]}
+    lang = I.ui_lang(request)
+    return {"brief": clean, "warnings": I.tr_list(warnings, lang), "snapshot": I.tr_history([meta], lang)[0] if meta else None,
+            "updated": p.read()["updated"]}
 
 
 # ---------------------------------------------------------------- follow-up for the source AI
 @app.get("/api/projects/{pid}/followup")
-def project_followup(pid: str, format: str = "json"):
-    """A ready-to-send English message for the source AI listing missing/invalid files, missing translations,
-    over-long or empty text, badly sized screenshots and suggestions. ?format=text returns just the message."""
+def project_followup(pid: str, format: str = "json", lang: str = "en"):
+    """A ready-to-send message for the source AI listing missing/invalid files, missing translations,
+    over-long or empty text, badly sized screenshots and suggestions. ?format=text returns just the message.
+    ?lang=uz writes it in Uzbek (default English: the source AI usually works in English)."""
     p = Project.get(pid)
-    r = followup.build(p.brief, p.assets())
+    r = followup.build(p.brief, p.assets(), lang=lang if lang in followup.LANGS else "en")
     if format == "text":
         return PlainTextResponse(r["message"])
     return JSONResponse(r, headers=NOCACHE)
@@ -363,6 +384,7 @@ def delete_project(pid: str):
 # ---------------------------------------------------------------- assets
 @app.post("/api/projects/{pid}/assets", status_code=201)
 async def upload_assets(pid: str, request: Request):
+    lang = I.ui_lang(request)
     p = Project.get(pid)
     if not request.headers.get("content-type", "").startswith("multipart/form-data"):
         raise HTTPException(415, "send multipart/form-data with one or more files")
@@ -382,17 +404,18 @@ async def upload_assets(pid: str, request: Request):
         if mapping:
             p.save_brief(B.normalize(B.rename_assets(p.brief, mapping), p.assets())[0])
         p.touch()
+    errors = I.tr_list(errors, lang)
     if not added and errors:
         raise HTTPException(400, "; ".join(errors))
     return {"added": added, "errors": errors, "assets": p.assets()}
 
 
 @app.delete("/api/projects/{pid}/assets/{name}")
-def delete_asset(pid: str, name: str):
+def delete_asset(pid: str, name: str, request: Request):
     p = Project.get(pid)
     p.delete_asset(name)
     _, warnings = B.normalize(p.brief, p.assets())
-    return {"deleted": name, "warnings": warnings}
+    return {"deleted": name, "warnings": I.tr_list(warnings, I.ui_lang(request))}
 
 
 @app.get("/api/projects/{pid}/files/{name}")
@@ -474,31 +497,35 @@ async def make_render(pid: str, request: Request):
     prm = _body(await request.body())
     if (j := jobs.busy(pid, "render")):
         return JSONResponse(j, status_code=409)
+    try:
+        workers = max(1, min(16, int(prm.get("workers") or 8)))   # parallel Chromium pages
+    except (TypeError, ValueError):
+        raise HTTPException(422, "workers must be a number (1-16)") from None
     return jobs.submit("render", pid, allow_silent=bool(prm.get("allow_silent")),
-                       skip_voice=bool(prm.get("skip_voice")), workers=int(prm.get("workers") or 8),
+                       skip_voice=bool(prm.get("skip_voice")), workers=workers,
                        langs=prm.get("langs") if isinstance(prm.get("langs"), list) else None,
                        formats=prm.get("formats") if isinstance(prm.get("formats"), list) else None)
 
 
 @app.get("/api/jobs/{jid}")
-def job(jid: str):
+def job(jid: str, request: Request):
     j = jobs.get(jid)
     if not j:
         raise HTTPException(404, "job not found")
-    return j
+    return I.tr_job(j, I.ui_lang(request))
 
 
 @app.post("/api/jobs/{jid}/cancel")
-def cancel_job(jid: str):
+def cancel_job(jid: str, request: Request):
     j = jobs.cancel(jid)
     if not j:
         raise HTTPException(404, "job not found")
-    return j
+    return I.tr_job(j, I.ui_lang(request))
 
 
 @app.get("/api/projects/{pid}/jobs")
-def project_jobs(pid: str):
-    return jobs.for_project(pid)
+def project_jobs(pid: str, request: Request):
+    return [I.tr_job(j, I.ui_lang(request)) for j in jobs.for_project(pid)]
 
 
 # ---------------------------------------------------------------- renders
@@ -651,16 +678,17 @@ def ai_status(fresh: int = 0):
 
 
 @app.get("/api/ai/jobs")
-def ai_jobs(project: str | None = None):
-    return JSONResponse(ai.list(project=project), headers=NOCACHE)
+def ai_jobs(request: Request, project: str | None = None):
+    lang = I.ui_lang(request)
+    return JSONResponse([I.tr_job(j, lang) for j in ai.list(project=project)], headers=NOCACHE)
 
 
 @app.get("/api/ai/jobs/{jid}")
-def ai_job(jid: str):
+def ai_job(jid: str, request: Request):
     j = ai.get(jid)
     if not j:
         raise HTTPException(404, "job not found")
-    return JSONResponse(j, headers=NOCACHE)
+    return JSONResponse(I.tr_job(j, I.ui_lang(request)), headers=NOCACHE)
 
 
 @app.post("/api/ai/jobs/{jid}/cancel")
@@ -744,7 +772,7 @@ async def ai_broll(request: Request):
     for j in ai.active(kind="broll"):
         jp = j["params"]
         if j["preset"] == preset and jp["prompt"] == params["prompt"] and jp["seed"] == seed and jp["orientation"] == orient \
-                and (jp.get("provider") or PV.DEFAULT) == provider and (jp.get("image") or {}).get("sha") == img_sha:
+                and (jp.get("provider") or PV.ORIGINAL) == provider and (jp.get("image") or {}).get("sha") == img_sha:
             return JSONResponse(j, status_code=409)
     return ai.submit("broll", params, project=project, label=label, units=pv["presets"][preset]["steps"], preset=preset)
 
@@ -913,6 +941,29 @@ def comfy_workflow_preview(wid: str):
     return FileResponse(f, headers=NOCACHE)
 
 
+MAX_WORKFLOW = 8 * 1024 * 1024
+MAX_PREVIEW = 5 * 1024 * 1024
+
+
+def _check_preview(data: bytes, fn: str) -> tuple[bytes, str]:
+    """A workflow preview must really be a PNG / JPEG / WebP (it is served back with an image type)."""
+    if len(data) > MAX_PREVIEW:
+        raise CFW.FlowError(f"preview image too large (limit {MAX_PREVIEW // 2**20} MB)", 413)
+    import io
+
+    from PIL import Image
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            im.verify()
+            fmt = (im.format or "").lower()
+    except Exception:  # noqa: BLE001 - any decoder error = not an image
+        raise CFW.FlowError(f"{fn}: not a valid image") from None
+    ext = {"png": ".png", "jpeg": ".jpg", "webp": ".webp"}.get(fmt)
+    if not ext:
+        raise CFW.FlowError(f"{fn}: preview must be PNG, JPEG or WebP")
+    return data, ext
+
+
 async def _read_workflow_upload(request: Request) -> tuple[dict, dict, bytes | None, str]:
     ctype = request.headers.get("content-type", "")
     meta, preview, pext = {}, None, ".jpg"
@@ -926,12 +977,13 @@ async def _read_workflow_upload(request: Request) -> tuple[dict, dict, bytes | N
                 elif key == "workflow" and val.strip():
                     raw = val
                 continue
-            data = await val.read(30 * 1024 * 1024)
             fn = (val.filename or "").lower()
             if fn.endswith(".json") or key == "workflow":
-                raw = data
+                raw = await val.read(MAX_WORKFLOW + 1)
+                if len(raw) > MAX_WORKFLOW:
+                    raise CFW.FlowError(f"workflow file too large (limit {MAX_WORKFLOW // 2**20} MB)", 413)
             elif fn.endswith((".png", ".jpg", ".jpeg", ".webp")):
-                preview, pext = data, Path(fn).suffix.replace(".jpeg", ".jpg")
+                preview, pext = _check_preview(await val.read(MAX_PREVIEW + 1), fn)
         if raw is None:
             raise CFW.FlowError("no workflow file — upload the JSON from ComfyUI's Workflow → Export (API)")
         meta["commercial"] = str(meta.get("commercial") or "").lower() in ("1", "true", "on", "yes")
@@ -942,7 +994,8 @@ async def _read_workflow_upload(request: Request) -> tuple[dict, dict, bytes | N
     except ValueError as e:
         raise CFW.FlowError(f"not valid JSON: {e}") from None
     if isinstance(d, dict) and "workflow" in d:
-        meta = {k: d.get(k) for k in ("name", "licence", "notes", "id", "commercial") if d.get(k) is not None}
+        meta = {k: d.get(k) if k == "commercial" else str(d.get(k))
+                for k in ("name", "licence", "notes", "id", "commercial") if d.get(k) is not None}
         return CFW.parse(d["workflow"]), meta, None, pext
     return CFW.parse(d), meta, None, pext
 
@@ -964,7 +1017,7 @@ async def comfy_workflow_upload(request: Request):
     g, meta, preview, pext = await _read_workflow_upload(request)
     det = CFW.detect(g)
     m = CFW.new_manifest(g, meta, det)
-    wid = (meta.get("id") or "").strip().lower() or None
+    wid = str(meta.get("id") or "").strip().lower() or None
     m = CFW.save(g, m, wid, preview=preview, preview_ext=pext)
     return {**_wf_view(m, ai.comfy.object_info_cached()), "detected": det, "nodes_list": CFW.nodes_view(g)}
 
@@ -1192,22 +1245,23 @@ async def make_video(pid: str, request: Request):
 
 
 @app.get("/api/projects/{pid}/make")
-def make_status(pid: str):
+def make_status(pid: str, request: Request):
     Project.get(pid)
-    return JSONResponse(make.latest(pid) or {}, headers=NOCACHE)
+    return JSONResponse(I.tr_job(make.latest(pid), I.ui_lang(request)) or {}, headers=NOCACHE)
 
 
 @app.get("/api/make")
-def make_list():
-    return JSONResponse(make.list(), headers=NOCACHE)
+def make_list(request: Request):
+    lang = I.ui_lang(request)
+    return JSONResponse([I.tr_job(it, lang) for it in make.list()], headers=NOCACHE)
 
 
 @app.get("/api/make/{mid}")
-def make_get(mid: str):
+def make_get(mid: str, request: Request):
     it = make.get(mid)
     if not it:
         raise HTTPException(404, "pipeline not found")
-    return JSONResponse(it, headers=NOCACHE)
+    return JSONResponse(I.tr_job(it, I.ui_lang(request)), headers=NOCACHE)
 
 
 @app.post("/api/make/{mid}/cancel")

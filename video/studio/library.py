@@ -18,13 +18,15 @@ import threading
 import time
 from pathlib import Path
 
+import paths
+
 from PIL import Image
 
 from store import FFMPEG, StoreError, now, probe
 
 STUDIO = Path(__file__).resolve().parent
 VIDEO = STUDIO.parent
-LIB = VIDEO / "library"
+LIB = paths.LIB
 BROLL = LIB / "broll"
 PORTRAITS = LIB / "portraits"
 AI = VIDEO / "ai"

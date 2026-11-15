@@ -18,7 +18,6 @@
       if (v == null || v === false) continue;
       if (k === "class") e.className = v;
       else if (k === "text") e.textContent = v;
-      else if (k === "html") e.innerHTML = v;
       else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
       else if (k === "style" && typeof v === "object") Object.assign(e.style, v);
       else if (v === true) e.setAttribute(k, "");
@@ -68,7 +67,7 @@
 
   // ---------------------------------------------------------------- API
   async function api(method, url, body, isForm) {
-    const opt = { method, headers: {} };
+    const opt = { method, headers: { "X-UI-Lang": uiLang() } };
     if (body !== undefined) {
       if (isForm) opt.body = body;
       else { opt.body = JSON.stringify(body); opt.headers["Content-Type"] = "application/json"; }
@@ -122,16 +121,21 @@
 
   // ---------------------------------------------------------------- Ovoz status
   const OV = { ok: null, models: [], error: "" };
+  // server capabilities (from the first /api/health): preview_sandbox = the server sends the CORS headers a
+  // sandboxed preview frame needs (an older server running against these files keeps the old frame)
+  let capsDone;
+  const capsReady = new Promise(res => { capsDone = res; });
   async function checkOvoz() {
     try {
       const h = await api("GET", "/api/health");
+      capsDone(h);
       const was = OV.ok;
       OV.ok = h.ovoz; OV.error = h.ovoz_error || ""; OV.url = h.ovoz_url;
       if (OV.ok && (!OV.models.length || was === false)) {
         try { OV.models = await api("GET", "/api/voices"); } catch { OV.models = []; }
       }
       if (was !== OV.ok) document.dispatchEvent(new Event("ovoz"));
-    } catch { OV.ok = false; OV.error = t("serverDown"); }
+    } catch { OV.ok = false; OV.error = t("serverDown"); capsDone({}); }
     const p = $("#ovoz");
     p.className = `pill ${OV.ok ? "ok" : "bad"}`;
     p.textContent = OV.ok ? t("ovozOk") : t("ovozOffline");
@@ -1285,7 +1289,7 @@
       if (bg.prompt) box.append(el("p", { class: "muted small" }, t("ai.bgSuggested", { p: bg.prompt })));
       const provs = (AI.status && AI.status.providers) || [];
       const provName = id => (provs.find(x => x.id === id) || {}).name || id;
-      const projProv = S.brief.broll_provider || "wan22-5b";
+      const projProv = S.brief.broll_provider || (AI.status && AI.status.default_provider) || "fastwan-5b";
       box.append(el("p", { class: "muted small" }, t("ai.bgProvider", { p: provName(bg.provider || projProv) }) +
         (bg.provider ? "" : ` (${t("ai.projectDefault")})`) + (bg.image ? ` · ${t("ai.bgAnimates", { a: bg.image })}` : "")));
       if (cur && cur.provider) box.append(el("p", { class: "muted tiny" }, t("ai.clipFrom", { p: provName(cur.provider), l: cur.licence || "" })));
@@ -1381,9 +1385,11 @@
         f.append(boxes.status);
       }
       const provs = (AI.status && AI.status.providers) || [];
+      const defProv = (AI.status && AI.status.default_provider) || "fastwan-5b";
       const provSel = el("select", { id: "proj-prov", onchange: e => {
-        if (e.target.value === "wan22-5b") delete b.broll_provider; else b.broll_provider = e.target.value; changed({ now: true }); } },
-        provs.map(p2 => el("option", { value: p2.id, selected: (b.broll_provider || "wan22-5b") === p2.id }, `${p2.name} — ${p2.licence}`)));
+        if (e.target.value === defProv) delete b.broll_provider; else b.broll_provider = e.target.value; changed({ now: true }); } },
+        provs.map(p2 => el("option", { value: p2.id, selected: (b.broll_provider || defProv) === p2.id },
+          `${p2.name}${p2.legacy ? ` (${t("ai.legacy")})` : ""} — ${p2.licence}`)));
       const provField = el("div", { class: "form mt" }, el("h3", {}, t("ai.projectProvider")),
         el("p", { class: "muted small" }, t("ai.projectProviderHelp")), provs.length ? provSel : el("p", { class: "muted small" }, "…"));
       panel.replaceChildren(warnBox, f, provField,
@@ -1569,7 +1575,10 @@
     S.txMods = {};
     async function tplTransitions() {
       const m = tplOf(curTplId());
-      if (!m || !m.has_js || !(m.transitions || []).length) return {};
+      // Only the built-in templates' code may run in this page (it is the studio's origin, with the full API).
+      // An imported template's code runs only in the sandboxed preview frame and the isolated renderer, so its
+      // own transitions get a still tile here instead of an animated one.
+      if (!m || !m.builtin || !m.has_js || !(m.transitions || []).length) return {};
       const key = `${m.id}@${m.hash}`;
       if (!S.txMods[key]) S.txMods[key] = import(`/templates/${m.id}/template.js?v=${m.hash}`).then(x => x.transitions || {}).catch(() => ({}));
       return S.txMods[key];
@@ -1710,18 +1719,30 @@
       try { r = await api("GET", `/api/projects/${pid}/followup`); } catch (e) { toast(e.message, "error"); return; }
       const ta = el("textarea", { class: "mono tall", spellcheck: "false", "aria-label": t("fu.title"), "data-native-undo": "1" });
       ta.value = r.message;
+      // the message is for the source AI: English by default, Uzbek on request
+      const msgLang = el("select", { "aria-label": t("fu.msgLang"), onchange: async e => {
+        try { ta.value = (await api("GET", `/api/projects/${pid}/followup?lang=${e.target.value}`)).message; }
+        catch (err) { toast(err.message, "error"); }
+      } }, el("option", { value: "en", selected: true }, "English"), el("option", { value: "uz" }, "Oʻzbekcha"));
       const kinds = Object.entries(r.counts || {});
       modal(t("fu.title"), el("div", { class: "form" },
         el("p", { class: "muted small" }, t("fu.intro")),
         el("div", { class: "row gap wrap" }, r.ok ? el("span", { class: "chipx ok" }, "✓ " + t("fu.allGood")) : null,
           ...kinds.map(([k, n]) => el("span", { class: `chipx ${k === "suggestion" ? "" : "bad"}` }, `${t("fu.kinds." + k) !== "fu.kinds." + k ? t("fu.kinds." + k) : k}: ${n}`))),
-        ta, el("p", { class: "muted small" }, t("fu.api"), " ", el("code", {}, `GET /api/projects/${pid}/followup`))),
+        el("label", { class: "row gap" }, el("span", { class: "muted small" }, t("fu.msgLang")), msgLang),
+        ta, el("p", { class: "muted small" }, t("fu.api"), " ", el("code", {}, `GET /api/projects/${pid}/followup[?lang=uz]`))),
         [{ label: t("close"), onClick: () => {} }, { label: "⧉ " + t("copy"), primary: true, onClick: () => { copyText(ta.value); } }]);
     }
 
     // ---------- preview ----------
     const preview = (() => {
-      const frame = el("iframe", { class: "pv-frame", src: "/renderer/index.html?embed", title: t("preview"), tabindex: "-1" });
+      // The renderer runs template code (template.js), so it lives in a sandboxed frame: an opaque origin that
+      // cannot touch this page, its storage or the studio API. It is driven by postMessage (html/app.js bridge).
+      const frame = el("iframe", { class: "pv-frame", title: t("preview"), tabindex: "-1" });
+      capsReady.then(c => {
+        if (c && c.preview_sandbox) frame.setAttribute("sandbox", "allow-scripts");
+        frame.src = "/renderer/index.html?embed";
+      });
       const frameBox = el("div", { class: "pv-stage" }, frame);
       const audio = new Audio();
       audio.preload = "auto";
@@ -1736,12 +1757,15 @@
       previewBox.append(frameBox);
       transport.append(playBtn, scrubWrap, time);
       transport.after(info);
-      frame.addEventListener("load", () => { loaded = true; if (tl) push(); });
-      function win() { return frame.contentWindow; }
-      function push() {
-        if (!loaded || !win() || !win().loadTimeline) return;
-        win().loadTimeline(tl).then(() => draw()).catch(() => {});
-      }
+      let seq = 0;
+      const post = msg => { const w = frame.contentWindow; if (loaded && w) w.postMessage(msg, "*"); };
+      const onMsg = e => {
+        if (e.source !== frame.contentWindow || !e.data || typeof e.data !== "object") return;
+        if (e.data.type === "hello") { loaded = true; if (tl) push(); }
+        else if (e.data.type === "loaded" && e.data.seq === seq) draw();
+      };
+      addEventListener("message", onMsg);
+      function push() { if (tl) post({ type: "load", tl, seq: ++seq }); }
       function setFormat(fmt) { frameBox.classList.toggle("land", fmt === "16:9"); frameBox.classList.toggle("square", fmt === "1:1"); }
       // background music: plays along with the voice-over, approximate ducking from the server's envelope
       const mus = new Audio();
@@ -1800,8 +1824,7 @@
         return cur;
       }
       function draw() {
-        const w = win();
-        if (w && w.seek && w.__ready !== false) { try { w.seek(cur); } catch { /* frame reloading */ } }
+        post({ type: "seek", t: cur });
         scrub.value = cur;
         time.textContent = `${fmtTime(cur)} / ${fmtTime(tl ? tl.duration : 0)}`;
         if (tl) {
@@ -1823,7 +1846,7 @@
         t0 = cur; t0Perf = performance.now();
         if (audio.src && audio.duration && cur < audio.duration) { audio.currentTime = cur; audio.play().catch(() => {}); }
         else if (audio.src) { audio.currentTime = cur; audio.play().catch(() => {}); }
-        win() && win().setPlaying && win().setPlaying(true);
+        post({ type: "play", on: true });
         syncMusic(true);
         playBtn.textContent = "❚❚"; playBtn.setAttribute("aria-label", t("pause"));
         cancelAnimationFrame(raf); raf = requestAnimationFrame(loop);
@@ -1833,7 +1856,7 @@
         playing = false;
         audio.pause();
         mus.pause();
-        win() && win().setPlaying && win().setPlaying(false);
+        post({ type: "play", on: false });
         playBtn.textContent = "▶"; playBtn.setAttribute("aria-label", t("play"));
         cancelAnimationFrame(raf);
         draw();
@@ -1845,7 +1868,7 @@
         draw();
       }
       return { load, seek, toggle, pause, setFormat, get t() { return cur; }, get musicVolume() { return M ? musicAt(cur) : null; },
-        stop: () => { pause(); audio.src = ""; mus.removeAttribute("src"); } };
+        stop: () => { pause(); audio.src = ""; mus.removeAttribute("src"); removeEventListener("message", onMsg); } };
     })();
 
     window.SUI.preview = preview;   // read-only handle for UI tests (time, music volume)

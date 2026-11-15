@@ -30,7 +30,7 @@ Contents: [Theme or full?](#theme-or-full) · [manifest.json](#manifestjson-refe
 |---|---|---|
 | Files | `manifest.json` (+ background pictures, fonts) | + `template.css`, optional `template.js` (ES module) |
 | Can change | colours, fonts, radii, shadows, caption / progress / logo style, background picture, which background layers show | anything: CSS for every element, new HTML + animation for any layout, new transitions, background decorations |
-| Code | none | JavaScript, run by the renderer (only import templates you trust) |
+| Code | none | JavaScript, run by the renderer in a sandbox (see *Packaging and importing*) |
 
 Start with a **theme** if you only need brand colours and a font. Move to **full** when the design needs
 different layouts.
@@ -318,6 +318,18 @@ in the template picker) re-reads your files, so edits to template.css / template
    `curl -F "file=@acme.zip" "http://127.0.0.1:8001/api/templates?replace=1"`.
 3. Problems are listed all at once (e.g. *tokens.colors.primary: 'blue' — use a hex colour*); nothing is
    installed until the zip is valid. It lands in `video/templates/acme/`.
+
+Rules the import enforces (a zip that breaks one is refused): file names are plain relative paths (no `..`,
+no absolute / drive / UNC paths, no backslashes, no Windows device names like `con.css`, no trailing dot or
+space, at most 6 folders deep, no two names that differ only in case), no symbolic links, each file ≤ 15 MB,
+manifest texts have length limits (name 80, description 600 characters), ≤ 40 options, ≤ 20 transitions,
+tokens ≤ 32 KB.
+
+**Where template code runs.** `template.js` / `template.css` run inside the renderer page, never in the
+studio itself: the live preview is a sandboxed iframe (an opaque origin with no access to the editor, its
+storage or the studio API), and a render serves the page from a private origin that exposes only the renderer,
+its fonts, your template folder and the project's media — no other files and no network (`fetch` to anything
+else fails). Bundle every font and picture in the template folder; remote URLs do not load in a render.
 
 API: `GET /api/templates` · `GET /api/templates/{id}` · `GET /api/templates/schema` ·
 `POST /api/templates` (zip) · `DELETE /api/templates/{id}` (not built-ins; projects using it fall back to

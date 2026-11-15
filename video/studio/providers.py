@@ -4,8 +4,9 @@ Every provider has: id, name, licence (+ caveats), capabilities (t2v / i2v, reso
 seconds, fps), VRAM / RAM needs, `estimate()` and `generate()` (= the AI queue job it becomes).
 Generation itself runs in the warm worker of the provider's model family (video/ai/worker.py).
 
-    wan22-5b    Wan2.2-TI2V-5B (the original b-roll model, unchanged)        Apache-2.0
-    fastwan-5b  FastWan2.2-TI2V-5B, 3-step DMD distillation — fast drafts      Apache-2.0
+    fastwan-5b  FastWan2.2-TI2V-5B, 3-step DMD distillation — the default    Apache-2.0
+    wan22-5b    Wan2.2-TI2V-5B (the original b-roll model; legacy: its draft-size clips came out near-black)
+                                                                              Apache-2.0
     wan22-a14b  Wan2.2-T2V/I2V-A14B + Wan2.2-Lightning 4-step LoRA — quality   Apache-2.0
 
     comfy:<id>  every workflow in video/comfy-workflows/<id>/ (comfyflows.py), run by a local ComfyUI over its
@@ -20,7 +21,9 @@ import hashlib
 import json
 import time
 
-DEFAULT = "wan22-5b"
+DEFAULT = "fastwan-5b"     # default video generator (drafts and finals)
+ORIGINAL = "wan22-5b"      # the first b-roll model: its timing / clip-cache keys keep their old format
+LEGACY = {"wan22-5b"}      # still selectable, marked "legacy" in the UI
 COMFY = "comfy:"
 
 PROVIDERS: dict[str, dict] = {
@@ -35,8 +38,9 @@ PROVIDERS: dict[str, dict] = {
             "final": {"steps": 30, "frames": 121, "fps": 24, "guidance": 5.0, "portrait": (704, 1280), "landscape": (1280, 704)},
         },
         "max_seconds": 5.0, "vram_gb": 7.7, "ram_gb": 36.0,
-        "summary": "The original b-roll model. Good for dark, abstract or product-style backgrounds.",
-        "speed": "medium",
+        "summary": "The original b-roll model (legacy): at draft size its clips often come out nearly black — "
+                   "use FastWan for drafts.",
+        "speed": "medium", "legacy": True,
     },
     "fastwan-5b": {
         "id": "fastwan-5b", "name": "FastWan2.2 5B (fast drafts)", "vendor": "FastVideo / Hao AI Lab",
@@ -153,13 +157,18 @@ def get(pid: str | None) -> dict:
     return PROVIDERS.get(pid or DEFAULT) or PROVIDERS[DEFAULT]
 
 
+def default_for(preset: str | None = None) -> str:
+    """The generator used when nothing is chosen (FastWan for drafts and finals; wan22-5b is legacy)."""
+    return DEFAULT
+
+
 def exists(pid: str | None) -> bool:
     return bool(pid) and (pid in PROVIDERS or (is_comfy(pid) and pid in comfy_providers()))
 
 
 def timing_key(provider: str, preset: str) -> str:
     """The original model keeps its old key so measured timings carry over."""
-    return f"broll/{preset}" if provider == DEFAULT else f"broll/{provider}/{preset}"
+    return f"broll/{preset}" if provider == ORIGINAL else f"broll/{provider}/{preset}"
 
 
 def size(provider: str, preset: str, orientation: str) -> tuple[int, int]:
@@ -172,7 +181,7 @@ def clip_key(provider: str, prompt: str, seed: int, preset: str, orientation: st
     import library as L
     pr = get(provider)["presets"][preset]
     w, h = size(provider, preset, orientation)
-    if provider == DEFAULT and not image_sha:
+    if provider == ORIGINAL and not image_sha:
         return L.broll_key(prompt, seed, pr["steps"], w, h, pr["frames"])
     if is_comfy(provider):                 # the workflow's graph is part of the key: editing it makes new clips
         import comfyflows as F
@@ -202,6 +211,7 @@ def public(ai=None) -> list[dict]:
                                           ai.need_gb_key(timing_key(p["id"], name)),
                                           measured=bool(ai.timings.get(timing_key(p["id"], name), {}).get("runs")))
         out.append(d)
+    out.sort(key=lambda d: bool(d.get("legacy")))      # legacy generators last in the pickers
     return out
 
 

@@ -46,6 +46,48 @@ NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 DEFAULTS = {"mode": "managed", "url": "http://127.0.0.1:8188", "port": 8188, "autostart": True, "vram_mode": "auto",
             "reserve_vram_gb": 1.0, "custom_nodes": False, "extra_args": ""}
 VRAM_MODES = {"auto": [], "lowvram": ["--lowvram"], "novram": ["--novram"], "highvram": ["--highvram"]}
+# An external ComfyUI must be on this PC unless the user explicitly allows other hosts (env, comma-separated):
+#   STUDIO_COMFY_HOSTS=192.168.1.20,gpu-box.local   (or * for any host)
+LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+REMOTE_HOSTS = {h.strip().lower() for h in os.environ.get("STUDIO_COMFY_HOSTS", "").split(",") if h.strip()}
+# extra_args may tune ComfyUI, but not re-open it to the network, move its folders or load other code
+BLOCKED_ARGS = ("--listen", "--port", "--enable-cors-header", "--tls-keyfile", "--tls-certfile", "--output-directory",
+                "--input-directory", "--temp-directory", "--user-directory", "--base-directory",
+                "--extra-model-paths-config", "--front-end-root", "--front-end-version", "--enable-manager",
+                "--comfy-api-base", "--database-url", "--multi-user", "--enable-compress-response-body")
+ARG_RE = re.compile(r"^(--[a-z0-9][a-z0-9-]*(=[\w.:,+-]*)?|[\w.:,+-]+)$", re.I)
+
+
+def check_url(u: str) -> str:
+    """http(s)://host[:port] of an external ComfyUI; loopback only unless STUDIO_COMFY_HOSTS allows the host."""
+    u = str(u or "").strip().rstrip("/")
+    p = urllib.parse.urlparse(u)
+    host = (p.hostname or "").lower()
+    if p.scheme not in ("http", "https") or not host or p.username or p.password or p.query or p.fragment \
+            or (p.path not in ("", "/")):
+        raise ValueError("url must look like http://127.0.0.1:8188")
+    try:
+        p.port
+    except ValueError:
+        raise ValueError("url: bad port") from None
+    if host not in LOOPBACK and not host.startswith("127.") and "*" not in REMOTE_HOSTS and host not in REMOTE_HOSTS:
+        raise ValueError(f"only a ComfyUI on this PC (127.0.0.1 / localhost) is allowed; to use {host}, start the "
+                         "studio with STUDIO_COMFY_HOSTS=" + host)
+    return u
+
+
+def check_args(extra: str) -> str:
+    extra = str(extra or "").strip()[:300]
+    try:
+        toks = shlex.split(extra, posix=False)
+    except ValueError:
+        raise ValueError("extra_args: unbalanced quotes") from None
+    for t in toks:
+        if not ARG_RE.match(t):
+            raise ValueError(f"extra_args: '{t}' is not allowed (plain --flags and values only)")
+        if t.lower().split("=")[0] in BLOCKED_ARGS:
+            raise ValueError(f"extra_args: {t.split('=')[0]} is managed by the studio and cannot be changed")
+    return extra
 SAMPLERS = ("KSampler", "KSamplerAdvanced", "SamplerCustom", "SamplerCustomAdvanced")
 
 
@@ -87,18 +129,20 @@ class Comfy:
             d = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             d = {}
-        return {**DEFAULTS, **{k: d[k] for k in DEFAULTS if k in d}}
+        s = {**DEFAULTS, **{k: d[k] for k in DEFAULTS if k in d}}
+        for k, chk in (("url", check_url), ("extra_args", check_args)):   # a hand-edited file obeys the same rules
+            try:
+                s[k] = chk(s[k])
+            except (ValueError, TypeError):
+                s[k] = DEFAULTS[k]
+        return s
 
     def update(self, d: dict) -> dict:
         s = dict(self.settings)
         if d.get("mode") in ("managed", "external"):
             s["mode"] = d["mode"]
         if d.get("url"):
-            u = str(d["url"]).strip().rstrip("/")
-            p = urllib.parse.urlparse(u)
-            if p.scheme not in ("http", "https") or not p.netloc:
-                raise ValueError("url must look like http://127.0.0.1:8188")
-            s["url"] = u
+            s["url"] = check_url(d["url"])
         if d.get("port") not in (None, ""):
             s["port"] = max(1024, min(65535, int(d["port"])))
         for k in ("autostart", "custom_nodes"):
@@ -109,7 +153,7 @@ class Comfy:
         if d.get("reserve_vram_gb") not in (None, ""):
             s["reserve_vram_gb"] = round(max(0.0, min(8.0, float(d["reserve_vram_gb"]))), 2)
         if "extra_args" in d:
-            s["extra_args"] = str(d["extra_args"] or "")[:300]
+            s["extra_args"] = check_args(d["extra_args"])
         self.settings = s
         L.LIB.mkdir(parents=True, exist_ok=True)
         SETTINGS_FILE.write_text(json.dumps(s, indent=1), encoding="utf-8")

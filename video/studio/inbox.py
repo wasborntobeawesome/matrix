@@ -15,11 +15,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import paths
+
 from brief import BriefError
 from store import StoreError, import_project, kind_of
 
 VIDEO = Path(__file__).resolve().parent.parent
-INBOX = VIDEO / "inbox"
+INBOX = paths.INBOX
 POLL_SECONDS = 3
 STABLE_SECONDS = 2
 
