@@ -7,8 +7,10 @@ and 16:9, in several languages from one brief (uz, ru, en, ar), with background 
 captions, `.srt`/`.vtt` subtitles and a cover image per video. The look comes from a **template**
 (built in: *Aurora*, *Clean*, *Bold*; import your own as a zip — see
 [`../templates/TEMPLATES.md`](../templates/TEMPLATES.md)). The editor has undo/redo, a version history, a
-follow-up message for the source AI, and an English / Uzbek interface. Everything is free/open source: FastAPI,
-Playwright Chromium, FFmpeg, faster-whisper, numpy and plain HTML/JS.
+follow-up message for the source AI, and an English / Uzbek interface. A live system monitor (header widget +
+monitor page) shows GPU, VRAM by owner, CPU and RAM; optional local AI layers (b-roll from three video generators,
+image-to-video, a talking-head presenter, AI music) run in warm model workers. Everything is free/open source: FastAPI,
+Playwright Chromium, FFmpeg, faster-whisper, numpy, NVML/psutil and plain HTML/JS.
 
 ## Run
 
@@ -83,13 +85,16 @@ video/
     followup.py         "Ask the AI for missing material" message
     jobs.py             background queues: voice (1 worker), render (1 at a time, subprocess)
     inbox.py            shared-folder watcher
-    aijobs.py           GPU job queue for the AI layers (b-roll, portrait, presenter; subprocesses)
-    gpu.py              VRAM status: nvidia-smi + per-process GPU memory (Ovoz attribution)
+    aijobs.py           GPU job queue for the AI layers (b-roll, portrait, presenter, music) — runs them in warm workers
+    workers.py          warm AI model workers (one video/ai/worker.py per model family): RAM budget, idle timeout, release
+    providers.py        b-roll video generators (wan22-5b, fastwan-5b, wan22-a14b): licences, presets, estimates
+    sysmon.py           1 Hz system sampler (NVML + psutil + PDH per-process GPU counters), 30-min history, stage markers
+    gpu.py              VRAM status for the AI queue (reads the sampler; nvidia-smi + PowerShell fallback)
     library.py          shared b-roll + portrait library (video/library/)
     presenter.py        talking-head planning, segment cache, assembly
     pipeline.py         "Make video": voice -> free GPU (Ovoz /api/unload) -> AI jobs -> render
-    static/             UI: index.html, app.js, ai.js (AI page + components), style.css, strings.js (English UI text),
-                        strings-uz.js (Uzbek UI text)
+    static/             UI: index.html, app.js, ai.js (AI page + components), monitor.js (header widget + #/monitor),
+                        style.css, strings.js (English UI text), strings-uz.js (Uzbek UI text)
     example/            fictional sample brief + screenshots + recording
   templates/<id>/       manifest.json (+ template.css, template.js, fonts, previews); aurora, clean, bold,
                         _starter (copy me), validate.py, TEMPLATES.md
@@ -410,6 +415,147 @@ follow-up) stay in English.
   with an overflow check (no clipped buttons/labels, no horizontal scroll): `v2-phase2-uz-*.png`. The
   choice survives a reload. No console errors.
 
+## System monitor, warm AI models, more video generators, AI music (v2 phase 3)
+
+### Live system monitor
+- **Header widget on every page** (`#sysmon`, `static/monitor.js`): GPU %, VRAM used/total, GPU temperature
+  and power, CPU %, RAM used/total. Updated every second over Server-Sent Events; amber from 60 % / 75 % /
+  70 °C, red from 90 % / 92 % / 82 °C. The tooltip splits VRAM into Ovoz / AI / Studio and shows the RAM of
+  the warm models. Click → **#/monitor**.
+- **Monitor page:** hand-written canvas charts of the last 5 / 15 / 30 minutes with a synced crosshair +
+  tooltip: GPU utilisation; VRAM stacked by owner (Ovoz TTS, AI jobs, Studio render/Chromium, desktop &
+  other, total as a line); CPU; RAM stacked (warm AI models, other AI, Ovoz, Studio, other); GPU temperature;
+  GPU power with the power-limit line (separate charts — no dual axes). Shaded bands = “Make video” stages
+  (voice amber, AI purple, render teal), AI jobs (labelled warm/cold) and renders; they are also listed under
+  *Timeline markers*. Tiles with the current values, *Running now*, the GPU process table (PID, owner, VRAM,
+  GPU %, RAM) and the warm-model table. Colours were checked with the dataviz palette validator against the
+  dark surface (lightness band, chroma, colour-blind separation).
+- **Sampler** (`sysmon.py`): one thread, 1 Hz, 30-minute ring buffer. NVML (`nvidia-ml-py`, BSD-3) for GPU
+  %, VRAM, temperature, power; `psutil` (BSD-3) for CPU/RAM and the process tree; the Windows counters
+  `\GPU Process Memory(*)\Dedicated Usage` and `\GPU Engine(*)\Utilization Percentage` read through PDH with
+  ctypes (≈1 ms — the old PowerShell probe took ~2 s). Owners: Ovoz = the process listening on :8000, its
+  children and anything running from `OVOZ_DIR`; AI = warm workers and their children; Studio = this server's
+  other children (render.py, headless Chromium). `gpu.Monitor` (VRAM gate, unload stage) now reads the sampler.
+- **Overhead (measured):** 2.7 ms CPU per 1 s sample in steady state = 0.27 % of one core (0.017 % of the
+  16-thread CPU), ~6 ms wall time, max 24 ms; the first samples read every process's command line once.
+  The page shows the live figure at the bottom.
+
+### Warm AI model workers (128 GB RAM)
+- One `video/ai/worker.py --family <f>` process per model family (`workers.py`): `wan` (Wan2.2-TI2V-5B,
+  FastWan, portraits), `a14b-t2v`, `a14b-i2v`, `echomimic`, `acestep`. It keeps the weights in RAM between
+  jobs; during a job they stream to the GPU (group offloading from page-locked RAM) and afterwards only the
+  CUDA context (~0.4 GB) stays on the GPU. Details and measurements: `../ai/README.md`.
+- **Make video:** before the voice-over stage every warm worker releases its GPU memory (the stage detail
+  lists the workers and the AI VRAM before/after); the weights stay in RAM, Ovoz gets the GPU. After
+  `/api/unload` the AI stage uses the warm workers.
+- **Settings** (AI page → *Warm AI models*, `library/ai-settings.json`): keep warm (on), unload after
+  **30 min** idle, **RAM budget 80 GB** — before a job, least recently used *other* idle workers are stopped
+  until the total working set + what the job still has to load fits; after a job the same check runs again.
+  A family that is bigger than the budget on its own exits after each job. **Release RAM** stops all idle
+  workers (or one). Busy workers are never stopped by the budget.
+- **Cold vs warm (same kind of job twice, Ovoz unloaded):**
+
+  | Job | Cold | Warm | Saved |
+  |---|---|---|---|
+  | FastWan 5B draft b-roll | 50.5 s (load 24 s) | **20.2 s** | 60 % |
+  | Wan2.2 5B draft b-roll | 129 s (load 11 s + text encoder already warm) | 115 s | 11 % |
+  | Wan2.2 A14B draft b-roll | 257 s (load 87 s) | **165 s** | 36 % |
+  | ACE-Step 30 s of music | 12.6–14 s (load 4.4 s + worker start) | **3.8–6 s** | 60–70 % |
+  | EchoMimic presenter | see “Verified” below | | |
+
+### Video generators (providers)
+`providers.py` — every provider has an id, name, licence (+ note), modes (t2v / i2v), presets (resolution,
+frames, fps, steps), max seconds, VRAM/RAM needs, `estimate` (learned timings, warm or cold) and runs as an
+AI-queue job (`generate`).
+
+| id | Model | Licence | Modes | Draft / final | Use |
+|---|---|---|---|---|---|
+| `wan22-5b` | Wan2.2-TI2V-5B (unchanged) | Apache-2.0 | t2v, i2v | 480×832 / 704×1280, 24 fps, 3.4 / 5 s | the original |
+| `fastwan-5b` | FastWan2.2-TI2V-5B (FastVideo, 3-step DMD) | Apache-2.0 | t2v, i2v | same sizes, 3 steps | **fast drafts** (20 s warm) |
+| `wan22-a14b` | Wan2.2-T2V/I2V-A14B + Wan2.2-Lightning 4-step LoRA | Apache-2.0 | t2v, i2v | 480×832 / 720×1280, 16 fps, 5 s | **quality** |
+
+- Same 3 prompts at draft settings (frames in `preview/v2-phase3-providers-compare.png`, full table and
+  judgement in `../ai/README.md`): A14B is clearly best (detail, natural motion), FastWan is good and 6× faster
+  than the 5B, the original 5B draft was nearly black on 2 of 3 prompts.
+- **Animate an image (image-to-video):** the b-roll form (AI page and the scene form) has *Animate this image*:
+  a project image or a library portrait; the prompt then describes the motion
+  (`preview/v2-phase3-i2v-portrait.png`): Wan2.2-I2V-A14B keeps the face and background (264 s cold); FastWan is
+  fast (78 s cold) but the face drifts after a few frames.
+- Per scene `background.provider` (+ `background.image`), project default `broll_provider` (editor → AI tab).
+  Library ids keep the old hash for `wan22-5b` text-to-video (existing clips stay cached); other providers
+  and image-to-video include the provider and the image's hash.
+- **Cloud providers (not implemented, nothing is called).** A paid API could be added later as one more
+  entry in `PROVIDERS` with `family: None` and a `CloudProvider` class (sketch in `providers.py`, disabled):
+  `generate(task) -> mp4` over HTTPS with the API key from an environment variable (never stored in projects),
+  `estimate()` from the service, `vram_gb = 0` so the AI queue skips the VRAM gate, and its own terms shown
+  next to the local licences. The rest of the studio (library, assignment, Make video) would work unchanged.
+
+### AI music (ACE-Step v1.5, MIT)
+- Job kind `music`: prompt, genre, mood, bpm, duration (10–240 s), seed; instrumental only. The track is
+  generated 6 s longer than asked, the leading silence and the faded/silent tail are cut, a 1.5 s fade-out is
+  added, it is encoded to OGG, checked and added with `music.add_track` as `source: "generated"` with the
+  licence text, prompt, seed, model and the check results. Identical requests reuse the track.
+- **Checks** (`music.analyze`, nobody can listen here): duration; EBU R128 loudness, true peak and LRA via
+  ffmpeg; silent fraction; spectral flatness (white noise 0.56, music ≈ 0.00), spectral centroid, band
+  energies and spectral flux (dB change of 24 log bands per 0.5 s: a sine 0.0, noise 2.0, music 4–6, the
+  builtin tracks 3–12). Fails on silence, noise-like spectra or a static drone. Tested on a sine and white
+  noise (both rejected) and every generated track (passed).
+- UI: **Generate music** on the AI page and in the editor's Music tab (generate now, or *Generate during
+  “Make video”*, which stores `music.generate` in the brief).
+
+### "Make video" + AI music + providers
+- The AI stage first generates the music when `music.generate` is set and the project has no (existing)
+  track (or reuses an identical generated one), then the portrait, the b-roll (each scene with its provider,
+  image-to-video when `background.image` is set), then the presenter. Every job runs alone on the GPU (one AI
+  queue), and the monitor shows each stage and job as a band.
+
+### API (v2 phase 3)
+
+| Method & path | What it does |
+|---|---|
+| `GET /api/monitor[?since=&procs=1]` | samples (1 Hz, 30 min), markers, latest sample, process table, warm workers, current pipeline/job, sampler overhead |
+| `GET /api/monitor/stream[?procs=1]` | Server-Sent Events, one sample per second |
+| `GET /api/ai/providers` | video generators with licences, capabilities, presets, estimates |
+| `POST /api/ai/broll` | now also `provider` and `image: {project, asset}` or `{portrait}` |
+| `POST /api/ai/music` | `{prompt, genre?, mood?, bpm?, duration?, seed?, title?, project?}` → job (or an instant done job when the same track exists) |
+| `GET /api/ai/workers` · `PUT /api/ai/workers/settings` · `POST /api/ai/workers/release-ram` · `POST /api/ai/workers/release-gpu` | warm workers: view, `{warm, idle_minutes, ram_budget_gb}`, stop idle workers (`{family?}`), free their GPU memory |
+
+### Verified (2026-11-15, test server on :8012, Playwright + API)
+
+- **Make video, 3-scene Uzbek project** (`nimbo-a7ea`: hook with `wan22-a14b` b-roll, screen scene with the
+  project default `fastwan-5b`, CTA; corner presenter (draft); `music.generate`; local Ovoz voice `navoiy`):
+
+  | Stage | Result |
+  |---|---|
+  | ① Voice | warm A14B worker released its GPU memory first (weights stayed in RAM, 68 GB); 3 lines in 42 s, 3/3 aligned |
+  | ② Free GPU | `unloaded navoiy`, Ovoz 2.9 → 0.0 GB, free 10.6 → 13.5 GB (1.5 s) |
+  | ③ AI (644 s) | music 21 s (cold) → A14B b-roll **165 s, warm** (no load) → FastWan b-roll 47 s (cold; the RAM budget stopped the idle A14B worker first) → presenter 405 s (cold: load 79 s, 11.6 s of talking head) |
+  | ④ Render | 40.6 s, 11.5 s video, −13.9 LUFS / −1.5 dBTP with the generated music |
+
+  Monitor during the run: `preview/v2-phase3-make-monitor-*.png` (one per stage / job), the whole run
+  `v2-phase3-monitor-after-make.png` — VRAM moves from Ovoz (amber, voice stage) to the AI workers (purple),
+  the RAM chart shows the 68 GB warm A14B model, then the eviction. Frames: `v2-phase3-make-render-frames.png`
+  (A14B light ribbons, FastWan bokeh behind the phone, presenter bubble).
+- **Warm presenter:** the CTA line was edited twice and *Make video* run again each time. The presenter job
+  (only the CTA chunk) took **186 s cold** (load 67 s, 4.0 s of video) and **74 s warm** (load 0, 3.1 s of
+  video); the voice stage released the warm EchoMimic worker's GPU memory (0.7 GB → context only) before
+  Ovoz ran. Whole pipeline 259 s → 157 s.
+- **Music:** 4 generated tracks (30 s, 30 s, 18.5 s in the pipeline, 33 s): all passed the checks (LUFS
+  −9.7 … −17.4, flux 3.8–6.3 dB, flatness 0.00, < 3 % silent after trimming); a white-noise and a sine test
+  file were rejected. Spectrograms: `preview/v2-phase3-music-*-spectrum.png` — clear beat and harmonic lines,
+  a fade-out at the end. Honest note: the takes are bass/low-mid heavy (< 1 % of the energy above 2 kHz);
+  nobody listened to them.
+- **Monitor:** `v2-phase3-monitor-running-warm-job.png` (a warm FastWan job: *Running now* chip, warm RAM
+  tile 23.9 GB = the chart band = the worker table), `…-hover.png` (crosshair tooltip with the stage list).
+  History lives in the server process: a restart starts a new 30 minutes.
+- **UI:** AI page (providers, image-to-video, Generate music, warm models), editor scene background (provider
+  pre-selected from the scene), Music tab (*Generate music*, *Generate during “Make video”*), AI tab (project
+  default provider) — EN and OʻZ at 1600 / 1280 / 420 px, no console errors, no horizontal overflow
+  (`v2-phase3-*`, `v2-phase3-uz-*`). Every new string has an Uzbek translation (key parity checked by script).
+- **Old projects:** every existing brief normalises exactly as with the committed code; `nimbo-ade8` (uz
+  9:16) rendered again: 39.36 s, PSNR 56.9 dB against its earlier render (encoder noise). The renderer and
+  `build.py` are unchanged.
+
 ## "Make video" (one button, voice first, then video)
 
 **Make video** in the editor, or `POST /api/projects/{id}/make` for a coding agent, runs four stages in
@@ -574,6 +720,12 @@ held ~2 GB, leaving ≈ 8 GB free.
 | chinese-wav2vec2-base | MIT | trained on Chinese speech; lip shapes for uz/ru/en/ar are plausible, not dubbing-grade |
 | PyTorch / diffusers / transformers / accelerate | BSD-3 / Apache-2.0 | |
 | ffmpeg (gyan.dev, `--enable-gpl`) | GPL-3 | fine as a tool; don't ship it inside a closed product |
+| FastWan2.2-TI2V-5B-FullAttn (FastVideo) | Apache-2.0 | fine-tune of Wan2.2-TI2V-5B; same UMT5 + VAE |
+| Wan2.2-T2V-A14B / I2V-A14B (Wan-AI) + Wan2.1 VAE | Apache-2.0 | |
+| Wan2.2-Lightning LoRAs (lightx2v) | Apache-2.0 | fused at load time |
+| ACE-Step v1.5 XL turbo + its VAE | MIT | card: licensed / royalty-free / synthetic training data, generated music usable commercially |
+| Qwen3-Embedding-0.6B (ACE-Step text encoder) | Apache-2.0 | |
+| nvidia-ml-py, psutil, peft | BSD-3 / BSD-3 / Apache-2.0 | |
 
 There are no InsightFace, Basel Face Model or other non-commercial components. Uploaded portraits require
 ticking *"This is a fictional person or I have the person's permission"* (stored in the portrait's

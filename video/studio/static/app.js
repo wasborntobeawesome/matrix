@@ -1,5 +1,5 @@
 /* Video Studio UI — plain JS, no build step.
- * Routes: #/ (projects)   #/p/<id> (editor)
+ * Routes: #/ (projects)   #/p/<id> (editor)   #/ai (AI page, ai.js)   #/monitor (system monitor, monitor.js)
  */
 (() => {
   "use strict";
@@ -152,8 +152,12 @@
     $("#crumb").innerHTML = "";
     $("#savestate").textContent = "";
     $("#ai-link").classList.toggle("on", location.hash.startsWith("#/ai"));
+    const sm = $("#sysmon");
+    if (sm) sm.classList.toggle("on", location.hash.startsWith("#/monitor"));
+    if (window.MonUI) window.MonUI.initWidget();
     if (m) cleanup = Editor(view, m[1]);
     else if (location.hash.startsWith("#/ai")) cleanup = window.AIUI.page(view);
+    else if (location.hash.startsWith("#/monitor")) cleanup = window.MonUI.page(view);
     else cleanup = ProjectsPage(view);
     checkOvoz();
   }
@@ -1103,6 +1107,19 @@
           slider("start", 0, Math.max(1, Math.floor(meta ? meta.duration : 60)), 0.5, sec, t("musicStart")),
           el("p", { class: "muted small" }, t("musicMixHelp"))));
       }
+      // generate (ACE-Step)
+      const gen = b.music && b.music.generate;
+      const pendMusic = (S.aiJobs || []).filter(j => j.kind === "music" && isActive(j) && j.params && j.params.assign_project === pid);
+      kids.push(el("details", { class: "mt gen-music", open: !!gen || pendMusic.length > 0 },
+        el("summary", {}, "✦ " + t("ai.musicTitle")),
+        gen ? el("p", { class: "ok-t small" }, t("ai.musicPlanned", { p: [gen.genre, gen.mood, gen.prompt].filter(Boolean).join(", ") }),
+          " ", el("button", { class: "btn small", onclick: () => { delete b.music.generate; changed({ now: true }); renderMusic(); } }, t("ai.musicUnplan"))) : null,
+        pendMusic.length ? el("div", { class: "jobs" }, pendMusic.map(j => AI.jobRow(j, pollAi))) : null,
+        AI.musicForm({ project: pid, duration: S.tl ? Math.ceil(S.tl.duration + 3) : 30,
+          onQueued: j => { onAiJob(j); renderMusic(); },
+          onSpec: sp => { b.music = { volume_db: -20, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0, ...(b.music || {}), generate: sp };
+            changed({ now: true }); toast(t("ai.musicPlannedToast"), "ok"); renderMusic(); } })));
+      if (!AI.status) AI.loadStatus().then(() => { if (S.tab === "music") renderMusic(); }).catch(() => {});
       // upload
       const file = el("input", { type: "file", accept: ".mp3,.wav,.ogg,.m4a,audio/*", id: "mu-file" });
       const title = el("input", { type: "text", id: "mu-title", placeholder: t("musicTitlePh") });
@@ -1217,6 +1234,14 @@
         await loadPortraits().catch(() => {});
         if (j.params.assign_project === pid) { ensurePres().portrait = r.portrait; changed({ now: true }); }
         if (S.tab === "ai") renderAiTab();
+      } else if (j.kind === "music" && r.track) {
+        toast(t("ai.musicReady", { name: r.title || r.track }), "ok");
+        await loadMusic().catch(() => {});
+        if (j.params && j.params.assign_project === pid) {
+          S.brief.music = { volume_db: -20, duck: true, duck_db: -10, fade_in: 1, fade_out: 2.5, start: 0, ...(S.brief.music || {}), track: r.track };
+          changed({ now: true }); refreshTimeline();
+        }
+        if (S.tab === "music") renderMusic();
       } else if (j.kind === "presenter" && j.project === pid) {
         toast(t("ai.presenterReady"), "ok");
         await refreshTimeline();
@@ -1257,6 +1282,12 @@
       const clips = S.lib || [];
       const cur = clips.find(c => c.id === bg.clip);
       if (bg.prompt) box.append(el("p", { class: "muted small" }, t("ai.bgSuggested", { p: bg.prompt })));
+      const provs = (AI.status && AI.status.providers) || [];
+      const provName = id => (provs.find(x => x.id === id) || {}).name || id;
+      const projProv = S.brief.broll_provider || "wan22-5b";
+      box.append(el("p", { class: "muted small" }, t("ai.bgProvider", { p: provName(bg.provider || projProv) }) +
+        (bg.provider ? "" : ` (${t("ai.projectDefault")})`) + (bg.image ? ` · ${t("ai.bgAnimates", { a: bg.image })}` : "")));
+      if (cur && cur.provider) box.append(el("p", { class: "muted tiny" }, t("ai.clipFrom", { p: provName(cur.provider), l: cur.licence || "" })));
       if (bg.clip && S.lib && !cur) box.append(el("p", { class: "warn small" }, t("ai.bgMissing", { id: bg.clip })));
       if (!bg.clip) box.append(el("p", { class: "muted small" }, t("ai.bgNone")));
       if (cur && ((cur.w > cur.h) !== (S.brief.format === "16:9"))) {
@@ -1277,7 +1308,19 @@
       box.append(el("details", { class: "gen", open: !!(bg.prompt && !bg.clip) },
         el("summary", {}, "✦ " + t("ai.generateClip")),
         AI.brollForm({ prompt: bg.prompt || "", orientation: S.brief.format === "16:9" ? "landscape" : "portrait",
-          assign: { project: pid, scene: sc.id, dim: bg.dim, blur: bg.blur }, onQueued: j => onAiJob(j) })));
+          provider: bg.provider || projProv, image: bg.image || "",
+          images: Object.entries(S.assets).filter(([, m]) => m.type === "image").map(([n]) => ({ value: n, label: n, ref: { project: pid, asset: n } }))
+            .concat((S.portraits || []).map(m => ({ value: m.id, label: `${t("ai.kinds.portrait")}: ${m.name || m.id}`, ref: { portrait: m.id } }))),
+          assign: { project: pid, scene: sc.id, dim: bg.dim, blur: bg.blur },
+          onQueued: (j, o) => {
+            if (o) {    // remember the choice in the brief, so "Make video" regenerates it the same way
+              if (o.provider && o.provider !== projProv) bg.provider = o.provider; else delete bg.provider;
+              if (o.image) bg.image = o.image; else delete bg.image;
+              changed({ now: true });
+            }
+            onAiJob(j);
+          } })));
+      if (!S.portraits) loadPortraits().catch(() => {});
       refreshAiViews();
       return box;
     }
@@ -1336,7 +1379,13 @@
         }
         f.append(boxes.status);
       }
-      panel.replaceChildren(warnBox, f,
+      const provs = (AI.status && AI.status.providers) || [];
+      const provSel = el("select", { id: "proj-prov", onchange: e => {
+        if (e.target.value === "wan22-5b") delete b.broll_provider; else b.broll_provider = e.target.value; changed({ now: true }); } },
+        provs.map(p2 => el("option", { value: p2.id, selected: (b.broll_provider || "wan22-5b") === p2.id }, `${p2.name} — ${p2.licence}`)));
+      const provField = el("div", { class: "form mt" }, el("h3", {}, t("ai.projectProvider")),
+        el("p", { class: "muted small" }, t("ai.projectProviderHelp")), provs.length ? provSel : el("p", { class: "muted small" }, "…"));
+      panel.replaceChildren(warnBox, f, provField,
         el("h3", { class: "mt" }, t("ai.projectJobs")), boxes.jobs,
         boxes.gpu,
         el("p", {}, el("a", { href: "#/ai" }, t("ai.openAiPage") + " →")),

@@ -112,17 +112,24 @@ def classify(procs: dict | None, ai_pids: set) -> dict:
 
 
 class Monitor:
-    """Background refresher. `get()` returns the last snapshot and keeps the loop alive."""
+    """GPU memory snapshot for the AI queue's VRAM gate and the "Make video" unload stage.
 
-    def __init__(self, ai_pids=lambda: set()):
+    With a `sysmon.Sampler` (the normal case) this is just the sampler's latest 1 Hz sample (NVML + PDH
+    counters, ~3 ms). Without one it falls back to the old nvidia-smi + PowerShell probe (~2 s)."""
+
+    def __init__(self, ai_pids=lambda: set(), sampler=None):
         self.ai_pids = ai_pids
+        self.sampler = sampler
         self.snap: dict = {"ok": False, "checked": 0}
         self.wanted = 0.0
         self.lock = threading.Lock()
         self.ev = threading.Event()
-        threading.Thread(target=self._loop, name="gpu-monitor", daemon=True).start()
+        if sampler is None:
+            threading.Thread(target=self._loop, name="gpu-monitor", daemon=True).start()
 
     def get(self, fresh: bool = False) -> dict:
+        if self.sampler is not None:
+            return self.refresh() if fresh else self.sampler.gate_snapshot()
         self.wanted = time.time()
         if fresh or not self.snap.get("checked"):
             self.refresh()
@@ -131,6 +138,9 @@ class Monitor:
         return self.snap
 
     def refresh(self) -> dict:
+        if self.sampler is not None:              # wait for the next sample (<= 1 s), so it is really fresh
+            self.sampler.wait_next(time.time(), timeout=3)
+            return self.sampler.gate_snapshot()
         with self.lock:
             s = smi()
             procs = processes()

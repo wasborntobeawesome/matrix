@@ -26,6 +26,7 @@ TEXT_FIELDS = ("say", "kicker", "headline", "sub", "callout", "button", "url", "
 ON_SCREEN = ("kicker", "headline", "sub", "callout", "button")   # Uzbek apostrophes are fixed on these (+ items, labels)
 MUSIC_DEFAULT = {"volume_db": -20.0, "duck": True, "duck_db": -10.0, "fade_in": 1.0, "fade_out": 2.5, "start": 0.0}
 LAYOUTS = ["hero", "chips", "stat", "list", "cta", "screen", "screens", "presenter"]
+BROLL_PROVIDERS = ["wan22-5b", "fastwan-5b", "wan22-a14b"]     # providers.py
 PRESENTER_MODES = ["corner", "full"]
 PRESENTER_QUALITY = ["draft", "final"]
 BG_DIM_DEFAULT = 0.55
@@ -66,6 +67,10 @@ _background = {
             "clip": {**_str, "description": "b-roll library id (set by the studio)"},
             "prompt": {**_str, "description": "Suggested text-to-video prompt: what the background footage shows, "
                                               "no text/logos/people's faces, e.g. 'slow drifting purple light ribbons on dark navy'"},
+            "provider": {"enum": BROLL_PROVIDERS, "description": "Video generator for this scene's clip (default: the "
+                         "project's broll_provider): wan22-5b (original), fastwan-5b (fast drafts), wan22-a14b (best quality)"},
+            "image": {**_str, "description": "Optional: animate this uploaded image asset (image-to-video) instead of "
+                                             "generating from text only; 'prompt' then describes the motion"},
             "dim": {"type": "number", "minimum": 0, "maximum": 0.9, "default": BG_DIM_DEFAULT,
                     "description": "Darkening 0..0.9"},
             "blur": {"type": "number", "minimum": 0, "maximum": 24, "default": 0, "description": "Blur in px"},
@@ -127,7 +132,18 @@ SCHEMA = {
                                  "fade_in": {"type": "number", "minimum": 0, "maximum": 10, "default": 1},
                                  "fade_out": {"type": "number", "minimum": 0, "maximum": 15, "default": 2.5},
                                  "start": {"type": "number", "minimum": 0, "description": "start offset into the track (s)"},
-                                 "mood": {**_str, "description": "suggestion for the studio user, e.g. 'calm, warm'"}}},
+                                 "mood": {**_str, "description": "suggestion for the studio user, e.g. 'calm, warm'"},
+                                 "generate": {"type": "object", "description": "Generate an instrumental track locally "
+                                              "(ACE-Step) when the project has none yet; 'Make video' does it in its AI stage",
+                                              "properties": {"prompt": {**_str, "description": "what the music sounds like, "
+                                                                        "e.g. 'warm modern tech background, soft synths, light drums'"},
+                                                             "genre": _str, "mood": _str,
+                                                             "bpm": {"type": "integer", "minimum": 50, "maximum": 200},
+                                                             "duration": {"type": "number", "minimum": 10, "maximum": 240,
+                                                                          "description": "seconds (default: the video length)"},
+                                                             "seed": {"type": "integer"}}}}},
+        "broll_provider": {"enum": BROLL_PROVIDERS, "default": "wan22-5b",
+                           "description": "Default video generator for scene b-roll (a scene's background.provider wins)"},
         "cover": {"type": "object", "description": "Cover image moment (default: the end of the first scene)",
                   "properties": {"scene": _str, "t": {"type": "number", "minimum": 0,
                                                           "description": "seconds from the scene start"}}},
@@ -344,6 +360,12 @@ def normalize(raw, assets: dict | None = None) -> tuple[dict, list[str]]:
                     warn += tw
                 except TPL.TemplateError:
                     pass
+    if raw.get("broll_provider") not in (None, ""):
+        bp = str(raw.get("broll_provider")).strip().lower()
+        if bp in BROLL_PROVIDERS:
+            b["broll_provider"] = bp
+        else:
+            warn.append(f"broll_provider '{bp}' unknown ({', '.join(BROLL_PROVIDERS)}) — using {BROLL_PROVIDERS[0]}")
     if raw.get("transition") not in (None, ""):
         tr = _transition_norm(raw.get("transition"), "transition", warn)
         if tr:
@@ -514,6 +536,27 @@ def _music_norm(v, warn: list) -> dict | None:
     o["duck"] = v.get("duck") is not False
     if _text(v.get("mood"), 80):
         o["mood"] = _text(v.get("mood"), 80)
+    g = v.get("generate")
+    if isinstance(g, str):
+        g = {"prompt": g}
+    if isinstance(g, dict):
+        go = {}
+        for k, n in (("prompt", 400), ("genre", 60), ("mood", 80)):
+            if _text(g.get(k), n):
+                go[k] = _text(g.get(k), n)
+        bpm = _num(g.get("bpm"), 50, 200)
+        if bpm is not None:
+            go["bpm"] = int(round(bpm))
+        d = _num(g.get("duration"), 10, 240)
+        if d is not None:
+            go["duration"] = round(d, 1)
+        sd = _num(g.get("seed"), 0, 2**31 - 1)
+        if sd is not None:
+            go["seed"] = int(sd)
+        if go.get("prompt") or go.get("genre") or go.get("mood"):
+            o["generate"] = go
+        else:
+            warn.append("music.generate ignored (give a prompt, genre or mood)")
     return o
 
 
@@ -617,6 +660,15 @@ def _background_norm(v, sid: str, warn: list) -> dict | None:
     prompt = _text(v.get("prompt"), 600)
     if prompt:
         o["prompt"] = prompt
+    prov = str(v.get("provider") or "").strip().lower()
+    if prov:
+        if prov in BROLL_PROVIDERS:
+            o["provider"] = prov
+        else:
+            warn.append(f"scene '{sid}': background.provider '{prov}' unknown — using the project default")
+    img = _text(v.get("image"), 120)
+    if img:
+        o["image"] = img
     # no clip and no prompt yet (the editor's "AI clip" mode before a clip is picked): kept, renders as brand
     o["dim"] = round(_num(v.get("dim"), 0, 0.9, BG_DIM_DEFAULT), 3)
     o["blur"] = round(_num(v.get("blur"), 0, 24, 0), 2)
@@ -688,6 +740,9 @@ def rename_assets(brief: dict, mapping: dict) -> dict:
             for it in s.get("items") or []:
                 if isinstance(it, dict) and it.get("asset") in mapping:
                     it["asset"] = mapping[it["asset"]]
+            bg = s.get("background")
+            if isinstance(bg, dict) and bg.get("image") in mapping:
+                bg["image"] = mapping[bg["image"]]
     return b
 
 

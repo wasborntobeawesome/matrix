@@ -115,11 +115,15 @@ project). If something is wrong, it writes `ERROR.txt` into the folder; fix the 
   (U+02BB) and the tutuq belgisi `ʼ` (U+02BC): "Nimbo'ni ko'ring" → "Nimboʼni koʻring". The brief keeps
   what you wrote, and the voice-over reads your text as written.
 
-**Music and cover (optional).** The studio user picks the track from the studio's music library, so a
-source AI can only suggest a mood:
+**Music and cover (optional).** The studio user picks the track from the studio's music library, or the
+studio generates one locally (ACE-Step, instrumental). A source AI may suggest a mood, or describe the
+music to generate:
 
 ```json
 "music": { "mood": "calm, warm" },                                    // suggestion; the user picks a track
+"music": { "generate": { "prompt": "calm modern tech background, soft synth pads, gentle beat",
+                         "genre": "corporate electronic", "mood": "calm, confident", "bpm": 96 } },
+                                                                      // "Make video" generates it if there is no track yet
 "music": { "track": "builtin-calm-pad", "volume_db": -20, "duck": true, "duck_db": -10,
            "fade_in": 1, "fade_out": 2.5, "start": 0 },                // as the studio stores it
 "cover": { "scene": "hook", "t": 2.0 }                                 // cover PNG moment (default: end of scene 1)
@@ -179,7 +183,15 @@ generates and approves.
 "background": { "type": "brand" }                                   // default (the brand gradient); same as leaving it out
 "background": { "type": "broll", "prompt": "slow drifting violet light ribbons on dark navy, soft bokeh", "dim": 0.55, "blur": 0 }
 "background": { "type": "broll", "clip": "b-a328a9b1a9", "dim": 0.55, "blur": 4 }   // a clip id from the studio library
+"background": { "type": "broll", "prompt": "...", "provider": "wan22-a14b" }     // which video generator (optional)
+"background": { "type": "broll", "image": "hero.png", "prompt": "slow push-in, light flickers" }  // animate this image
 ```
+
+- `provider` (optional): `wan22-5b` (the original model), `fastwan-5b` (fast drafts) or `wan22-a14b`
+  (best quality, slower). Default: the project's top-level `"broll_provider"`, else `wan22-5b`. All are
+  local and free for commercial use.
+- `image` (optional): an uploaded image asset (a still background, a product photo, a portrait) that the
+  clip starts from (image-to-video); `prompt` then describes the motion. Leave it out for text-to-video.
 
 - `prompt` (from the source AI) is a suggestion: the scene shows the brand gradient until someone clicks
   *Generate new clip* (pre-filled with the prompt) or picks a library clip. The clip is then stored as `clip`.
@@ -247,7 +259,9 @@ PRODUCT
   for the hook, lists of features, a number, and the ending.
 - "asset" values must be exactly the file names you give me.
 - Brand colours as hex; "background" must be dark (the video style is dark).
-- OPTIONAL: "music": {"mood": "<2-3 words, e.g. calm, warm>"} — the studio user picks a track.
+- OPTIONAL: "music": {"mood": "<2-3 words, e.g. calm, warm>"} — the studio user picks a track; or
+  "music": {"generate": {"prompt": "<instrumental background music>", "genre": "...", "mood": "...", "bpm": 90}}
+  to have the studio generate an instrumental track.
 - OPTIONAL (generated locally by the studio, slow): for 1–3 scenes that are not screenshots
   (hook, chips, stat, CTA), you may suggest a moving background footage prompt:
   "background": {"type": "broll", "prompt": "<calm abstract footage, no text/logos/people>"}.
@@ -270,8 +284,10 @@ Fields:
     cta     {headline, sub?, button?, url?}
     presenter {kicker?, headline, sub?}            (AI talking head; needs top-level "presenter")
   optional per scene: pad (seconds of silence after the line, default 0.4), duration (minimum seconds),
-    background {type: "broll", prompt, dim?, blur?}   (AI b-roll suggestion; default = brand gradient)
-  optional top level: music {mood}, presenter {enabled, mode: "corner"|"full", scenes: "all"|[ids], portrait_prompt},
+    background {type: "broll", prompt, dim?, blur?, provider?, image?}   (AI b-roll suggestion; default = brand gradient)
+  optional top level: music {mood} or music {generate: {prompt, genre?, mood?, bpm?}},
+    broll_provider ("wan22-5b" | "fastwan-5b" | "wan22-a14b"; leave out if unsure),
+    presenter {enabled, mode: "corner"|"full", scenes: "all"|[ids], portrait_prompt},
     template ("aurora" | "clean" | "bold"; the studio user usually picks it — leave out if unsure)
 
 Example (a fictional app, two languages, two formats):

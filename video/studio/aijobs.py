@@ -1,13 +1,14 @@
 """GPU job queue for the local generative-AI layers (separate from the render queue).
 
 One GPU job at a time. Kinds:
-  broll      Wan2.2 text-to-video clip -> library/broll/<id>/   (video/ai/broll.py)
-  portrait   Wan2.2 text-to-image portrait -> library/portraits/<id>/   (video/ai/portrait.py)
-  presenter  EchoMimicV3 talking head on a project's voice-over -> projects/<id>/presenter/   (video/ai/avatar.py)
+  broll      text/image-to-video clip from a provider (providers.py) -> library/broll/<id>/
+  portrait   Wan2.2 text-to-image portrait -> library/portraits/<id>/
+  presenter  EchoMimicV3 talking head on a project's voice-over -> projects/<id>/presenter/
+  music      ACE-Step v1.5 instrumental track -> library/music/<id>/ (music.add_track, source "generated")
 
-The AI scripts run as subprocesses with video/ai/.venv (torch cu128). They print
-"@@PROGRESS {json}" per diffusion step and "@@RESULT {json}" at the end; the rest of the output
-becomes the job's log tail. Before a job starts, free VRAM is checked with nvidia-smi; when it
+Jobs run in warm model workers (workers.py -> video/ai/worker.py, video/ai/.venv, torch cu128) that keep
+the weights in RAM between jobs. They print "@@PROGRESS {json}" per diffusion step and "@@RESULT {json}"
+at the end; the rest of the output becomes the job's log tail. Before a job starts, free VRAM is checked with nvidia-smi; when it
 is below what the job needs the job stays queued ("waiting for GPU memory") until memory frees
 up or the user clicks "start anyway". Jobs are persisted in library/ai-jobs.json; after a server
 restart, jobs that were queued or running show as "interrupted" (and can be retried).
@@ -26,7 +27,10 @@ from pathlib import Path
 import build
 import gpu
 import library as L
+import music as MU
 import presenter as PR
+import providers as P
+import workers as WK
 from brief import normalize
 from store import Project, StoreError, now
 
@@ -37,11 +41,12 @@ JOBS_FILE = L.LIB / "ai-jobs.json"
 TIMINGS_FILE = L.LIB / "ai-timings.json"
 TMP = L.LIB / "tmp"
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-KINDS = ("broll", "portrait", "presenter")
+KINDS = ("broll", "portrait", "presenter", "music")
 
 # VRAM a job needs before it starts (GB, as nvidia-smi "free"): measured peak torch-reserved
 # memory + ~0.5 GB CUDA context. Updated from real runs (ai-timings.json).
-NEED_GB = {"broll/draft": 7.7, "broll/final": 11.5, "portrait/final": 7.7, "presenter/draft": 8.2, "presenter/final": 11.1}
+NEED_GB = {"broll/draft": 7.7, "broll/final": 11.5, "portrait/final": 7.7, "presenter/draft": 8.2, "presenter/final": 11.1,
+           "music/final": 8.6, **P.NEED_GB}
 # Time model per kind/preset: load + unit * per_unit + tail (seconds). units = steps (b-roll,
 # portrait) or seconds of talking head to generate (presenter). Seeded with measured runs
 # (video/ai/README.md + this studio's own draft runs); replaced by real job timings as they finish.
@@ -51,7 +56,10 @@ TIME_DEFAULTS = {
     "portrait/final": {"load": 25, "per_unit": 0.6, "tail": 5},
     "presenter/draft": {"load": 100, "per_unit": 23.5, "tail": 15},
     "presenter/final": {"load": 70, "per_unit": 55.0, "tail": 5},   # free GPU, model offload
+    "music/final": {"load": 12, "per_unit": 0.25, "tail": 3},        # units = seconds of audio (ACE-Step turbo, 8 steps)
+    **P.TIME_DEFAULTS,
 }
+WARM_LOAD = 2.0   # seconds to start a job whose models are already in RAM (the first estimate before it is measured)
 LICENCES = [
     {"what": "Wan2.2-TI2V-5B weights + code (Wan-AI) — b-roll and generated portraits", "licence": "Apache-2.0",
      "commercial": True, "note": "You are responsible for generated content; no illegal or harmful use (model card)."},
@@ -64,8 +72,20 @@ LICENCES = [
     {"what": "chinese-wav2vec2-base (TencentGameMate) — audio features", "licence": "MIT", "commercial": True,
      "note": "Trained on Chinese speech (WenetSpeech); lip shapes for uz/ru/en/ar are plausible, not dubbing-grade."},
     {"what": "PyTorch / diffusers / transformers / accelerate", "licence": "BSD-3 / Apache-2.0", "commercial": True, "note": ""},
+    {"what": "FastWan2.2-TI2V-5B-FullAttn (FastVideo / Hao AI Lab) — fast draft b-roll", "licence": "Apache-2.0",
+     "commercial": True, "note": "DMD-distilled fine-tune of Wan2.2-TI2V-5B; shares its UMT5 encoder and VAE (Apache-2.0)."},
+    {"what": "Wan2.2-T2V-A14B + Wan2.2-I2V-A14B (Wan-AI) — quality b-roll, animate an image", "licence": "Apache-2.0",
+     "commercial": True, "note": "Uses the Wan2.1 VAE and the UMT5-XXL encoder (both Apache-2.0)."},
+    {"what": "Wan2.2-Lightning 4-step LoRAs (lightx2v / ModelTC)", "licence": "Apache-2.0", "commercial": True,
+     "note": "Distillation LoRAs fused into the A14B weights at load time."},
+    {"what": "ACE-Step v1.5 XL turbo (ACE Studio / StepFun) — music", "licence": "MIT", "commercial": True,
+     "note": "Model card: trained on licensed, royalty-free/public-domain and synthetic (MIDI) music; generated music may "
+             "be used commercially. Its own 48 kHz Oobleck VAE (not Stable Audio's). Check outputs for accidental "
+             "similarity to existing songs before publishing."},
+    {"what": "Qwen3-Embedding-0.6B (Qwen) — ACE-Step text encoder", "licence": "Apache-2.0", "commercial": True, "note": ""},
     {"what": "ffmpeg (gyan.dev build, --enable-gpl)", "licence": "GPL-3", "commercial": True,
      "note": "Fine to run as a tool; don't ship it inside a closed product."},
+    {"what": "nvidia-ml-py / psutil (system monitor)", "licence": "BSD-3", "commercial": True, "note": ""},
 ]
 DISCLOSURE = ("A generated or animated presenter is synthetic media: most platforms require an "
               "\"AI-generated\" label. Only animate a real person with their permission.")
@@ -80,7 +100,7 @@ def _key(kind: str, preset: str | None) -> str:
 
 
 class AIJobs:
-    def __init__(self):
+    def __init__(self, sampler=None):
         self.jobs: dict[str, dict] = {}
         self.procs: dict[str, subprocess.Popen] = {}
         self.lock = threading.RLock()
@@ -89,7 +109,9 @@ class AIJobs:
         self.hold = None   # callable -> str | None: a reason why no GPU job may start now ("Make video" voice stage)
         self._saved = 0.0
         self.timings = self._load_timings()
-        self.monitor = gpu.Monitor(ai_pids=self._ai_pids)
+        WK.kill_leftovers()                  # warm workers a previous studio process left behind
+        self.pool = WK.Pool()
+        self.monitor = gpu.Monitor(ai_pids=self._ai_pids, sampler=sampler)
         self._load()
         threading.Thread(target=self._loop, name="ai-gpu-queue", daemon=True).start()
 
@@ -132,9 +154,14 @@ class AIJobs:
             pass
         return t
 
-    def _learn(self, key: str, load: float | None, per_unit: float | None, tail: float | None, need_gb: float | None) -> None:
+    def _learn(self, key: str, load: float | None, per_unit: float | None, tail: float | None, need_gb: float | None,
+               warm: bool = False) -> None:
         cur = self.timings.setdefault(key, dict(TIME_DEFAULTS.get(key, {"load": 30, "per_unit": 10, "tail": 30})))
         measured = cur.get("runs", 0)
+        if warm and load is not None:        # a warm start says nothing about the cold model load
+            cur["load_warm"] = round(load if not cur.get("warm_runs") else 0.6 * cur["load_warm"] + 0.4 * load, 2)
+            cur["warm_runs"] = cur.get("warm_runs", 0) + 1
+            load = None
         for name, v in (("load", load), ("per_unit", per_unit), ("tail", tail)):
             if v is not None and v > 0:
                 # first real measurement replaces the seed value, later ones are averaged
@@ -149,21 +176,41 @@ class AIJobs:
         except OSError:
             pass
 
-    def estimate(self, kind: str, preset: str | None, units: float) -> float:
-        t = self.timings.get(_key(kind, preset)) or {"load": 30, "per_unit": 10, "tail": 30}
-        return round(t["load"] + units * t["per_unit"] + t["tail"])
+    def estimate(self, kind: str, preset: str | None, units: float, key: str | None = None, warm: bool = False) -> float:
+        t = self.timings.get(key or _key(kind, preset)) or {"load": 30, "per_unit": 10, "tail": 30}
+        load = t.get("load_warm", WARM_LOAD) if warm else t["load"]
+        return round(load + units * t["per_unit"] + t["tail"])
 
     def need_gb(self, kind: str, preset: str | None) -> float:
-        k = _key(kind, preset)
+        return self.need_gb_key(_key(kind, preset))
+
+    def need_gb_key(self, k: str) -> float:
         return float((self.timings.get(k) or {}).get("need_gb") or NEED_GB.get(k, 8.0))
+
+    def is_warm(self, family: str, keys: list[str]) -> bool:
+        w = self.pool.workers.get(family)
+        if not w or not w.alive() or not self.pool.settings.get("warm"):
+            return False
+        have = {m["key"] for m in (w.status.get("models") or [])}
+        return all(k in have for k in keys)
+
+    def estimate_broll(self, provider: str, preset: str, i2v: bool = False) -> float:
+        pv = P.get(provider)
+        fam = pv["family"]["i2v" if i2v else "t2v"]
+        return self.estimate("broll", preset, pv["presets"][preset]["steps"], key=P.timing_key(provider, preset),
+                             warm=self.is_warm(fam, broll_keys(provider, fam)))
 
     # ------------------------------------------------------------ public API
     def submit(self, kind: str, params: dict, project: str | None = None, label: str = "", units: float = 0,
                preset: str | None = None) -> dict:
+        tkey = P.timing_key(params.get("provider") or P.DEFAULT, preset or "draft") if kind == "broll" else _key(kind, preset)
+        est = (self.estimate_broll(params.get("provider") or P.DEFAULT, preset or "draft", bool(params.get("image")))
+               if kind == "broll" else self.estimate(kind, preset, units, warm=self.is_warm(*_family_keys(kind))))
         job = {"id": secrets.token_hex(6), "kind": kind, "project": project, "params": params, "preset": preset,
                "label": label, "status": "queued", "stage": "queued", "progress": 0.0, "message": "", "error": None,
                "result": None, "created": now(), "started": None, "finished": None, "eta": None, "elapsed": 0,
-               "estimate": self.estimate(kind, preset, units), "units": units, "need_gb": self.need_gb(kind, preset),
+               "provider": params.get("provider") if kind == "broll" else None, "timing_key": tkey,
+               "estimate": est, "units": units, "need_gb": self.need_gb_key(tkey),
                "force": False, "waiting": False, "log": [], "pid": None}
         with self.lock:
             self.jobs[job["id"]] = job
@@ -218,7 +265,7 @@ class AIJobs:
         if j["status"] == "queued":
             j.update(status="cancelled", stage="cancelled", waiting=False, finished=now())
         elif j["status"] == "running":
-            j["_cancel"] = True
+            j["_cancel"] = True             # the warm worker stops at the next step and keeps its weights
             j["message"] = "cancelling…"
             proc = self.procs.get(jid)
             if proc and proc.poll() is None:
@@ -259,7 +306,7 @@ class AIJobs:
         return s
 
     def _ai_pids(self) -> set:
-        return {p.pid for p in self.procs.values() if p.poll() is None}
+        return {p.pid for p in self.procs.values() if p.poll() is None} | set(self.pool.pids())
 
     # ------------------------------------------------------------ the GPU loop
     def _next(self) -> dict | None:
@@ -314,7 +361,8 @@ class AIJobs:
         self.current = job["id"]
         self._save(force=True)
         try:
-            runner = {"broll": self._broll, "portrait": self._portrait, "presenter": self._presenter}[job["kind"]]
+            runner = {"broll": self._broll, "portrait": self._portrait, "presenter": self._presenter,
+                      "music": self._music}[job["kind"]]
             job["result"] = runner(job)
             job.update(status="done", progress=1.0, stage="done", eta=0, message="")
         except Cancelled:
@@ -389,6 +437,29 @@ class AIJobs:
             raise RuntimeError(f"{Path(cmd[0]).name} failed (exit {rc}): " + " | ".join(tail))
         return result
 
+    def _task(self, job: dict, family: str, task: dict, keys: list[str], on_progress) -> dict:
+        """Run one task in the family's warm worker; PROGRESS -> on_progress, other output -> the log tail."""
+        tqdm_re = re.compile(r"^\s*\d+%\|")
+
+        def on_event(kind, data):
+            if kind == "PROGRESS":
+                on_progress(data)
+                self._save()
+            elif kind == "LOG":
+                log = job["log"]
+                if log and tqdm_re.match(data) and tqdm_re.match(log[-1]):
+                    log[-1] = data[:300]
+                else:
+                    log.append(data[:300])
+                del log[:-40]
+        job["worker"] = family
+        try:
+            res = self.pool.run(job, family, task, keys, on_event, lambda: bool(job.get("_cancel")))
+        except WK.Cancelled:
+            raise Cancelled() from None
+        job["warm"] = bool(res.get("warm"))
+        return res
+
     def _stepper(self, job: dict, total_units: float, p0: float, p1: float, tail_est: float):
         """Progress callback for denoising steps: progress p0..p1, ETA from the measured step time."""
         st = {"t_first": None, "n_first": 0, "tail_t": None}
@@ -397,7 +468,10 @@ class AIJobs:
             stage, done, total = ev.get("stage"), ev.get("done", 0), ev.get("total") or 1
             el = time.time() - job["started"]
             if stage == "load":
-                job.update(stage="loading", message="loading the model…", progress=round(p0 * 0.5, 3))
+                warm = ev.get("warm")
+                job["warm"] = bool(warm)
+                job.update(stage="loading", message="warm model (already in RAM)…" if warm else "loading the model…",
+                           progress=round(p0 * 0.5, 3))
                 job["eta"] = max(0, round(job["estimate"] - el)) if job.get("estimate") else None
             elif stage == "denoise":
                 if st["t_first"] is None:
@@ -424,42 +498,57 @@ class AIJobs:
     # ------------------------------------------------------------ runners
     def _broll(self, job: dict) -> dict:
         prm = job["params"]
-        pr = L.BROLL_PRESETS[job["preset"]]
-        w, h = pr[prm.get("orientation", "portrait")]
-        cid = L.broll_key(prm["prompt"], prm["seed"], pr["steps"], w, h, pr["frames"])
+        provider = prm.get("provider") or P.DEFAULT
+        pv = P.get(provider)
+        preset = job["preset"] if job["preset"] in pv["presets"] else "draft"
+        pr = pv["presets"][preset]
+        orient = prm.get("orientation", "portrait")
+        w, h = P.size(provider, preset, orient)
+        img = prm.get("image") or None              # {"path", "sha", "label"}: image-to-video ("animate this image")
+        if img and not Path(img["path"]).is_file():
+            raise RuntimeError(f"the image to animate is gone: {img.get('label') or img['path']}")
+        cid = P.clip_key(provider, prm["prompt"], prm["seed"], preset, orient, img["sha"] if img else None)
         if L.broll_get(cid):
             self._assign_broll(job, cid)
             return {"clip": cid, "cached": True}
         TMP.mkdir(parents=True, exist_ok=True)
         tmp = TMP / f"{job['id']}.mp4"
-        tl = self.timings.get(_key("broll", job["preset"]), {})
-        res = self._proc(job, ["broll.py", "--prompt", prm["prompt"], "--negative", prm.get("negative") or L.NEGATIVE,
-                               "--seed", str(prm["seed"]), "--steps", str(pr["steps"]), "--width", str(w),
-                               "--height", str(h), "--frames", str(pr["frames"]), "--out-file", str(tmp), "--progress",
-                               "--offload", prm.get("offload") or "auto"],
+        tkey = P.timing_key(provider, preset)
+        tl = self.timings.get(tkey, {})
+        fam = pv["family"]["i2v" if img else "t2v"]
+        task = {"kind": "broll", "provider": provider, "prompt": prm["prompt"], "negative": prm.get("negative") or L.NEGATIVE,
+                "seed": int(prm["seed"]), "steps": pr["steps"], "width": w, "height": h, "frames": pr["frames"],
+                "fps": pr["fps"], "guidance": pr["guidance"], "out": str(tmp)}
+        if img:
+            task["image"] = img["path"]
+        res = self._task(job, fam, task, broll_keys(provider, fam),
                          self._stepper(job, pr["steps"], 0.06, 0.82, tl.get("tail", 40)))
         job.update(stage="library", message="adding to the library (VP9 + thumbnail)…", progress=0.97)
         t = time.time()
         meta = L.broll_add(tmp, {"id": cid, "prompt": prm["prompt"], "negative": prm.get("negative") or L.NEGATIVE,
-                                 "seed": prm["seed"], "steps": pr["steps"], "guidance": res.get("guidance", 5.0),
-                                 "width": w, "height": h, "frames": pr["frames"], "fps": res.get("fps", 24),
-                                 "seconds": res.get("seconds"), "preset": job["preset"], "source": "generated",
+                                 "seed": prm["seed"], "steps": pr["steps"], "guidance": res.get("guidance", pr["guidance"]),
+                                 "width": w, "height": h, "frames": pr["frames"], "fps": res.get("fps", pr["fps"]),
+                                 "seconds": res.get("seconds"), "preset": preset, "source": "generated",
+                                 "provider": provider, "model": pv["model"], "licence": pv["licence"],
+                                 "mode": "i2v" if img else "t2v", "image": (img or {}).get("label"),
+                                 "image_sha": (img or {}).get("sha"),
                                  "gen_seconds": res.get("gen_seconds"), "load_seconds": res.get("load_seconds"),
-                                 "job_seconds": round(time.time() - job["started"]),
+                                 "job_seconds": round(time.time() - job["started"]), "warm": res.get("warm"),
                                  "peak_vram_allocated_gb": res.get("peak_vram_allocated_gb"),
                                  "peak_vram_reserved_gb": res.get("peak_vram_reserved_gb"),
                                  "offload": res.get("offload"), "full_gpu": res.get("full_gpu"),
-                                 "denoise_seconds": res.get("denoise_seconds"),
+                                 "denoise_seconds": res.get("denoise_seconds"), "decode_seconds": res.get("decode_seconds"),
+                                 "worker_ram_gb": res.get("worker_ram_gb"),
                                  "free_vram_at_start_gb": res.get("free_vram_at_start_gb")}, move=True)
         post = time.time() - t
-        self._learn(_key("broll", job["preset"]), res.get("load_seconds"),
+        self._learn(tkey, (res.get("load_seconds") or 0) + (res.get("encode_seconds") or 0),
                     (res.get("denoise_seconds") or 0) / pr["steps"], (res.get("decode_seconds") or 0) + post,
-                    _need(res, res.get("full_gpu")))
+                    _need(res, res.get("full_gpu")), warm=bool(res.get("warm")))
         self._assign_broll(job, cid)
-        return {"clip": cid, "seconds": meta.get("duration"), "gen_seconds": res.get("gen_seconds"),
+        return {"clip": cid, "provider": provider, "seconds": meta.get("duration"), "gen_seconds": res.get("gen_seconds"),
                 "denoise_seconds": res.get("denoise_seconds"), "load_seconds": res.get("load_seconds"),
-                "offload": res.get("offload"), "full_gpu": res.get("full_gpu"),
-                "peak_vram_reserved_gb": res.get("peak_vram_reserved_gb")}
+                "decode_seconds": res.get("decode_seconds"), "warm": res.get("warm"), "offload": res.get("offload"),
+                "peak_vram_reserved_gb": res.get("peak_vram_reserved_gb"), "worker_ram_gb": res.get("worker_ram_gb")}
 
     def _assign_broll(self, job: dict, cid: str) -> None:
         a = job["params"].get("assign")
@@ -473,7 +562,8 @@ class AIJobs:
         for s in b["scenes"]:
             if s["id"] == a["scene"]:
                 bg = s.get("background") if isinstance(s.get("background"), dict) else {}
-                s["background"] = {"type": "broll", "clip": cid, "dim": a.get("dim", bg.get("dim", 0.55)),
+                s["background"] = {**{k: bg[k] for k in ("prompt", "provider", "image") if bg.get(k)},
+                                   "type": "broll", "clip": cid, "dim": a.get("dim", bg.get("dim", 0.55)),
                                    "blur": a.get("blur", bg.get("blur", 0))}
                 p.save_brief(normalize(b, p.assets())[0])
                 job.setdefault("result_note", f"assigned to scene '{a['scene']}'")
@@ -484,15 +574,18 @@ class AIJobs:
         TMP.mkdir(parents=True, exist_ok=True)
         tmp = TMP / f"{job['id']}.png"
         tl = self.timings.get("portrait/final", {})
-        res = self._proc(job, ["portrait.py", "--out", str(tmp), "--seed", str(prm["seed"]), "--prompt", prm["prompt"],
-                               "--steps", str(prm.get("steps", 40)), "--progress"],
-                         self._stepper(job, 40, 0.1, 0.9, tl.get("tail", 5)))
+        steps = int(prm.get("steps", 40))
+        res = self._task(job, "wan", {"kind": "portrait", "provider": "wan22-5b", "prompt": prm["prompt"],
+                                      "seed": int(prm["seed"]), "steps": steps, "width": 704, "height": 1280,
+                                      "out": str(tmp)}, ["umt5", "vae22", "wan22-5b"],
+                         self._stepper(job, steps, 0.1, 0.9, tl.get("tail", 5)))
         m = L.portrait_add(tmp, {"source": "generated", "fictional": True, "prompt": res.get("prompt", prm["prompt"]),
                                  "seed": prm["seed"], "steps": res.get("steps"), "name": prm.get("name") or "Generated presenter",
                                  "gen_seconds": res.get("gen_seconds"), **L.WAN})
         tmp.unlink(missing_ok=True)
-        self._learn("portrait/final", res.get("load_seconds"), (res.get("gen_seconds") or 0) / max(1, res.get("steps") or 40),
-                    5, (res.get("peak_vram_reserved_gb") or 0) + 0.5 if res.get("peak_vram_reserved_gb") else None)
+        self._learn("portrait/final", res.get("load_seconds"), (res.get("denoise_seconds") or 0) / max(1, res.get("steps") or 40),
+                    (res.get("decode_seconds") or 0) + 2, (res.get("peak_vram_reserved_gb") or 0) + 0.5
+                    if res.get("peak_vram_reserved_gb") else None, warm=bool(res.get("warm")))
         a = prm.get("assign_project")
         if a:
             try:
@@ -536,30 +629,75 @@ class AIJobs:
         st = PR.PRESETS[quality]
         res = {}
         if todo:
-            jf = d / f"job-{job['id']}.json"
-            jf.write_text(json.dumps({"portrait": str(portrait), "gpu": job["params"].get("gpu") or "auto",
-                                      **{k: st[k] for k in ("width", "height", "steps", "teacache", "seed")},
-                                      "segments": [{"wav": x["wav"], "out": x["out"], "min_dur": x["dur"]} for x in todo]}),
-                          encoding="utf-8")
             tlm = self.timings.get(_key("presenter", quality), {})
-            try:
-                res = self._proc(job, ["avatar.py", "--job", str(jf)],
-                                 self._stepper(job, len(todo) * st["steps"], 0.08, 0.92, tlm.get("tail", 20)))
-            finally:
-                jf.unlink(missing_ok=True)
+            res = self._task(job, "echomimic", {"portrait": str(portrait), **{k: st[k] for k in ("width", "height", "steps",
+                                                                                                    "teacache", "seed")},
+                                                "segments": [{"wav": x["wav"], "out": x["out"], "min_dur": x["dur"]}
+                                                             for x in todo]}, ["echomimic"],
+                             self._stepper(job, len(todo) * st["steps"], 0.08, 0.92, tlm.get("tail", 20)))
         job.update(stage="assemble", message="assembling the presenter video…", progress=0.95)
         t = time.time()
         PR.assemble(pl, portrait, tl["duration"])
         post = time.time() - t
         if res.get("video_seconds"):
             self._learn(_key("presenter", quality), res.get("load_seconds"), res["gen_seconds"] / res["video_seconds"],
-                        post, _need(res, res.get("gpu_mode") == "full"))
+                        post, _need(res, res.get("gpu_mode") == "full"), warm=bool(res.get("warm")))
         p.touch()
         return {"video": Path(pl["file"]).name, "key": pl["key"], "segments": len(todo),
                 "generated_seconds": res.get("video_seconds"), "gen_seconds": res.get("gen_seconds"),
                 "load_seconds": res.get("load_seconds"), "gpu_mode": res.get("gpu_mode"),
-                "per_segment": res.get("per_segment"), "assemble_seconds": round(post, 1),
+                "per_segment": res.get("per_segment"), "assemble_seconds": round(post, 1), "warm": res.get("warm"),
                 "peak_vram_reserved_gb": res.get("peak_vram_reserved_gb")}
+
+    def _music(self, job: dict) -> dict:
+        """ACE-Step instrumental -> trimmed, faded, checked (duration, loudness, spectrum) -> music library."""
+        prm = job["params"]
+        TMP.mkdir(parents=True, exist_ok=True)
+        raw = TMP / f"{job['id']}.wav"
+        dur = float(prm["duration"])
+        caption = music_caption(prm)
+        tl = self.timings.get("music/final", {})
+        # ask for a little more than needed: ACE-Step often fades out early; the silent tail is trimmed below
+        gen_dur = min(240.0, dur + 6.0)
+        res = self._task(job, "acestep", {"prompt": caption, "duration": gen_dur, "bpm": prm.get("bpm"),
+                                         "key": prm.get("key"), "seed": int(prm["seed"]), "steps": 8,
+                                         "instrumental": True, "out": str(raw)}, ["acestep"],
+                         self._stepper(job, 8, 0.1, 0.85, tl.get("tail", 3)))
+        job.update(stage="checking", message="trimming and checking the audio (loudness, spectrum)…", progress=0.92)
+        t = time.time()
+        ogg = TMP / f"{job['id']}.ogg"
+        info = MU.finish_generated(raw, ogg, dur)
+        check = MU.analyze(ogg)
+        raw.unlink(missing_ok=True)
+        if not check.get("ok"):
+            ogg.unlink(missing_ok=True)
+            raise RuntimeError(f"the generated audio failed the check ({check.get('problem')}): "
+                               f"{json.dumps({k: check.get(k) for k in ('duration', 'lufs', 'flatness', 'flux')})}")
+        title = (prm.get("title") or "").strip() or (", ".join(x for x in (prm.get("genre"), prm.get("mood")) if x)
+                                                     or prm["prompt"])[:60]
+        m = MU.add_track(ogg, {"title": title, "artist": "ACE-Step v1.5 (generated locally)", "licence": MU.GENERATED_LICENCE,
+                               "source": "generated", "mood": prm.get("mood") or None, "bpm": prm.get("bpm"),
+                               "prompt": caption, "genre": prm.get("genre") or None, "seed": int(prm["seed"]),
+                               "model": "ACE-Step v1.5 XL turbo", "gen_seconds": res.get("gen_seconds"),
+                               "check": check, "key": prm.get("cache_key")}, move=True)
+        post = time.time() - t
+        self._learn("music/final", res.get("load_seconds"), (res.get("gen_seconds") or 0) / max(1.0, gen_dur), post,
+                    (res.get("peak_vram_reserved_gb") or 0) + 0.6 if res.get("peak_vram_reserved_gb") else None,
+                    warm=bool(res.get("warm")))
+        a = prm.get("assign_project")
+        if a:
+            try:
+                p = Project.get(a)
+                b = p.brief
+                mu = b.get("music") if isinstance(b.get("music"), dict) else {}
+                b["music"] = {**mu, "track": m["id"]}
+                p.save_brief(normalize(b, p.assets())[0])
+            except StoreError:
+                pass
+        return {"track": m["id"], "title": m["title"], "duration": m["duration"], "lufs": m["lufs"], "check": check,
+                "trim": info, "gen_seconds": res.get("gen_seconds"), "load_seconds": res.get("load_seconds"),
+                "warm": res.get("warm"), "peak_vram_reserved_gb": res.get("peak_vram_reserved_gb"),
+                "worker_ram_gb": res.get("worker_ram_gb")}
 
 
 def _need(res: dict, full_gpu) -> float | None:
@@ -581,7 +719,25 @@ def _kill_orphan(pid: int) -> None:
                             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"],
                            capture_output=True, text=True, timeout=20, creationflags=NOWIN)
         cl = (r.stdout or "").lower()
-        if any(s in cl for s in ("broll.py", "portrait.py", "avatar.py")):
+        if any(s in cl for s in ("broll.py", "portrait.py", "avatar.py", "worker.py")):
             _kill_tree(pid)
     except Exception:
         pass
+
+
+def broll_keys(provider: str, family: str) -> list[str]:
+    """Models a b-roll job of this provider needs in its worker (to tell warm from cold)."""
+    if family == "wan":
+        return ["umt5", "vae22-bf16" if provider == "fastwan-5b" else "vae22", provider]
+    return ["umt5", family]
+
+
+def _family_keys(kind: str) -> tuple[str, list[str]]:
+    return {"portrait": ("wan", ["umt5", "vae22", "wan22-5b"]), "presenter": ("echomimic", ["echomimic"]),
+            "music": ("acestep", ["acestep"])}.get(kind, ("wan", ["umt5"]))
+
+
+def music_caption(prm: dict) -> str:
+    """ACE-Step caption: genre, mood and the prompt; instrumental only."""
+    parts = [prm.get("genre"), prm.get("mood"), prm.get("prompt"), "instrumental, no vocals"]
+    return ", ".join(str(x).strip() for x in parts if x and str(x).strip())[:500]

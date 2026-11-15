@@ -1,13 +1,15 @@
 """"Make video": one button / one API call from brief to MP4, each step with the whole GPU.
 
 Stages, strictly in order, one pipeline at a time:
-  1. voice   generate every missing/changed voice-over line (Ovoz may use the whole GPU; no AI
-             GPU job may start meanwhile)
+  1. voice   the warm AI workers first give back their GPU memory (weights stay in RAM), then every
+             missing/changed voice-over line is generated (Ovoz may use the whole GPU; no AI GPU job may
+             start meanwhile)
   2. unload  POST {OVOZ}/api/unload, then confirm with the GPU counters that Ovoz's VRAM dropped
              (404 = old Ovoz: a notice, and the AI queue's normal VRAM wait / "start anyway" applies)
-  3. ai      every AI job the project still needs: a presenter portrait (from portrait_prompt),
-             b-roll for scenes that ask for one, the presenter video; quality = the pipeline's
-             (default "final"); the runners use full-GPU mode when enough VRAM is free.
+  3. ai      every AI job the project still needs: generated music (music.generate without a track),
+             a presenter portrait (from portrait_prompt), b-roll for scenes that ask for one (each with
+             its provider: background.provider or the project's broll_provider), the presenter video;
+             quality = the pipeline's (default "final"). Jobs run one after another in the warm workers.
              The studio's own voice requests wait during this stage.
   4. render  the MP4 (the normal render queue)
 
@@ -28,7 +30,9 @@ import urllib.request
 import build
 import gpu
 import library as L
+import music as MU
 import presenter as PR
+import providers as P
 from brief import localize as normalize_l
 from brief import normalize
 from store import Project, StoreError, now
@@ -148,6 +152,15 @@ class Pipelines:
     def list(self) -> list[dict]:
         return [self.view(p) for p in sorted(self.items.values(), key=lambda p: p["created"], reverse=True)[:30]]
 
+    def activity(self) -> list[tuple]:
+        """(key, label, category) of the running pipeline stage, for the monitor's timeline markers."""
+        it = self.items.get(self.current) if self.current else None
+        if not it or it.get("status") != "running" or not it.get("current"):
+            return []
+        names = {"voice": "① Voice-over", "unload": "② Free GPU", "ai": "③ AI clips", "render": "④ Render"}
+        return [(f"make:{it['id']}:{it['current']}", f"Make video · {names.get(it['current'], it['current'])} · "
+                 f"{(it.get('title') or it['project'])[:30]}", f"stage-{it['current']}")]
+
     def cancel(self, ident: str) -> dict | None:
         it = self.items.get(ident)
         if not it:
@@ -247,11 +260,21 @@ class Pipelines:
             st["message"] = f"waiting for the running AI job ({j.get('kind', '?')}) to finish"
             self._save()
             time.sleep(2)
+        # warm AI workers give back their GPU memory (their weights stay in RAM) so Ovoz gets the whole GPU
+        st["message"] = "warm AI workers: releasing GPU memory (weights stay in RAM)…"
+        self._save(force=True)
+        before = self.ai.monitor.refresh()
+        released = self.ai.pool.release_gpu()
+        after = self.ai.monitor.refresh() if released else before
+        st["detail"]["released"] = {"workers": released, "ai_mb_before": before.get("ai_mb"),
+                                    "ai_mb_after": after.get("ai_mb"), "warm_ram_gb": self.ai.pool.view()["ram_gb"]}
         brief = p.brief
         langs = build.langs_of(brief)
         todo = build.todo_lines(p)
+        rel = st["detail"]["released"]
+        st["detail"] = {"released": rel}
         total = sum(1 for lg in langs for s in normalize_l(brief, lg)["scenes"] if build.say_of(s))
-        st["detail"] = {"lines": total, "to_generate": len(todo), "languages": langs,
+        st["detail"] = {**st["detail"], "lines": total, "to_generate": len(todo), "languages": langs,
                         "model": brief["voice"].get("model"), "voice": brief["voice"].get("voice"),
                         "voices": {lg: f"{v.get('model')}/{v.get('voice')}" for lg, v in (brief.get("voices") or {}).items()}}
 
@@ -345,6 +368,26 @@ class Pipelines:
         bubble, full, _ = PR.needed(brief)
         wants_presenter = bool(bubble or full)
         jobs_done: list[dict] = []
+        # 0) generated music when the project asks for one and has no (existing) track yet
+        mu = brief.get("music") if isinstance(brief.get("music"), dict) else {}
+        spec = mu.get("generate")
+        if spec and not (mu.get("track") and MU.get(mu["track"])):
+            spec = {**spec, "duration": spec.get("duration") or min(240.0, round(build.timeline(p)["duration"] + 3, 1)),
+                    "seed": spec.get("seed", 7)}
+            have = MU.generated_for(spec)
+            if have:
+                b2 = p.brief
+                b2["music"] = {**b2.get("music", {}), "track": have["id"]}
+                p.save_brief(normalize(b2, p.assets())[0])
+                self._notice(it, f"music: reused the generated track '{have['title']}'")
+            else:
+                j = self.ai.submit("music", {**spec, "cache_key": MU.generate_key(spec), "assign_project": p.id,
+                                             "title": f"{brief.get('product') or brief.get('title') or 'Video'} — "
+                                                      f"{spec.get('mood') or spec.get('genre') or 'music'}"[:60]},
+                                   project=p.id, label=(spec.get("prompt") or spec.get("genre") or "music")[:70],
+                                   units=spec["duration"], preset="final")
+                jobs_done += self._wait_jobs(it, st, [j["id"]], base)
+            brief = p.brief
         # a) portrait from portrait_prompt when the presenter has none yet
         if wants_presenter and pres is not None and not pres.get("portrait") and pres.get("portrait_prompt"):
             j = self.ai.submit("portrait", {"prompt": pres["portrait_prompt"], "seed": 1, "steps": 40,
@@ -364,16 +407,24 @@ class Pipelines:
                     continue   # "AI clip" picked in the editor but no prompt: nothing to generate
                 self._notice(it, f"scene '{s['id']}': clip {bg['clip']} is missing and there is no prompt — brand gradient")
                 continue
-            pr = L.BROLL_PRESETS[q]
+            provider = bg.get("provider") or brief.get("broll_provider") or P.DEFAULT
             orient = "landscape" if fmt == "16:9" else "portrait"
-            w, h = pr[orient]
-            params = {"prompt": bg["prompt"], "negative": None, "seed": 42, "orientation": orient,
+            img = None
+            if bg.get("image"):
+                img = image_ref(p, bg["image"])
+                if not img:
+                    self._notice(it, f"scene '{s['id']}': image '{bg['image']}' to animate is missing — text to video instead")
+            params = {"prompt": bg["prompt"], "negative": None, "seed": 42, "orientation": orient, "provider": provider,
                       "assign": {"project": p.id, "scene": s["id"], "dim": bg.get("dim", 0.55), "blur": bg.get("blur", 0)}}
-            cid = L.broll_key(bg["prompt"], 42, pr["steps"], w, h, pr["frames"])
+            if img:
+                params["image"] = img
+            cid = P.clip_key(provider, bg["prompt"], 42, q, orient, img["sha"] if img else None)
             if L.broll_get(cid):
                 self.ai._assign_broll({"params": params}, cid)
                 continue
-            ids.append(self.ai.submit("broll", params, project=p.id, label=bg["prompt"][:70], units=pr["steps"], preset=q)["id"])
+            pv = P.get(provider)
+            ids.append(self.ai.submit("broll", params, project=p.id, label=f"{pv['name']} · {bg['prompt'][:56]}",
+                                      units=pv["presets"][q]["steps"], preset=q)["id"])
         if wants_presenter:
             brief = p.brief
             if (brief.get("presenter") or {}).get("quality") != q and isinstance(brief.get("presenter"), dict):
@@ -458,3 +509,18 @@ class Pipelines:
 
 def _snap(s: dict) -> dict:
     return {k: s.get(k) for k in ("ovoz_mb", "free_mb", "used_mb", "ai_mb")}
+
+
+def image_ref(p: Project, name: str) -> dict | None:
+    """An image asset of the project (or a library portrait id) to animate: {path, sha, label}."""
+    try:
+        f = p.asset_path(name)
+        if f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
+            return {"path": str(f), "sha": L.file_sha(f), "label": name}
+    except StoreError:
+        pass
+    m = L.portrait_get(name)
+    if m:
+        f = L.PORTRAITS / name / "portrait.png"
+        return {"path": str(f), "sha": L.file_sha(f), "label": f"portrait {name}"}
+    return None

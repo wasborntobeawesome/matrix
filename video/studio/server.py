@@ -7,14 +7,16 @@ UI at http://127.0.0.1:8001/ ; API under /api (see README.md).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 import align
@@ -26,10 +28,12 @@ import inbox
 import library as L
 import music as MU
 import presenter as PR
+import providers as PV
+import sysmon
 import templates as TP
 from aijobs import AI_PY, DISCLOSURE, LICENCES, AIJobs
 from jobs import Jobs
-from pipeline import Pipelines
+from pipeline import Pipelines, image_ref
 from store import MAX_IMAGE, MAX_VIDEO, Project, StoreError, import_project, kind_of
 
 STUDIO = Path(__file__).resolve().parent
@@ -44,7 +48,38 @@ try:
     L.import_existing()   # first start: the 3 existing Wan2.2 clips + the generated presenter portrait
 except Exception as e:  # never block the studio on the AI library
     print("library import failed:", e)
-ai = AIJobs()
+ai = None
+make = None
+
+
+def _activity() -> list[tuple]:
+    """What runs right now, for the monitor's timeline markers: pipeline stage, AI job, render / voice job."""
+    out = []
+    if make is not None:
+        out += make.activity()
+    if ai is not None and ai.current:
+        j = ai.jobs.get(ai.current) or {}
+        if j.get("status") == "running":
+            what = j.get("provider") or j.get("kind")
+            out.append((f"ai:{j['id']}", f"AI · {j.get('kind')}{' · ' + what if what != j.get('kind') else ''}"
+                        f"{' · ' + j['preset'] if j.get('preset') and j.get('kind') == 'broll' else ''}"
+                        f"{' (warm)' if j.get('warm') else ''}", f"ai-{j.get('kind')}"))
+    for j in list(jobs.jobs.values()):
+        if j["status"] == "running":
+            out.append((f"job:{j['id']}", f"{'Render' if j['kind'] == 'render' else 'Voice-over'} · {j['project']}",
+                        j["kind"]))
+    return out
+
+
+def _warm_ram() -> dict:
+    if ai is None:
+        return {}
+    return {w.family: w.ram_gb() for w in list(ai.pool.workers.values()) if w.alive()}
+
+
+sampler = sysmon.Sampler(ai_pids=lambda: ai._ai_pids() if ai is not None else set(), activity=_activity,
+                         warm_ram=_warm_ram)
+ai = AIJobs(sampler=sampler)
 make = Pipelines(jobs, ai)
 
 
@@ -60,6 +95,11 @@ def _startup() -> None:
         align.load_model()               # warm up faster-whisper (CPU) for word timing
     import threading
     threading.Thread(target=_bg, name="warmup", daemon=True).start()
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    ai.pool.shutdown()          # warm workers exit with the studio (they also exit when their socket closes)
 
 
 @app.exception_handler(StoreError)
@@ -579,11 +619,14 @@ def ai_status(fresh: int = 0):
     return JSONResponse({
         "gpu": g, "venv": AI_PY.exists(), "current_job": ai.current,
         "queued": len(ai.queued()), "active": ai.active(),
+        "providers": PV.public(ai), "default_provider": PV.DEFAULT, "workers": ai.pool.view(),
         "presets": {
             "broll": {k: {"steps": v["steps"], "frames": v["frames"], "portrait": v["portrait"], "landscape": v["landscape"],
-                          "seconds": round(v["frames"] / 24, 2), "estimate": ai.estimate("broll", k, v["steps"]),
+                          "seconds": round(v["frames"] / 24, 2), "estimate": ai.estimate_broll(PV.DEFAULT, k),
                           "need_gb": ai.need_gb("broll", k), "measured": bool(tm.get(f"broll/{k}", {}).get("runs"))}
                       for k, v in L.BROLL_PRESETS.items()},
+            "music": {"estimate_per_30s": ai.estimate("music", "final", 36, warm=ai.is_warm("acestep", ["acestep"])),
+                      "need_gb": ai.need_gb("music", "final"), "measured": bool(tm.get("music/final", {}).get("runs"))},
             "presenter": {k: {**v, "need_gb": ai.need_gb("presenter", k),
                               "per_second": tm.get(f"presenter/{k}", {}).get("per_unit"),
                               "load": tm.get(f"presenter/{k}", {}).get("load"),
@@ -647,31 +690,171 @@ async def ai_broll(request: Request):
     prompt = str(d.get("prompt") or "").strip()
     if len(prompt) < 8:
         raise HTTPException(422, "prompt is too short (describe what the footage shows)")
-    preset = d.get("preset") if d.get("preset") in L.BROLL_PRESETS else "draft"
+    provider = d.get("provider") or PV.DEFAULT
+    if not PV.exists(provider):
+        raise HTTPException(422, f"unknown provider '{provider}' ({', '.join(PV.PROVIDERS)})")
+    pv = PV.get(provider)
+    preset = d.get("preset") if d.get("preset") in pv["presets"] else "draft"
     orient = d.get("orientation") if d.get("orientation") in ("portrait", "landscape") else "portrait"
     try:
         seed = int(d.get("seed") if d.get("seed") not in (None, "") else 42)
     except (TypeError, ValueError):
         raise HTTPException(422, "seed must be an integer") from None
-    pr = L.BROLL_PRESETS[preset]
-    w, h = pr[orient]
     params = {"prompt": prompt[:800], "negative": str(d.get("negative") or "").strip()[:800] or None, "seed": seed,
-              "orientation": orient}
+              "orientation": orient, "provider": provider}
+    im = d.get("image") if isinstance(d.get("image"), dict) else None
+    if im:                       # "animate this image": {project, asset} or {portrait}
+        if "i2v" not in pv["modes"]:
+            raise HTTPException(422, f"{pv['name']} cannot animate an image")
+        ref = None
+        if im.get("portrait"):
+            ref = _portrait_ref(str(im["portrait"]))
+        elif im.get("project") and im.get("asset"):
+            ref = image_ref(Project.get(im["project"]), str(im["asset"]))
+        if not ref:
+            raise HTTPException(422, "image not found (an image asset of the project or a library portrait)")
+        params["image"] = ref
     a = d.get("assign") if isinstance(d.get("assign"), dict) else None
     if a and a.get("project") and a.get("scene"):
         Project.get(a["project"])
         params["assign"] = {"project": a["project"], "scene": a["scene"],
                             **{k: float(a[k]) for k in ("dim", "blur") if isinstance(a.get(k), (int, float))}}
     project = params.get("assign", {}).get("project")
-    cid = L.broll_key(params["prompt"], seed, pr["steps"], w, h, pr["frames"])
+    img_sha = (params.get("image") or {}).get("sha")
+    cid = PV.clip_key(provider, params["prompt"], seed, preset, orient, img_sha)
+    label = f"{pv['name']} · {prompt[:56]}"
     if L.broll_get(cid):
         ai._assign_broll({"params": params}, cid)
-        return ai.done_job("broll", params, {"clip": cid}, project=project, label=prompt[:70], preset=preset)
+        return ai.done_job("broll", params, {"clip": cid}, project=project, label=label, preset=preset)
     for j in ai.active(kind="broll"):
         jp = j["params"]
-        if j["preset"] == preset and jp["prompt"] == params["prompt"] and jp["seed"] == seed and jp["orientation"] == orient:
+        if j["preset"] == preset and jp["prompt"] == params["prompt"] and jp["seed"] == seed and jp["orientation"] == orient \
+                and (jp.get("provider") or PV.DEFAULT) == provider and (jp.get("image") or {}).get("sha") == img_sha:
             return JSONResponse(j, status_code=409)
-    return ai.submit("broll", params, project=project, label=prompt[:70], units=pr["steps"], preset=preset)
+    return ai.submit("broll", params, project=project, label=label, units=pv["presets"][preset]["steps"], preset=preset)
+
+
+def _portrait_ref(pid: str) -> dict | None:
+    m = L.portrait_get(pid)
+    if not m:
+        return None
+    f = L.PORTRAITS / pid / "portrait.png"
+    return {"path": str(f), "sha": L.file_sha(f), "label": f"portrait {m.get('name') or pid}"}
+
+
+@app.get("/api/ai/providers")
+def ai_providers():
+    """Video generators (b-roll): id, name, licence, capabilities, presets with estimates and VRAM needs."""
+    return JSONResponse({"providers": PV.public(ai), "default": PV.DEFAULT,
+                         "cloud": {"enabled": False, "note": "No paid cloud API is implemented — see README (Cloud providers)."}},
+                        headers=NOCACHE)
+
+
+# ---------------------------------------------------------------- AI music
+@app.post("/api/ai/music", status_code=202)
+async def ai_music(request: Request):
+    """Generate an instrumental track (ACE-Step v1.5) into the music library.
+    Body: {prompt, genre?, mood?, bpm?, duration? (s, 10-240, default 30), seed?, title?, project? (use it there)}."""
+    d = _body(await request.body())
+    prompt = str(d.get("prompt") or "").strip()[:400]
+    genre, mood = str(d.get("genre") or "").strip()[:60], str(d.get("mood") or "").strip()[:80]
+    if len(prompt) + len(genre) + len(mood) < 4:
+        raise HTTPException(422, "describe the music (prompt, genre or mood)")
+    try:
+        dur = float(d.get("duration") or 30)
+        bpm = int(d["bpm"]) if d.get("bpm") not in (None, "") else None
+        seed = int(d.get("seed") if d.get("seed") not in (None, "") else 7)
+    except (TypeError, ValueError):
+        raise HTTPException(422, "duration, bpm and seed must be numbers") from None
+    if not 10 <= dur <= 240:
+        raise HTTPException(422, "duration must be 10–240 s")
+    if bpm is not None and not 50 <= bpm <= 200:
+        raise HTTPException(422, "bpm must be 50–200")
+    spec = {"prompt": prompt or None, "genre": genre or None, "mood": mood or None, "bpm": bpm, "duration": round(dur, 1),
+            "seed": seed}
+    params = {**spec, "title": str(d.get("title") or "").strip()[:60] or None, "cache_key": MU.generate_key(spec)}
+    if d.get("project"):
+        Project.get(d["project"])
+        params["assign_project"] = d["project"]
+    label = (prompt or ", ".join(x for x in (genre, mood) if x))[:70]
+    have = MU.generated_for(spec)
+    if have:
+        if params.get("assign_project"):
+            p = Project.get(params["assign_project"])
+            b = p.brief
+            b["music"] = {**(b.get("music") if isinstance(b.get("music"), dict) else {}), "track": have["id"]}
+            p.save_brief(B.normalize(b, p.assets())[0])
+        return ai.done_job("music", params, {"track": have["id"], "title": have["title"]}, project=d.get("project"),
+                           label=label, preset="final")
+    return ai.submit("music", params, project=d.get("project"), label=label, units=dur, preset="final")
+
+
+# ---------------------------------------------------------------- warm AI workers
+@app.get("/api/ai/workers")
+def ai_workers():
+    """Warm model workers: settings, per worker {family, pid, busy, models [{key, gb}], ram_gb, vram_gb, idle_s}."""
+    return JSONResponse(ai.pool.view(), headers=NOCACHE)
+
+
+@app.put("/api/ai/workers/settings")
+async def ai_workers_settings(request: Request):
+    """{warm?: bool, idle_minutes?: 1-1440, ram_budget_gb?: 8-120}"""
+    d = _body(await request.body())
+    try:
+        return ai.pool.update(d)
+    except (TypeError, ValueError):
+        raise HTTPException(422, "idle_minutes and ram_budget_gb must be numbers") from None
+
+
+@app.post("/api/ai/workers/release-ram")
+async def ai_workers_release(request: Request):
+    """Stop the idle warm workers (all, or {family}) so their RAM is free again. Busy workers are left alone."""
+    d = _body(await request.body())
+    return {"stopped": ai.pool.release_ram(d.get("family")), **ai.pool.view()}
+
+
+@app.post("/api/ai/workers/release-gpu")
+def ai_workers_release_gpu():
+    """Every idle warm worker gives back its GPU memory; the weights stay in RAM."""
+    return {"released": ai.pool.release_gpu(), **ai.pool.view()}
+
+
+# ---------------------------------------------------------------- system monitor
+@app.get("/api/monitor")
+def monitor(since: float = 0, procs: int = 1):
+    """Samples of the last 30 minutes (1 Hz, or newer than `since`), stage markers, the latest sample, the
+    process table, the warm workers and the sampler's own overhead. Sample keys: t, gu (GPU %), vt/vu (VRAM
+    total/used MB), vo/va/vs (VRAM of Ovoz / AI / studio MB), tc (°C), pw (W), cpu (%), rt/ru (RAM total/used
+    GB), ra/ro/rs (RAM of AI / Ovoz / studio GB), rw (RAM of warm model workers GB), act (running activities)."""
+    out = {"samples": sampler.history(since), "markers": sampler.marker_list(), "now": sampler.latest,
+           "info": sampler.info, "overhead": sampler.overhead(), "errors": sampler.err, "server_time": time.time()}
+    if procs:
+        out["procs"] = sampler.procs
+        out["workers"] = ai.pool.view()
+        out["current"] = {"pipeline": make.active(), "ai_job": ai.get(ai.current) if ai.current else None}
+    return JSONResponse(out, headers=NOCACHE)
+
+
+@app.get("/api/monitor/stream")
+async def monitor_stream(request: Request, procs: int = 0):
+    """Server-Sent Events: one `data: {sample}` per second (+ `procs` and open markers when ?procs=1)."""
+    async def gen():
+        last = 0.0
+        yield "retry: 3000\n\n"
+        while True:
+            if await request.is_disconnected():
+                break
+            s = await asyncio.to_thread(sampler.wait_next, last, 3.0)
+            if not s or s.get("t", 0) <= last:
+                continue
+            last = s["t"]
+            msg = {"s": s}
+            if procs:
+                msg["procs"] = sampler.procs
+                msg["open"] = [m for m in sampler.marker_list() if not m["t1"]]
+            yield "data: " + json.dumps(msg, separators=(",", ":")) + "\n\n"
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/library/broll")

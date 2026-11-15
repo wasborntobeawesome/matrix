@@ -158,11 +158,119 @@ def add_track(src: Path, meta: dict, move: bool = False) -> dict:
         m = {"id": tid, "title": str(meta.get("title") or src.stem)[:80], "artist": str(meta.get("artist") or "")[:80],
              "licence": str(meta["licence"]).strip()[:160], "source": meta.get("source") or "upload",
              "duration": round(dur, 2), "created": meta.get("created") or now(), "lufs": round(lufs, 1), "ext": ext}
-        for k in ("mood", "bpm", "prompt", "original_name"):
+        for k in ("mood", "bpm", "prompt", "original_name", "genre", "seed", "model", "gen_seconds", "check", "key"):
             if meta.get(k) not in (None, ""):
                 m[k] = meta[k]
         _write(d / "meta.json", m)
     return m
+
+
+GENERATED_LICENCE = ("Generated locally with ACE-Step v1.5 (MIT); the model card allows commercial use of the "
+                     "music. AI-generated.")
+
+
+def generated_for(spec: dict) -> dict | None:
+    """The library track generated for a project's `music.generate` spec (same prompt/genre/mood/bpm/duration/seed)."""
+    k = generate_key(spec)
+    for m in list_tracks():
+        if m.get("source") == "generated" and m.get("key") == k:
+            return m
+    return None
+
+
+def generate_key(spec: dict) -> str:
+    raw = json.dumps([spec.get(k) for k in ("prompt", "genre", "mood", "bpm", "duration", "seed")], ensure_ascii=False)
+    return "g-" + hashlib.sha1(raw.encode()).hexdigest()[:12]
+
+
+def finish_generated(raw: Path, out: Path, want: float) -> dict:
+    """A generated take -> library-ready OGG: leading silence cut, the silent / faded-out tail cut (ACE-Step often
+    ends a little early), a 20 ms fade-in and a fade-out over the last 1.5 s of what is left, at most `want` + 4 s."""
+    x = decode(Path(raw), 2)
+    n = len(x)
+    win = int(0.05 * SR)
+    frames = max(1, n // win)
+    rms = np.sqrt(np.mean(x[: frames * win].reshape(frames, win, 2) ** 2, axis=(1, 2)) + 1e-12)
+    db = 20 * np.log10(rms)
+    loud = db > (np.percentile(db, 95) - 45)
+    first = int(np.argmax(loud)) if loud.any() else 0
+    last = frames - int(np.argmax(loud[::-1])) if loud.any() else frames
+    a = first * win
+    b = min(n, last * win + int(0.3 * SR))
+    b = min(b, a + int((want + 4.0) * SR))
+    y = x[a:b].copy()
+    fi, fo = min(len(y), int(0.02 * SR)), min(len(y), int(1.5 * SR))
+    if fi:
+        y[:fi] *= np.linspace(0, 1, fi)[:, None]
+    if fo:
+        y[-fo:] *= np.cos(np.linspace(0, np.pi / 2, fo))[:, None]
+    tmp = Path(out).with_suffix(".tmp.wav")
+    write_wav(tmp, y)
+    r = subprocess.run([FFMPEG, "-y", "-v", "error", "-i", str(tmp), "-c:a", "libvorbis", "-q:a", "6", str(out)],
+                       capture_output=True, text=True, errors="replace", creationflags=NOWIN)
+    tmp.unlink(missing_ok=True)
+    if r.returncode != 0:
+        raise RuntimeError("could not encode the generated track: " + r.stderr.strip()[-300:])
+    return {"raw_seconds": round(n / SR, 2), "kept_seconds": round(len(y) / SR, 2), "cut_head": round(a / SR, 2),
+            "cut_tail": round((n - b) / SR, 2), "short": len(y) / SR < want - 0.5}
+
+
+def analyze(path: Path) -> dict:
+    """Sanity checks for a generated track (nobody can listen here): duration, loudness (EBU R128 via
+    ffmpeg), true peak, silent fraction, and the spectrum — spectral flatness (white noise ≈ 0.5–0.6 on this
+    scale, tonal music < 0.15), spectral centroid, band energies and how much the spectrum changes over time
+    (static drones/hum ≈ 0). `ok` is False for silence, noise or a broken file."""
+    x = decode(Path(path), 1)[:, 0].astype(np.float64)
+    dur = len(x) / SR
+    out: dict = {"duration": round(dur, 2)}
+    if dur < 0.5:
+        return {**out, "ok": False, "problem": "too short"}
+    r = subprocess.run([FFMPEG, "-hide_banner", "-nostats", "-i", str(path), "-af", "ebur128=peak=true:framelog=quiet",
+                        "-f", "null", "-"], capture_output=True, text=True, errors="replace", creationflags=NOWIN)
+    m = re.findall(r"I:\s+(-?[\d.]+|-inf) LUFS", r.stderr)
+    tp = re.findall(r"Peak:\s+(-?[\d.]+|-inf) dBFS", r.stderr)
+    lra = re.findall(r"LRA:\s+(-?[\d.]+) LU", r.stderr)
+    out["lufs"] = None if not m or m[-1] == "-inf" else float(m[-1])
+    out["true_peak_db"] = None if not tp or tp[-1] == "-inf" else float(tp[-1])
+    out["lra"] = float(lra[-1]) if lra else None
+    n = 4096
+    hop = n // 2
+    frames = np.lib.stride_tricks.sliding_window_view(x, n)[::hop]
+    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+    out["silent_fraction"] = round(float(np.mean(20 * np.log10(rms) < -50)), 3)
+    spec = np.abs(np.fft.rfft(frames * np.hanning(n), axis=1)) ** 2 + 1e-12
+    loud = rms > np.percentile(rms, 20)
+    sp = spec[loud] if loud.any() else spec
+    flat = np.exp(np.mean(np.log(sp), axis=1)) / np.mean(sp, axis=1)
+    freqs = np.fft.rfftfreq(n, 1 / SR)
+    cen = np.sum(sp * freqs, axis=1) / np.sum(sp, axis=1)
+    bands = {"sub <60": (0, 60), "bass 60-250": (60, 250), "low-mid 250-2k": (250, 2000), "high-mid 2k-6k": (2000, 6000),
+             "air >6k": (6000, SR / 2)}
+    tot = np.sum(sp)
+    out["bands"] = {k: round(float(np.sum(sp[:, (freqs >= a) & (freqs < b)]) / tot), 3) for k, (a, b) in bands.items()}
+    out["flatness"] = round(float(np.median(flat)), 4)
+    out["centroid_hz"] = round(float(np.median(cen)))
+    # spectral flux: mean change (dB) of 24 log-spaced band levels between frames, floored 60 dB below the
+    # loudest band, over ~0.5 s steps (0 = a frozen tone or drone; music moves several dB)
+    edges = np.geomspace(40, SR / 2, 25)
+    bl = np.stack([np.sum(spec[:, (freqs >= a) & (freqs < b)], axis=1) for a, b in zip(edges[:-1], edges[1:])], axis=1)
+    db = 10 * np.log10(bl + 1e-12)
+    db = np.maximum(db, db.max() - 60)
+    step = max(1, int(0.5 * SR / hop))
+    out["flux"] = round(float(np.mean(np.abs(db[step:] - db[:-step]))), 2) if len(db) > step else 0.0
+    problems = []
+    if out["lufs"] is None or out["lufs"] < -45:
+        problems.append("silent")
+    if out["silent_fraction"] > 0.5:
+        problems.append("mostly silence")
+    if out["flatness"] > 0.35:
+        problems.append("noise-like spectrum")
+    if out["flux"] < 0.5:
+        problems.append("static (no musical change)")
+    out["ok"] = not problems
+    if problems:
+        out["problem"] = ", ".join(problems)
+    return out
 
 
 def delete(tid: str) -> None:
